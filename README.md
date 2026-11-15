@@ -4,19 +4,17 @@ A lockfile-free, entity-agnostic filesystem Markdown work bucket skill (`SKILL.m
 
 ## Installation
 
-Clone this repository into your agent's skills directory (or symlink it):
+Install with [`skills`](https://github.com/vercel-labs/skills):
 
 ```bash
-# Global (pick the path your harness uses)
-git clone git@github.com:beefsack/work-bucket.git ~/.agents/skills/work-bucket
-# or ~/.gemini/skills/work-bucket
-# or ~/.config/opencode/skills/work-bucket
+# Project-local
+npx skills add beefsack/work-bucket
 
-# Or project-local
-git clone git@github.com:beefsack/work-bucket.git .agents/skills/work-bucket
+# Or global (across all projects)
+npx skills add beefsack/work-bucket -g
 ```
 
-Node.js 20+ is optional. If `node` is present, agents use `scripts/wb.mjs` for atomic operations and event-driven `watch` waits; otherwise they use standard filesystem moves and file edits directly.
+Node.js 20+ is optional at runtime. If `node` is present, agents use `scripts/wb.mjs` for atomic operations and event-driven `watch` waits; otherwise they use standard filesystem moves and file edits directly.
 
 When starting an agent session, provide two required inputs:
 - `bucket_dir`: Path to the bucket root directory.

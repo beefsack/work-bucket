@@ -16,9 +16,10 @@ npx skills add beefsack/work-bucket -g
 
 Node.js 20+ is optional at runtime. If `node` is present, agents use `scripts/wb.mjs` for atomic operations and event-driven `watch` waits; otherwise they use standard filesystem moves and file edits directly.
 
-When starting an agent session, provide two required inputs:
+When starting an agent session, provide three required inputs:
 - `bucket_dir`: Path to the bucket root directory.
 - `entity_id`: The opaque name for that participant (e.g. `alex`, `worker-linux-1`).
+- `mode`: `once` (handle one task through review/completion) or `ongoing` (keep watching for new and reopened tasks).
 - Optional capability tags (e.g. `--tag linux`) and `--include-untagged`.
 
 ## How Humans Interact with the Bucket

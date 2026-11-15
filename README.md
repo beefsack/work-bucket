@@ -90,6 +90,13 @@ REVIEW
 - `bucket pause --bucket <dir> [-m <reason>]` atomically creates plain `PAUSED`; `bucket resume --bucket <dir>` removes it (idempotently). Humans can create/remove the file directly. Pause is bucket-wide, not task cancellation. `claim` refuses with exit 2, including a pause detected during settle; that election's immutable claim remains and can be resumed by its winner or reset by the owner.
 - Paused pool `watch` reports `reason: "paused"`, `paused: true` and no ready work. Executors stop at checkpoints and do not repeatedly re-arm pool watches until explicitly resumed. Owners may continue `--owner-only` watches/reviews/messages/stall handling; those watches include the pause flag but do not wake solely for pause. Task-specific watches retain lifecycle/event behavior and include `paused` on updates.
 
+## Reclaims and Session Handover
+
+- Pinned reclaims (`assignee == entity`, `claim_round > 1`) skip the claim-settle delay, including an explicit `--claim-settle-ms`. Initially assigned tasks and open-pool claims retain the normal settle. Winner election and late-sync split-brain checks remain in place.
+- Optional `--session-nonce <token>` is accepted by `create`, `claim`, `post`, `watch`, `msg send`, `entity register` and `tag set`; it overrides `WB_SESSION_NONCE`. Register the entity first, then supply the same caller-chosen token on writes (or inherit the environment variable). The marker is stored as `session_nonce` in `entities/<id>.md`.
+- A different nonce on a still-live entity prints one warning per command but does not refuse the write: presence remains advisory, not an exclusive lease. Stale transfers do not warn. Commands without a nonce preserve an existing marker and cannot detect collisions; existing buckets need no migration. Resolve unexpected identity sharing with the coordinator rather than inventing a new ID.
+- Before context handover, capture task IDs, last-seen event filename and the existing watcher's handle/PID. The successor must stop that known watcher for its entity before re-arming, even if its completion targets the predecessor session. Resume task waits with `watch --task <id> --after-event <last_seen> --since-status <review|blocked>`; owner/pool watches reuse persisted entity cursors. An already `in-progress` task resumes from its checkpoint without another claim.
+
 ## License
 
 [MIT](LICENSE)

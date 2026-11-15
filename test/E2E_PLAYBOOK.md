@@ -60,6 +60,12 @@ In background-completion harnesses, each re-arm runs in the background without `
 - Use `bucket pause -m "Await decision"` before claiming a pending fixture: claim exits 2, pool watch reports paused/no work, task remains pending. Do not re-arm paused pool watches in a loop. Owners can review an existing review task while paused. Resume, explicitly resume executor loops, then confirm claims work. Also create/remove `PAUSED` directly.
 - Close a completed negative investigation with `complete --outcome fail` and an unfinished fixture task with `cancelled --outcome abandoned`; inspect outcome separately from lifecycle. Use `partial` only with an explicit unverified list, not an acceptance PASS claim.
 
+## Reclaim and Handover Checks
+
+- Time an initial assigned claim with a nonzero settle, then return it via feedback and reclaim under the pinned executor with `--claim-settle-ms 2000`. Only the pinned round (`claim_round > 1`) skips the delay; inspect `claim_winner` afterward. Existing concurrent-claim tests still exercise pool election.
+- Register a caller-selected `--session-nonce`; repeat it with no warning. Use a different token while the entity is live: expect a warning, not refusal, and the new marker. Omit the token: it is preserved without a collision check. Verify `WB_SESSION_NONCE` inheritance and explicit flag precedence; transfer a stale identity without a warning.
+- Handover while a task-specific background watcher is armed. Capture task ID, cursor, baseline status and watcher handle/PID. The successor stops the old watcher before arming `watch --task <id> --after-event <last_seen> --since-status <review|blocked>`. Post feedback before re-arm and confirm immediate delivery; no event may be missed and no predecessor watcher remains. Resume an `in-progress` task without re-claiming; owner/pool watches instead retain entity cursors.
+
 ## Loose Pass Gates
 
 After both agents finish, run these checks against `$BUCKET`:

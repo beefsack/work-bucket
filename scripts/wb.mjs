@@ -70,6 +70,8 @@ const CANONICAL_TASK_KEYS = [
 ];
 
 let tmpCounter = 0;
+let sessionNonce = process.env.WB_SESSION_NONCE || "";
+const warnedEntitySessions = new Set();
 
 class CliError extends Error {
   constructor(message, exitCode = 1) {
@@ -988,6 +990,7 @@ function formatEntityMarkdown(data, body) {
     "tags",
     "include_untagged",
     "mode",
+    "session_nonce",
     "ttl_seconds",
     "last_msg_seen",
     "updated_at",
@@ -1014,6 +1017,7 @@ function readEntityFile(bucketDir, entityId) {
       tags: normalizeTags(coerceStringList(data.tags)),
       include_untagged: Boolean(data.include_untagged),
       mode: String(data.mode ?? ""),
+      session_nonce: String(data.session_nonce ?? ""),
       ttl_seconds: Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_ENTITY_TTL_SECONDS,
       last_msg_seen: String(data.last_msg_seen ?? ""),
       owner_task_seen: coerceStringList(data.owner_task_seen),
@@ -1033,6 +1037,7 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
   fs.mkdirSync(entitiesDir, { recursive: true });
   const entityPath = path.join(entitiesDir, `${entityId}.md`);
   const existing = readEntityFile(bucketDir, entityId);
+  warnEntitySession(existing, entityId);
   let initialLastMsgSeen = existing ? existing.last_msg_seen : "";
   if (!existing) {
     const existingMsgs = listMessageFiles(path.join(bucketDir, "messages"));
@@ -1060,7 +1065,8 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
         ? String(updates.mode)
         : existing
         ? existing.mode
-        : "",
+         : "",
+    session_nonce: sessionNonce || existing?.session_nonce || "",
     ttl_seconds:
       updates.ttl_seconds !== undefined
         ? updates.ttl_seconds
@@ -1079,6 +1085,21 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
     updates.body !== undefined ? updates.body : existing ? existing.body : "";
   atomicWriteFile(entityPath, formatEntityMarkdown(nextData, nextBody));
   return { ...nextData, body: String(nextBody || "").trim(), path: entityPath };
+}
+
+function warnEntitySession(existing, entityId) {
+  if (!sessionNonce || !existing?.session_nonce || existing.session_nonce === sessionNonce ||
+      warnedEntitySessions.has(entityId)) return;
+  const timestamp = Date.parse(existing.updated_at);
+  const updatedMs = Number.isFinite(timestamp) ? timestamp : fs.statSync(existing.path).mtimeMs;
+  if (Date.now() - updatedMs > existing.ttl_seconds * 1000) return;
+  console.error(`Warning: entity "${entityId}" has a different live session nonce; concurrent writers may share this id.`);
+  warnedEntitySessions.add(entityId);
+}
+
+function useEntitySession(bucketDir, entityId, values) {
+  sessionNonce = values["session-nonce"] ?? process.env.WB_SESSION_NONCE ?? "";
+  warnEntitySession(readEntityFile(bucketDir, entityId), entityId);
 }
 
 function touchExistingEntity(bucketDir, entityId) {
@@ -1389,6 +1410,7 @@ function cmdCreate(argv) {
     options: {
       bucket: { type: "string", short: "b" },
       entity: { type: "string", short: "e" },
+      "session-nonce": { type: "string" },
       title: { type: "string", short: "t" },
       priority: { type: "string", short: "p", default: "medium" },
       tag: { type: "string", multiple: true },
@@ -1422,6 +1444,7 @@ function cmdCreate(argv) {
   const bucketDir = path.resolve(values.bucket || "");
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
   const entityId = validateIdentifier(values.entity, "--entity");
+  useEntitySession(bucketDir, entityId, values);
   if (!values.title || !values.title.trim()) {
     throw new CliError("Missing required --title <text>.");
   }
@@ -1570,6 +1593,7 @@ async function cmdClaim(argv) {
     options: {
       bucket: { type: "string", short: "b" },
       entity: { type: "string", short: "e" },
+      "session-nonce": { type: "string" },
       task: { type: "string" },
       tag: { type: "string", multiple: true },
       tags: { type: "string", multiple: true },
@@ -1590,6 +1614,7 @@ async function cmdClaim(argv) {
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
   const bucketDir = path.resolve(values.bucket);
   const entityId = validateIdentifier(values.entity, "--entity");
+  useEntitySession(bucketDir, entityId, values);
   const settleMs = Number.parseInt(values["claim-settle-ms"], 10);
   if (!Number.isFinite(settleMs) || settleMs < 0) {
     throw new CliError(`Invalid --claim-settle-ms "${values["claim-settle-ms"]}".`);
@@ -1681,7 +1706,7 @@ async function cmdClaim(argv) {
       );
     }
 
-    if (settleMs > 0) {
+    if (settleMs > 0 && !(preTask.assignee === entityId && claimRound > 1)) {
       await new Promise((resolve) => setTimeout(resolve, settleMs));
     }
 
@@ -1768,6 +1793,7 @@ function cmdPost(argv) {
     options: {
       bucket: { type: "string", short: "b" },
       entity: { type: "string", short: "e" },
+      "session-nonce": { type: "string" },
       task: { type: "string" },
       type: { type: "string" },
       message: { type: "string", short: "m" },
@@ -1798,6 +1824,7 @@ function cmdPost(argv) {
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
   const bucketDir = path.resolve(values.bucket);
   const entityId = validateIdentifier(values.entity, "--entity");
+  useEntitySession(bucketDir, entityId, values);
   const taskId = validateTaskId(values.task);
   const eventType = String(values.type || "").toLowerCase();
   if (!VALID_EVENT_TYPES.has(eventType)) {
@@ -2241,6 +2268,7 @@ async function cmdWatch(argv) {
     options: {
       bucket: { type: "string", short: "b" },
       entity: { type: "string", short: "e" },
+      "session-nonce": { type: "string" },
       task: { type: "string" },
       tag: { type: "string", multiple: true },
       tags: { type: "string", multiple: true },
@@ -2276,6 +2304,7 @@ async function cmdWatch(argv) {
   const bucketDir = path.resolve(values.bucket);
   const watchTaskId = values.task ? validateTaskId(values.task) : null;
   const entityId = values.entity ? validateIdentifier(values.entity, "--entity") : null;
+  if (entityId) useEntitySession(bucketDir, entityId, values);
   const ownerOnly = Boolean(values["owner-only"]);
   const excludedTasks = new Set(values["exclude-task"] ?? []);
   for (const taskId of excludedTasks) validateTaskId(taskId);
@@ -2738,6 +2767,7 @@ function cmdMsg(argv) {
       options: {
         bucket: { type: "string", short: "b" },
         entity: { type: "string", short: "e" },
+        "session-nonce": { type: "string" },
         to: { type: "string", multiple: true },
         tag: { type: "string", multiple: true },
         tags: { type: "string", multiple: true },
@@ -2759,6 +2789,7 @@ function cmdMsg(argv) {
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
     const bucketDir = path.resolve(values.bucket);
     const entityId = validateIdentifier(values.entity, "--entity");
+    useEntitySession(bucketDir, entityId, values);
     const body = readBodyInput(values);
     if (!body.trim()) {
       throw new CliError("Message body cannot be empty (pass -m, --body-file, or --stdin).");
@@ -2908,6 +2939,7 @@ function cmdEntity(argv) {
       options: {
         bucket: { type: "string", short: "b" },
         entity: { type: "string", short: "e" },
+        "session-nonce": { type: "string" },
         tag: { type: "string", multiple: true },
         tags: { type: "string", multiple: true },
         "include-untagged": { type: "boolean", default: false },
@@ -2930,6 +2962,7 @@ function cmdEntity(argv) {
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
     const bucketDir = path.resolve(values.bucket);
     const entityId = validateIdentifier(values.entity, "--entity");
+    useEntitySession(bucketDir, entityId, values);
     if (values.mode && !["once", "one-shot", "continuous", "owner", "worker"].includes(values.mode)) {
       throw new CliError(`Invalid --mode "${values.mode}".`);
     }
@@ -3011,6 +3044,7 @@ function cmdTag(argv) {
       options: {
         bucket: { type: "string", short: "b" },
         entity: { type: "string", short: "e" },
+        "session-nonce": { type: "string" },
         tag: { type: "string" },
         message: { type: "string", short: "m" },
         body: { type: "string" },
@@ -3029,6 +3063,7 @@ function cmdTag(argv) {
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
     const bucketDir = path.resolve(values.bucket);
     const entityId = validateIdentifier(values.entity, "--entity");
+    useEntitySession(bucketDir, entityId, values);
     const tagName = validateIdentifier(
       String(values.tag || "").trim().toLowerCase(),
       "--tag"
@@ -3111,6 +3146,9 @@ Subcommands:
   entity   Register or list advisory entity presence in entities/
   tag      Document or list capability tags in tags/
 
+All entity-writing commands accept --session-nonce <token> (or WB_SESSION_NONCE).
+Register the entity first; a different live nonce warns but does not lock out or block writes.
+Omitting a nonce preserves the stored value without collision detection.
 Run "wb.mjs <subcommand> --help" for subcommand options.`);
 }
 
@@ -3129,6 +3167,7 @@ function printCreateHelp() {
   --ac <criterion>                       Acceptance criterion (repeatable)
   --body <markdown> | --body-file <path> | --stdin   Custom Markdown body
   --slug <slug>                          Override auto-generated task slug
+  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
   --json                                 Output JSON`);
 }
 
@@ -3138,10 +3177,13 @@ function printClaimHelp() {
   --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
   --include-untagged                     Also accept untagged tasks when --tag is set
   --claim-settle-ms <ms>                 Settle wait before electing round winner (default: ${DEFAULT_CLAIM_SETTLE_MS})
+  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
   --json                                 Output JSON, including instructions: [{file, body}] and unread_events
   unread_events includes full unaccepted amend bodies (including pre-claim amends) and feedback since
   the previous round's claim. Read these before executing; accepted amendments are not repeated.
   Read optional INSTRUCTIONS.md and each task tag's tags/<tag>.md body before claiming/executing.
+  Reclaims with assignee == entity and claim_round > 1 skip settle (even when explicitly set);
+  initial/pool claims retain settle and all claims retain the round-winner/split-brain guards.
   PAUSED refuses claims (exit 2), including a pause detected during settle.`);
 }
 
@@ -3154,6 +3196,7 @@ function printPostHelp() {
   --accept-amends                        With --type log: append unaccepted amend bodies to task.md,
                                         bump revision once, record last_amend_seen and log filenames
   --outcome <pass|partial|fail|abandoned>  Optional result on complete/cancelled status
+  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
   --assignee <id>                        Update assignee (pass "" to clear)
   --claimed-by <id>                      Update claimed_by (pass "" to clear)
   --add-depends-on <id1,id2>             Append task IDs to depends_on
@@ -3185,6 +3228,7 @@ function printWatchHelp() {
   --poll-ms <ms>                         Stat polling fallback interval (default: 1000)
   --msg-coalesce-ms <ms>                 Quiet window for message-only bursts (default: 500)
   --ttl <seconds>                        Entity presence TTL in seconds (default: 300)
+  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
   --timeout <seconds>                    Optional timeout (exits 124)
   --json                                 Output JSON
   Pool watches skip pending tasks with any claimed event for the current claim_round.
@@ -3230,19 +3274,23 @@ function printBucketHelp() {
 
 function printMsgHelp() {
   console.log(`Usage: wb.mjs msg <send|list> --bucket <dir> [options]
-  send --entity <id> [--to <id|*,...>] [--tag <t>] [--slug <s>] -m <text> [--json]
+  send --entity <id> [--to <id|*,...>] [--tag <t>] [--slug <s>] -m <text> [--session-nonce <token>] [--json]
+       Optional session marker also reads WB_SESSION_NONCE.
   list [--entity <id>] [--tag <t>] [--after-msg <file>] [--unread] [--all] [--json]`);
 }
 
 function printEntityHelp() {
   console.log(`Usage: wb.mjs entity <register|list> --bucket <dir> [options]
-  register --entity <id> [--tag <t>] [--include-untagged] [--mode <m>] [--ttl <sec>] [-m <note>] [--json]
+  register --entity <id> [--tag <t>] [--include-untagged] [--mode <m>] [--ttl <sec>] [-m <note>] [--session-nonce <token>] [--json]
+       Nonce defaults to WB_SESSION_NONCE; different live nonce warns, not an exclusive lease.
+       Writes preserve the nonce when omitted; explicit flag overrides the environment.
   list [--online] [--json]`);
 }
 
 function printTagHelp() {
   console.log(`Usage: wb.mjs tag <set|list> --bucket <dir> [options]
-  set --entity <id> --tag <name> [-m <description>] [--json]
+  set --entity <id> --tag <name> [-m <description>] [--session-nonce <token>] [--json]
+       Optional session marker also reads WB_SESSION_NONCE.
   list [--json]`);
 }
 

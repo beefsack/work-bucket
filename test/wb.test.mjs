@@ -423,6 +423,95 @@ test("a pause during claim settle leaves the task pending and wakes an armed poo
   }
 });
 
+test("pinned reclaims skip settle while initially assigned claims still settle", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Pinned", "--assignee", "worker"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    const start = Date.now();
+    runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "250"]);
+    assert.ok(Date.now() - start >= 250, "Initial assigned claim must still settle");
+    runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
+    runWbJson(["post", ...args, "--entity", "owner", "--type", "feedback", "--status", "pending"]);
+    const reclaimStart = Date.now();
+    const reclaimed = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "2000"]);
+    assert.ok(Date.now() - reclaimStart < 1500, "Pinned reclaim must skip the explicit 2s settle");
+    assert.equal(reclaimed.task.claim_round, 2);
+    assert.equal(reclaimed.task.claimed_by, "worker");
+    assert.equal(runWbJson(["render", ...args]).claim_winner, "worker");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("optional session nonces warn only for a different live session, preserve omissions, and allow stale transfer", () => {
+  const bucket = makeTempBucket();
+  const options = { env: { ...process.env, WB_SESSION_NONCE: "" } };
+  try {
+    const args = ["entity", "register", "--bucket", bucket, "--entity", "actor"];
+    const first = runWb([...args, "--session-nonce", "session-a", "--json"], options);
+    assert.equal(first.status, 0, first.stderr);
+    assert.equal(JSON.parse(first.stdout).session_nonce, "session-a");
+    assert.equal(first.stderr, "");
+    assert.equal(runWb([...args, "--session-nonce", "session-a"], options).stderr, "");
+    const other = runWb([...args, "--session-nonce", "session-b", "--json"], options);
+    assert.equal(other.status, 0, other.stderr);
+    assert.match(other.stderr, /different live session nonce/);
+    assert.equal(other.stderr.trim().split("\n").length, 1);
+    assert.equal(JSON.parse(other.stdout).session_nonce, "session-b");
+    const omitted = runWb([...args, "--json"], options);
+    assert.equal(omitted.status, 0, omitted.stderr);
+    assert.equal(omitted.stderr, "");
+    assert.equal(JSON.parse(omitted.stdout).session_nonce, "session-b");
+    const override = runWb([...args, "--session-nonce", "session-b", "--json"], {
+      env: { ...process.env, WB_SESSION_NONCE: "ignored-env-session" },
+    });
+    assert.equal(override.status, 0, override.stderr);
+    assert.equal(override.stderr, "");
+    assert.equal(JSON.parse(override.stdout).session_nonce, "session-b");
+    const entityPath = path.join(bucket, "entities", "actor.md");
+    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, 'updated_at: "2000-01-01T00:00:00Z"'));
+    const transferred = runWb([...args, "--json"], { env: { ...process.env, WB_SESSION_NONCE: "session-c" } });
+    assert.equal(transferred.status, 0, transferred.stderr);
+    assert.equal(transferred.stderr, "");
+    assert.equal(JSON.parse(transferred.stdout).session_nonce, "session-c");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("all entity writers accept nonce flags and inherited nonce collision checks", () => {
+  const bucket = makeTempBucket();
+  try {
+    const base = ["--bucket", bucket, "--entity", "actor"];
+    const register = () => runWbJson(["entity", "register", ...base, "--session-nonce", "original"]);
+    register();
+    const created = runWb(["create", ...base, "--title", "Nonce writes", "--session-nonce", "other", "--json"]);
+    assert.equal(created.status, 0, created.stderr);
+    assert.match(created.stderr, /different live session nonce/);
+    const id = JSON.parse(created.stdout).task_id;
+    const commands = [
+      ["claim", ...base, "--task", id, "--claim-settle-ms", "0"],
+      ["post", ...base, "--task", id, "--type", "log", "-m", "Checkpoint"],
+      ["msg", "send", ...base, "-m", "Notice"],
+      ["tag", "set", ...base, "--tag", "test", "-m", "Instructions"],
+      ["watch", ...base, "--owner-only", "--timeout", "0.1"],
+    ];
+    for (const [index, args] of commands.entries()) {
+      register();
+      const result = runWb([...args, ...(index % 2 ? [] : ["--session-nonce", "other"])], {
+        env: { ...process.env, WB_SESSION_NONCE: "other" },
+      });
+      assert.equal(result.status, args[0] === "watch" ? 124 : 0, result.stderr);
+      assert.match(result.stderr, /different live session nonce/);
+      const entity = runWbJson(["entity", "list", "--bucket", bucket]).entities.find((item) => item.entity_id === "actor");
+      assert.equal(entity.session_nonce, "other");
+    }
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
 test("YAML frontmatter parsing handles CRLF, comments, quotes, and multiline arrays", () => {
   const raw = [
     "---",

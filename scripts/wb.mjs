@@ -1736,23 +1736,27 @@ function cmdPost(argv) {
   );
 
   // Enforce single-writer rule and late-sync split-brain guard on task.md
+  let roundWinner = null;
   if (mutatesTaskMd) {
     const curStatus = found.task.status;
-    if (curStatus === "in-progress") {
-      if (entityId !== found.task.claimed_by && eventType !== "reset") {
+    if (curStatus === "in-progress" && eventType !== "reset") {
+      const claimRound = Number(found.task.claim_round) || 1;
+      const { winner } = getRoundClaims(found.eventsDir, claimRound);
+      roundWinner = winner;
+      if (winner) {
+        if (winner.entityId !== entityId) {
+          const isClaimedBy = entityId === found.task.claimed_by;
+          throw new CliError(
+            isClaimedBy
+              ? `Split-brain claim conflict: round ${claimRound} winner is "${winner.entityId}", not "${entityId}".`
+              : `Single-writer violation: task "${taskId}" is in-progress (claimed_by="${found.task.claimed_by}"); "${entityId}" may only append events without modifying task.md.`,
+            isClaimedBy ? 2 : 1
+          );
+        }
+      } else if (entityId !== found.task.claimed_by) {
         throw new CliError(
           `Single-writer violation: task "${taskId}" is in-progress (claimed_by="${found.task.claimed_by}"); "${entityId}" may only append events without modifying task.md.`
         );
-      }
-      if (entityId === found.task.claimed_by && eventType !== "reset") {
-        const claimRound = Number(found.task.claim_round) || 1;
-        const { winner } = getRoundClaims(found.eventsDir, claimRound);
-        if (winner && winner.entityId !== entityId) {
-          throw new CliError(
-            `Split-brain claim conflict: round ${claimRound} winner is "${winner.entityId}", not "${entityId}".`,
-            2
-          );
-        }
       }
     } else if (curStatus === "blocked" || curStatus === "review") {
       if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
@@ -1829,6 +1833,9 @@ function cmdPost(argv) {
       returningFromActive
     ) {
       updatedTask.claimed_by = "";
+    } else if (roundWinner && roundWinner.entityId === entityId) {
+      // Heal claimed_by if a split-brain loser overwrote task.md via LWW sync
+      updatedTask.claimed_by = entityId;
     }
 
     if (values.assignee !== undefined) {

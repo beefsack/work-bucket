@@ -1643,15 +1643,12 @@ test("lockless claim election tie-breaks deterministically, rejects split-brain 
   }
 });
 
-test("two-replica async-sync simulator executes concurrent claims without double-claim or corruption", async () => {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wb-cloud-sim-"));
-  const replicaA = path.join(root, "replica-a");
-  const replicaB = path.join(root, "replica-b");
-
-  // Simple bidirectional eventual-consistency folder syncer:
-  // - Immutable/unique files (events/, messages/, tags/, entities/) are union-copied.
-  // - Mutable task.md propagates newer mtime, or emits a .sync-conflict- copy if both changed since last sync.
+function createReplicaSyncer(replicaA, replicaB) {
+  // Bidirectional eventual-consistency folder syncer:
+  // - Unique append-only files (events/, messages/, tags/, entities/) are union-copied.
+  // - Mutable task.md propagates newer mtime, emitting a .sync-conflict- copy if both changed since last sync.
   const lastSyncState = new Map();
+
   function syncDirTree(dirA, dirB, rel = "") {
     fs.mkdirSync(dirA, { recursive: true });
     fs.mkdirSync(dirB, { recursive: true });
@@ -1709,9 +1706,18 @@ test("two-replica async-sync simulator executes concurrent claims without double
     }
   }
 
+  return () => syncDirTree(replicaA, replicaB);
+}
+
+test("two-replica async-sync simulator executes concurrent claims without double-claim or corruption", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wb-cloud-sim-"));
+  const replicaA = path.join(root, "replica-a");
+  const replicaB = path.join(root, "replica-b");
+  const syncOnce = createReplicaSyncer(replicaA, replicaB);
+
   let syncStopped = false;
   const syncTimer = setInterval(() => {
-    if (!syncStopped) syncDirTree(replicaA, replicaB);
+    if (!syncStopped) syncOnce();
   }, 40);
 
   try {
@@ -1753,6 +1759,104 @@ test("two-replica async-sync simulator executes concurrent claims without double
   } finally {
     syncStopped = true;
     clearInterval(syncTimer);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("slow-sync simulator recovers when sync delay exceeds claim-settle-ms and LWW loser overwrites task.md", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wb-slow-sim-"));
+  const replicaA = path.join(root, "replica-a");
+  const replicaB = path.join(root, "replica-b");
+  const syncOnce = createReplicaSyncer(replicaA, replicaB);
+
+  try {
+    const t1 = runWbJson(["create", "--bucket", replicaA, "--entity", "owner-a", "--title", "Slow sync race"]);
+    syncOnce();
+
+    // Simulate slow cloud sync paused across claims (claimSettleMs=50ms < sync delay).
+    // Start "alpha" first, then "zeta" slightly later so "zeta" loses the election ("alpha" < "zeta")
+    // yet writes a newer LWW task.md mtime!
+    const resAlpha = await runWbAsync(["claim", "--bucket", replicaA, "--entity", "alpha", "--claim-settle-ms", "50", "--json"]);
+    await new Promise((r) => setTimeout(r, 30));
+    const resZeta = await runWbAsync(["claim", "--bucket", replicaB, "--entity", "zeta", "--claim-settle-ms", "50", "--json"]);
+    assert.equal(resAlpha.status, 0, resAlpha.stderr);
+    assert.equal(resZeta.status, 0, resZeta.stderr);
+
+    // Delayed sync now delivers both events and creates a real .sync-conflict- copy,
+    // with LWW task.md temporarily showing claimed_by: "zeta" on both replicas.
+    syncOnce();
+    const taskFiles = fs.readdirSync(path.join(replicaA, "tasks", t1.task_id));
+    assert.ok(taskFiles.some((f) => isSyncConflictFilename(f)));
+
+    // Both replicas deterministically agree on claim_winner === "alpha"
+    const rA = runWb(["render", "--bucket", replicaA, "--task", t1.task_id, "--json"]);
+    const rB = runWb(["render", "--bucket", replicaB, "--task", t1.task_id, "--json"]);
+    assert.equal(JSON.parse(rA.stdout).claim_winner, "alpha");
+    assert.equal(JSON.parse(rB.stdout).claim_winner, "alpha");
+
+    // Loser "zeta" is rejected at post even though LWW task.md temporarily had claimed_by="zeta"
+    const zetaPost = runWb([
+      "post",
+      "--bucket",
+      replicaB,
+      "--entity",
+      "zeta",
+      "--task",
+      t1.task_id,
+      "--type",
+      "review",
+      "--status",
+      "review",
+    ]);
+    assert.equal(zetaPost.status, 2);
+    assert.match(zetaPost.stderr, /Split-brain claim conflict/);
+
+    // Winner "alpha" heals task.md and completes full feedback rework across delayed syncs
+    const rev1 = runWbJson([
+      "post",
+      "--bucket",
+      replicaA,
+      "--entity",
+      "alpha",
+      "--task",
+      t1.task_id,
+      "--type",
+      "review",
+      "--status",
+      "review",
+      "-m",
+      "Round 1 work",
+    ]);
+    assert.equal(rev1.task.claimed_by, "alpha");
+    syncOnce();
+
+    const fb = runWbJson([
+      "post",
+      "--bucket",
+      replicaB,
+      "--entity",
+      "owner-a",
+      "--task",
+      t1.task_id,
+      "--type",
+      "feedback",
+      "-m",
+      "Polish",
+      "--status",
+      "pending",
+      "--bump-revision",
+    ]);
+    assert.equal(fb.task.claim_round, 2);
+    assert.equal(fb.task.assignee, "alpha");
+    syncOnce();
+
+    runWbJson(["claim", "--bucket", replicaA, "--entity", "alpha", "--claim-settle-ms", "50"]);
+    runWbJson(["post", "--bucket", replicaA, "--entity", "alpha", "--task", t1.task_id, "--type", "review", "--status", "review"]);
+    syncOnce();
+
+    const done = runWbJson(["post", "--bucket", replicaB, "--entity", "owner-a", "--task", t1.task_id, "--type", "complete"]);
+    assert.equal(done.task.status, "complete");
+  } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });

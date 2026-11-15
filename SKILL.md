@@ -9,7 +9,11 @@ description: Lockfile-free, entity-agnostic filesystem Markdown work bucket with
 - Require two explicit parameters from the user before reading or modifying any bucket files:
   1. `bucket_dir`: Path to the bucket root (`pending/`, `active/`, `archive/`).
   2. `entity_id`: Your opaque identifier for this session (e.g., `entity-a`, `win-worker-1`, `ci-runner`).
-- Record any optional capability/platform `tags` (and whether `--include-untagged` applies) supplied by the user for filtering tasks.
+- Record any optional capability/platform `tags` (and whether `--include-untagged` applies) supplied by the user for executor task matching.
+  - **Owner vs executor tag scope:** `tags` only restrict which tasks you `claim` as an executor. Creating, watching (`--task`), answering, reviewing, completing, or cancelling tasks where `owner == <entity_id>` is always allowed regardless of `tags`.
+- Record optional execution mode parameters if supplied (defaults: `single-threaded`, `one-shot`):
+  - **Continuity (`one-shot` | `continuous`):** `one-shot` stops after submitting `review` or `blocked`; `continuous` loops back to Step 1 (`wb.mjs watch`) for ongoing work.
+  - **Concurrency (`single-threaded` | `multithreaded`):** `single-threaded` claims and executes 1 task inline (`WIP = 1`). `multithreaded` runs as a dispatcher watching the bucket and spawning up to `max_workers` subagents (with configured `agent`/`model`/`effort`), each using a distinct `entity_id` (e.g. `<entity_id>-1`, `<entity_id>-2`) so `WIP = 1` per `entity_id` and `claimed_by` single-writer rules hold; parallelize shared-repo tasks only when `depends_on` or separate git worktrees prevent file conflicts.
 - **Never** invent, infer, or auto-generate `bucket_dir`, `entity_id`, or `tags`. If `bucket_dir` or `entity_id` is missing, ask the user and wait.
 - Treat all other `entity_id` values as anonymous peers. Never assume what tool, model, script, or human sits behind another `entity_id`.
 - Ensure `<bucket_dir>/pending`, `<bucket_dir>/active`, and `<bucket_dir>/archive` exist before operating.
@@ -28,15 +32,15 @@ description: Lockfile-free, entity-agnostic filesystem Markdown work bucket with
   - Frontmatter: `id`, `title`, `status: "pending"`, `priority`, `tags: []` (e.g., `["windows"]`, `["macos"]`, `["linux"]`), `owner: "<entity_id>"`, `claimed_by: ""`, `assignee: ""`, `parent: ""`, `depends_on: []`, `revision: 1`, `updated_by: "<entity_id>"`, `updated_at: "<ISO-8601 UTC>"`.
   - Body: `## Context & Target` (workspace path and target files), `## Description`, and numbered `- [ ] #N` `## Acceptance Criteria` including an exact verification command.
 - **Amending Mid-Flight:** Never edit `active/<task_id>/task.md` while `status == in-progress`. Publish `active/<task_id>/events/<UTC>-<entity_id>-amend.md` instead.
-- **Answering Blocked Tasks:** For `active/<task_id>/task.md` where `owner == <entity_id>` and `status == blocked`, publish `events/<UTC>-<entity_id>-answer.md`, then update `task.md` (`revision + 1`, `status: "pending"`, preserving `assignee` in `active/`, or moving back to `pending/` with `claimed_by: ""` and `assignee: ""` to open to any executor).
+- **Answering Blocked Tasks:** For `active/<task_id>/task.md` where `owner == <entity_id>` and `status == blocked`, publish `events/<UTC>-<entity_id>-answer.md`, then update `task.md` (`revision + 1`, `status: "pending"`, `claimed_by: ""`, pinning `assignee` to the prior executor in `active/` so they retain context, or `--reopen` to `pending/` with `assignee: ""` to open to any executor).
 - **Reviewing & Closing:** For `active/<task_id>/task.md` where `owner == <entity_id>` and `status == review`, inspect `events/`, workspace diffs, and test output. Either:
   - Publish `events/<UTC>-<entity_id>-complete.md`, update `task.md` (`status: "complete"`, `claimed_by: ""`), and move `active/<task_id>` to `archive/<task_id>`, **or**
-  - Publish `events/<UTC>-<entity_id>-feedback.md`, increment `revision`, and set `status: "pending"` in `active/<task_id>/task.md`, **or**
+  - Publish `events/<UTC>-<entity_id>-feedback.md`, increment `revision`, set `status: "pending"`, clear `claimed_by: ""`, and pin `assignee` to the prior executor in `active/<task_id>/task.md` (or `--reopen` to `pending/` with `assignee: ""`), **or**
   - To cancel a task, publish `events/<UTC>-<entity_id>-cancelled.md`, set `status: "cancelled"` and `claimed_by: ""`, and move to `archive/<task_id>`.
-- **Stale Recovery:** If an `in-progress` task in `active/` goes stale, `owner` publishes `events/<UTC>-<entity_id>-reset.md`, sets `status: "pending"` and `claimed_by: ""`, and moves `active/<task_id>` back to `pending/<task_id>`.
+- **Stale Recovery:** If an `in-progress` task in `active/` goes stale, `owner` publishes `events/<UTC>-<entity_id>-reset.md`, sets `status: "pending"`, `claimed_by: ""`, `assignee: ""`, and moves `active/<task_id>` back to `pending/<task_id>`.
 
 ## 4. Claiming, Decomposing & Executing Tasks (Executor Role)
-1. **READY Gate:** Enforce a WIP limit of **1 active `in-progress` task** per `entity_id`. Scan (or run `wb.mjs watch` with any configured `--tag` / `--include-untagged` flags):
+1. **READY Gate:** Enforce a WIP limit of **1 active `in-progress` task** per `entity_id` (or `max_workers` concurrent subagents in `multithreaded` mode, each with its own `entity_id`). Scan (or run `wb.mjs watch` with any configured `--tag` / `--include-untagged` flags):
    - `active/*/task.md` where `status == pending` and `assignee == <entity_id>` (resume your own unblocked/rejected tasks first; direct `assignee` matches bypass tag filters), then
    - `pending/*/task.md` where `status == pending`, `claimed_by == ""`, and `assignee` is `""` or `<entity_id>`.
    - **Tag filter check:** If session capability `tags` are configured, require every tag in `task.tags` to be present in your configured `tags`, and ignore untagged tasks (`tags: []`) unless `--include-untagged` was specified (or `assignee == <entity_id>`).
@@ -44,19 +48,22 @@ description: Lockfile-free, entity-agnostic filesystem Markdown work bucket with
 2. **Atomic Claim:**
    - If claiming from `pending/`, atomically move the folder (`wb.mjs claim`, POSIX `mv`, or PowerShell `Move-Item -ErrorAction Stop`). If the source folder vanished, another entity claimed it first - silently skip to the next candidate.
    - Publish `active/<task_id>/events/<UTC>-<entity_id>-claimed.md`, update `task.md` (`status: "in-progress"`, `claimed_by: "<entity_id>"`, `updated_at: "<UTC>"`), and record the latest filename in `events/` as `last_event_seen`.
+   - In `multithreaded` mode, pass the candidate `--task <task_id>` (or worker `entity_id`, `bucket_dir`, and `tags`) to a spawned subagent so it claims and executes in an isolated context while the dispatcher stays in `wb.mjs watch`.
 3. **Checkpoint & Amendment Check:** Before modifying workspace files and before finalization, refresh `updated_at` (heartbeat) and check `active/<task_id>/events/` for any files newer than `last_event_seen`. If new `*-amend.md` files exist, read all of them in chronological order, merge changes into `task.md` (incrementing `revision`), publish a `*-log.md` event noting incorporation, and advance `last_event_seen`.
 4. **Subtask Decomposition (Optional):** You may split an oversized task into child tasks (`parent: "<task_id>"`, `owner: "<entity_id>"`, plus platform/capability `tags`) in `pending/`, append all child IDs to the parent's `depends_on`, publish a `*-log.md` event, and set the parent to `status: "pending"`, `assignee: "<entity_id>"`, `claimed_by: ""` in `active/`. Execute/review the children until all are `complete`, then resume the parent to verify its `## Acceptance Criteria`.
 5. **Assume & Flag Execution Policy:**
    - Make tentative, idiomatic decisions on straightforward, reversible details without stopping, and log every assumption in `events/<UTC>-<entity_id>-log.md`.
    - **Hard Stop (Halt Immediately)** if: (a) an unexpected public API, schema, wire protocol, or dependency change is required, (b) requirements conflict or allow two fundamentally different designs, or (c) verification still fails after **2 fix attempts**.
-6. **Halt or DONE Gate:**
-   - **If Blocked / Halted:** Publish `events/<UTC>-<entity_id>-question.md`, then set `task.md` `status: "blocked"` (leave in `active/<task_id>/`), and stop.
-   - **If Complete (DONE Gate):** Verify every `- [ ]` in `## Acceptance Criteria` is checked `- [x]`, publish `events/<UTC>-<entity_id>-review.md` with files changed, verification command output, and tentative assumptions, then set `task.md` `status: "review"` (leave in `active/<task_id>/`), and stop.
+6. **Halt, DONE Gate, Rework & Continuity:**
+   - **If Blocked / Halted:** Publish `events/<UTC>-<entity_id>-question.md`, then set `task.md` `status: "blocked"` (leave in `active/<task_id>/`).
+   - **If Complete (DONE Gate):** Verify every acceptance criterion passes, check `- [ ]` to `- [x]` (pass `--check-ac` to `wb.mjs post`), publish `events/<UTC>-<entity_id>-review.md` with files changed, verification command output, and tentative assumptions, then set `task.md` `status: "review"` (leave in `active/<task_id>/`). Do not pass `--bump-revision` on `review`.
+   - **Rework after `feedback`:** Resume the `active/` task via `claim`, read the new `*-feedback.md` event(s), apply fixes, re-verify, optionally post `--type log`, and run `wb.mjs post --type review --status review --check-ac` (no `--bump-revision`).
+   - **Next step:** If `one-shot`, stop. If `continuous`, return to Step 1 (`wb.mjs watch`).
 
 ## 5. Optional Helper CLI (`scripts/wb.mjs`)
-Run `node "<skill_dir>/scripts/wb.mjs" <subcommand> --help` for full flags:
+Do **not** read `scripts/wb.mjs` source; run `node "<skill_dir>/scripts/wb.mjs" <subcommand> --help` if you need flag details:
 - `create`: `wb.mjs create --bucket <dir> --entity <id> --title <text> [--priority ...] [--tag <t>] [--assignee <id>] [--depends-on <ids>]`
 - `claim`: `wb.mjs claim --bucket <dir> --entity <id> [--task <id>] [--tag <t>] [--include-untagged] [--json]`
-- `post`: `wb.mjs post --bucket <dir> --entity <id> --task <id> --type <type> -m <text> [--status <status>] [--bump-revision] [--reopen]`
-- `watch`: `wb.mjs watch --bucket <dir> [--entity <id>] [--task <id>] [--tag <t>] [--include-untagged] [--after-event <file>] [--json]`
+- `post`: `wb.mjs post --bucket <dir> --entity <id> --task <id> --type <type> -m <text> [--status <status>] [--bump-revision] [--check-ac] [--reopen]` (preserves `task.md` body unless `--check-ac` is passed; auto-pins `assignee` from `claimed_by` when returning `review`/`blocked` to `pending` in `active/`)
+- `watch`: `wb.mjs watch --bucket <dir> [--entity <id>] [--task <id>] [--tag <t>] [--include-untagged] [--after-event <file>] [--json]` (exiting `124` on `--timeout` means no matching updates yet, not an error)
 - `render`: `wb.mjs render --bucket <dir> --task <id> [--json]`

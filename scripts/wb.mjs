@@ -1040,6 +1040,7 @@ function cmdPost(argv) {
       "claimed-by": { type: "string" },
       "add-depends-on": { type: "string", multiple: true },
       "remove-depends-on": { type: "string", multiple: true },
+      "check-ac": { type: "boolean", default: false },
       reopen: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -1099,6 +1100,7 @@ function cmdPost(argv) {
       values["claimed-by"] !== undefined ||
       addDeps.length > 0 ||
       removeDeps.size > 0 ||
+      values["check-ac"] ||
       values.reopen
   );
 
@@ -1148,9 +1150,17 @@ function cmdPost(argv) {
   let finalStage = found.stage;
   let finalDir = found.dir;
   const updatedTask = { ...found.task };
+  let updatedBody = found.body;
 
   // 2. Atomically update task.md if requested
   if (mutatesTaskMd) {
+    const returningToActivePending =
+      found.stage === "active" &&
+      (found.task.status === "blocked" || found.task.status === "review") &&
+      targetStatus === "pending" &&
+      !values.reopen &&
+      eventType !== "reset";
+
     if (targetStatus) {
       updatedTask.status = targetStatus;
     }
@@ -1164,7 +1174,8 @@ function cmdPost(argv) {
       targetStatus === "complete" ||
       targetStatus === "cancelled" ||
       eventType === "reset" ||
-      values.reopen
+      values.reopen ||
+      returningToActivePending
     ) {
       updatedTask.claimed_by = "";
     }
@@ -1174,6 +1185,12 @@ function cmdPost(argv) {
       updatedTask.assignee = values.assignee;
     } else if (values.reopen || eventType === "reset") {
       updatedTask.assignee = "";
+    } else if (returningToActivePending && !updatedTask.assignee && found.task.claimed_by) {
+      updatedTask.assignee = found.task.claimed_by;
+    }
+
+    if (values["check-ac"]) {
+      updatedBody = updatedBody.replace(/^(\s*[-*]\s+)\[ \]/gm, "$1[x]");
     }
 
     if (addDeps.length > 0 || removeDeps.size > 0) {
@@ -1187,7 +1204,7 @@ function cmdPost(argv) {
     updatedTask.updated_by = entityId;
     updatedTask.updated_at = isoUtc;
 
-    atomicWriteFile(found.taskPath, formatTaskMarkdown(updatedTask, found.body));
+    atomicWriteFile(found.taskPath, formatTaskMarkdown(updatedTask, updatedBody));
 
     // 3. Directory stage moves (after payload & task.md update)
     if (updatedTask.status === "complete" || updatedTask.status === "cancelled") {
@@ -1643,6 +1660,7 @@ function printPostHelp() {
   --claimed-by <id>                      Update claimed_by (pass "" to clear)
   --add-depends-on <id1,id2>             Append task IDs to depends_on
   --remove-depends-on <id1,id2>          Remove task IDs from depends_on
+  --check-ac                             Check all '- [ ]' acceptance criteria boxes to '- [x]'
   --reopen                               Move active task back to pending/ and clear claimed_by/assignee
   --json                                 Output JSON`);
 }

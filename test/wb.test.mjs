@@ -916,3 +916,150 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
     fs.rmSync(bucket, { recursive: true, force: true });
   }
 });
+
+test("post auto-pins assignee on feedback/answer from pool-claimed task and --check-ac checks boxes", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson([
+      "create",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--title",
+      "Pool task rework",
+      "--ac",
+      "First check",
+      "--ac",
+      "Second check",
+    ]);
+    assert.equal(created.task.assignee, "");
+
+    const claimed = runWbJson([
+      "claim",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-1",
+    ]);
+    assert.equal(claimed.task.claimed_by, "worker-1");
+    assert.equal(claimed.task.assignee, "");
+
+    // Worker submits review with --check-ac
+    const reviewed = runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-1",
+      "--task",
+      created.task_id,
+      "--type",
+      "review",
+      "--status",
+      "review",
+      "--check-ac",
+    ]);
+    assert.equal(reviewed.task.status, "review");
+
+    const renderedReview = runWbJson([
+      "render",
+      "--bucket",
+      bucket,
+      "--task",
+      created.task_id,
+    ]);
+    assert.match(renderedReview.body, /- \[x\] #1 First check/);
+    assert.match(renderedReview.body, /- \[x\] #2 Second check/);
+
+    // Owner sends feedback without --assignee: should auto-pin assignee=worker-1 and clear claimed_by
+    const fb = runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--task",
+      created.task_id,
+      "--type",
+      "feedback",
+      "-m",
+      "Needs adjustment",
+      "--status",
+      "pending",
+      "--bump-revision",
+    ]);
+    assert.equal(fb.stage, "active");
+    assert.equal(fb.task.status, "pending");
+    assert.equal(fb.task.assignee, "worker-1");
+    assert.equal(fb.task.claimed_by, "");
+    assert.equal(fb.task.revision, 2);
+
+    // Another worker cannot claim worker-1's pinned active task
+    const otherBlocked = runWb([
+      "claim",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-2",
+    ]);
+    assert.equal(otherBlocked.status, 2);
+
+    // worker-1 automatically picks it back up from active/
+    const reclaimed = runWbJson([
+      "claim",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-1",
+    ]);
+    assert.equal(reclaimed.task_id, created.task_id);
+    assert.equal(reclaimed.task.status, "in-progress");
+
+    // Reopening to general pool clears assignee and moves back to pending/
+    runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-1",
+      "--task",
+      created.task_id,
+      "--type",
+      "question",
+      "--status",
+      "blocked",
+      "-m",
+      "Need pool handoff",
+    ]);
+    const reopened = runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--task",
+      created.task_id,
+      "--type",
+      "answer",
+      "-m",
+      "Opening to pool",
+      "--reopen",
+    ]);
+    assert.equal(reopened.stage, "pending");
+    assert.equal(reopened.task.assignee, "");
+    assert.equal(reopened.task.claimed_by, "");
+
+    // Now worker-2 can claim it
+    const claimedBy2 = runWbJson([
+      "claim",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-2",
+    ]);
+    assert.equal(claimedBy2.task_id, created.task_id);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});

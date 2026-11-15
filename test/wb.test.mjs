@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import {
   compareEventFilenames,
+  compareMessageFilenames,
   parseFrontmatter,
   serializeFrontmatter,
   slugify,
@@ -168,7 +169,18 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "--tag",
       "windows",
     ]);
-    const tWinCert = runWbJson([
+    const tWinOrLinux = runWbJson([
+      "create",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--title",
+      "Windows or Linux task",
+      "--tags",
+      "windows,linux",
+    ]);
+    const tWinSigned = runWbJson([
       "create",
       "--bucket",
       bucket,
@@ -176,8 +188,8 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "owner-1",
       "--title",
       "Windows signed task",
-      "--tags",
-      "windows,signing-cert",
+      "--tag",
+      "windows-signing",
     ]);
     const tUntagged = runWbJson([
       "create",
@@ -202,83 +214,50 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "win-worker",
     ]);
 
-    // Worker with --tag windows matches pinned task (bypass) and windows task, ignores win+cert, macos, and untagged
-    const c1 = runWbJson([
-      "claim",
-      "--bucket",
-      bucket,
-      "--entity",
-      "win-worker",
-      "--tag",
-      "windows",
-    ]);
-    // Both tWin and tPinned are medium; whichever was created earlier (tWin) or let's check both are eligible
-    assert.ok([tWin.task_id, tPinned.task_id].includes(c1.task_id));
+    // Worker with --tag windows matches pinned task (bypass), windows task, and OR-tagged windows,linux task
+    const claimedIds = [];
+    for (let i = 0; i < 3; i += 1) {
+      const c = runWbJson([
+        "claim",
+        "--bucket",
+        bucket,
+        "--entity",
+        "win-worker",
+        "--tag",
+        "windows",
+      ]);
+      claimedIds.push(c.task_id);
+      runWbJson([
+        "post",
+        "--bucket",
+        bucket,
+        "--entity",
+        "win-worker",
+        "--task",
+        c.task_id,
+        "--type",
+        "review",
+        "--status",
+        "review",
+      ]);
+      runWbJson([
+        "post",
+        "--bucket",
+        bucket,
+        "--entity",
+        "owner-1",
+        "--task",
+        c.task_id,
+        "--type",
+        "complete",
+      ]);
+    }
+    assert.deepEqual(
+      new Set(claimedIds),
+      new Set([tWin.task_id, tWinOrLinux.task_id, tPinned.task_id])
+    );
 
-    // Complete c1 to free WIP
-    runWbJson([
-      "post",
-      "--bucket",
-      bucket,
-      "--entity",
-      "win-worker",
-      "--task",
-      c1.task_id,
-      "--type",
-      "review",
-      "--status",
-      "review",
-    ]);
-    runWbJson([
-      "post",
-      "--bucket",
-      bucket,
-      "--entity",
-      "owner-1",
-      "--task",
-      c1.task_id,
-      "--type",
-      "complete",
-    ]);
-
-    const c2 = runWbJson([
-      "claim",
-      "--bucket",
-      bucket,
-      "--entity",
-      "win-worker",
-      "--tag",
-      "windows",
-    ]);
-    assert.ok([tWin.task_id, tPinned.task_id].includes(c2.task_id));
-    assert.notEqual(c2.task_id, c1.task_id);
-
-    runWbJson([
-      "post",
-      "--bucket",
-      bucket,
-      "--entity",
-      "win-worker",
-      "--task",
-      c2.task_id,
-      "--type",
-      "review",
-      "--status",
-      "review",
-    ]);
-    runWbJson([
-      "post",
-      "--bucket",
-      bucket,
-      "--entity",
-      "owner-1",
-      "--task",
-      c2.task_id,
-      "--type",
-      "complete",
-    ]);
-
-    // Now only tWinCert and tUntagged remain; --tag windows without --include-untagged finds nothing (exit 2)
+    // Now only tWinSigned and tUntagged remain; --tag windows without --include-untagged finds nothing (exit 2)
     const noMatch = runWb([
       "claim",
       "--bucket",
@@ -290,7 +269,7 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
     ]);
     assert.equal(noMatch.status, 2);
 
-    // With --include-untagged, it claims tUntagged (still ignoring tWinCert)
+    // With --include-untagged, it claims tUntagged (still ignoring tWinSigned)
     const c3 = runWbJson([
       "claim",
       "--bucket",
@@ -303,7 +282,7 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
     ]);
     assert.equal(c3.task_id, tUntagged.task_id);
 
-    // Worker with both tags can claim tWinCert
+    // Worker with combined windows-signing tag claims tWinSigned
     const c4 = runWbJson([
       "claim",
       "--bucket",
@@ -311,11 +290,9 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "--entity",
       "win-cert-worker",
       "--tag",
-      "windows",
-      "--tag",
-      "signing-cert",
+      "windows-signing",
     ]);
-    assert.equal(c4.task_id, tWinCert.task_id);
+    assert.equal(c4.task_id, tWinSigned.task_id);
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
   }
@@ -1109,6 +1086,440 @@ test("human-created minimal/malformed tasks do not crash watch/render or deadloc
     const completed = runWbJson(["post", "--bucket", bucket, "--entity", "reviewer-1", "--task", "human-minimal", "--type", "complete"]);
     assert.equal(completed.stage, "archive");
     assert.equal(completed.task.status, "complete");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("backlog draft/ready lifecycle prevents premature claims and promotes/demotes cleanly", () => {
+  const bucket = makeTempBucket();
+  try {
+    const draftTask = runWbJson([
+      "create",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--title",
+      "Backlog draft item",
+      "--backlog",
+    ]);
+    assert.equal(draftTask.stage, "backlog");
+    assert.equal(draftTask.task.status, "draft");
+    assert.ok(fs.existsSync(path.join(bucket, "backlog", draftTask.task_id, "task.md")));
+
+    // Worker cannot claim draft in backlog
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+
+    // Mark ready inside backlog (still held back from workers)
+    const markedReady = runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--task",
+      draftTask.task_id,
+      "--type",
+      "log",
+      "-m",
+      "Refined and ready",
+      "--status",
+      "ready",
+    ]);
+    assert.equal(markedReady.stage, "backlog");
+    assert.equal(markedReady.task.status, "ready");
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+
+    // Human accidentally placing a draft task in pending/ must also not be claimable
+    const misplaced = runWbJson([
+      "create",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--title",
+      "Misplaced draft",
+      "--status",
+      "draft",
+    ]);
+    fs.renameSync(
+      path.join(bucket, "backlog", misplaced.task_id),
+      path.join(bucket, "pending", misplaced.task_id)
+    );
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+
+    // Promote draftTask to pending/ -> now claimable
+    const promoted = runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--task",
+      draftTask.task_id,
+      "--type",
+      "log",
+      "-m",
+      "Promoting to pending",
+      "--status",
+      "pending",
+    ]);
+    assert.equal(promoted.stage, "pending");
+    assert.equal(promoted.task.status, "pending");
+    assert.ok(fs.existsSync(path.join(bucket, "pending", draftTask.task_id, "task.md")));
+
+    // Pull back to backlog as ready, then re-promote and claim
+    const pulledBack = runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--task",
+      draftTask.task_id,
+      "--type",
+      "log",
+      "-m",
+      "Holding back briefly",
+      "--status",
+      "ready",
+    ]);
+    assert.equal(pulledBack.stage, "backlog");
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+
+    runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--task",
+      draftTask.task_id,
+      "--type",
+      "log",
+      "-m",
+      "Ready for work",
+      "--status",
+      "pending",
+    ]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "w-1"]);
+    assert.equal(claimed.task_id, draftTask.task_id);
+
+    // Cancel misplaced task directly from pending/
+    const cancelled = runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--task",
+      misplaced.task_id,
+      "--type",
+      "cancelled",
+      "-m",
+      "Not needed",
+    ]);
+    assert.equal(cancelled.stage, "archive");
+    assert.equal(cancelled.task.status, "cancelled");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("public messages filter by recipient/tags, coalesce bursts, and track last_msg_seen", async () => {
+  const bucket = makeTempBucket();
+  try {
+    // Numeric slug ordering check
+    const msgFiles = [
+      "20261115T042310Z-bob-fix-phase-2-10.md",
+      "20261115T042310Z-bob-fix-phase-2-2.md",
+      "20261115T042310Z-bob-fix-phase-2.md",
+    ];
+    assert.deepEqual([...msgFiles].sort(compareMessageFilenames), [
+      "20261115T042310Z-bob-fix-phase-2.md",
+      "20261115T042310Z-bob-fix-phase-2-2.md",
+      "20261115T042310Z-bob-fix-phase-2-10.md",
+    ]);
+
+    // Pre-existing message before bob registers should not flood initial watch
+    const pre = runWbJson([
+      "msg",
+      "send",
+      "--bucket",
+      bucket,
+      "--entity",
+      "alice",
+      "-m",
+      "Old announcement",
+    ]);
+    assert.deepEqual(pre.to, ["*"]);
+
+    // Register bob -> initializes last_msg_seen to pre.filename
+    const regBob = runWbJson([
+      "entity",
+      "register",
+      "--bucket",
+      bucket,
+      "--entity",
+      "bob",
+      "--tag",
+      "bob-tasks",
+    ]);
+    assert.equal(regBob.last_msg_seen, pre.filename);
+
+    // Start bob watcher; send unrelated message for joe + self-message from bob (neither should wake bob)
+    const watchPromise = runWbAsync([
+      "watch",
+      "--bucket",
+      bucket,
+      "--entity",
+      "bob",
+      "--tag",
+      "bob-tasks",
+      "--poll-ms",
+      "100",
+      "--msg-coalesce-ms",
+      "250",
+      "--timeout",
+      "4",
+      "--json",
+    ]);
+
+    await new Promise((r) => setTimeout(r, 120));
+    runWbJson([
+      "msg",
+      "send",
+      "--bucket",
+      bucket,
+      "--entity",
+      "alice",
+      "--to",
+      "joe",
+      "-m",
+      "For joe only",
+    ]);
+    runWbJson([
+      "msg",
+      "send",
+      "--bucket",
+      bucket,
+      "--entity",
+      "bob",
+      "-m",
+      "Self broadcast should not wake bob",
+    ]);
+
+    // Now send a rapid burst of two relevant messages (broadcast + tag-targeted)
+    const m1 = runWbJson([
+      "msg",
+      "send",
+      "--bucket",
+      bucket,
+      "--entity",
+      "alice",
+      "--tag",
+      "bob-tasks",
+      "-m",
+      "First update",
+    ]);
+    assert.deepEqual(m1.to, []);
+    const m2 = runWbJson([
+      "msg",
+      "send",
+      "--bucket",
+      bucket,
+      "--entity",
+      "alice",
+      "-m",
+      "Second broadcast",
+    ]);
+
+    const watchRes = await watchPromise;
+    assert.equal(watchRes.status, 0, watchRes.stderr);
+    const payload = JSON.parse(watchRes.stdout);
+    assert.equal(payload.mode, "ready");
+    assert.equal(payload.tasks.length, 0);
+    assert.deepEqual(
+      payload.messages.map((m) => m.filename),
+      [m1.filename, m2.filename]
+    );
+    assert.equal(payload.last_msg_seen, m2.filename);
+
+    // Re-arming watch must NOT loop on already-delivered messages
+    const secondWatch = runWb([
+      "watch",
+      "--bucket",
+      bucket,
+      "--entity",
+      "bob",
+      "--tag",
+      "bob-tasks",
+      "--poll-ms",
+      "100",
+      "--timeout",
+      "1",
+      "--json",
+    ]);
+    assert.equal(secondWatch.status, 124);
+
+    // Public list --all shows every message including joe-targeted and old ones
+    const allMsgs = runWbJson(["msg", "list", "--bucket", bucket, "--all"]);
+    assert.equal(allMsgs.count, 5);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("entities, tags registry, and owner-only watch mode", async () => {
+  const bucket = makeTempBucket();
+  try {
+    runWbJson([
+      "tag",
+      "set",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--tag",
+      "macos",
+      "-m",
+      "Entities running on macOS hosts",
+    ]);
+    runWbJson([
+      "entity",
+      "register",
+      "--bucket",
+      bucket,
+      "--entity",
+      "mac-1",
+      "--tag",
+      "macos",
+      "--mode",
+      "continuous",
+      "--ttl",
+      "300",
+    ]);
+
+    // Simulate a stale entity by setting updated_at in the past
+    runWbJson([
+      "entity",
+      "register",
+      "--bucket",
+      bucket,
+      "--entity",
+      "stale-1",
+      "--tag",
+      "linux",
+      "--ttl",
+      "60",
+    ]);
+    const stalePath = path.join(bucket, "entities", "stale-1.md");
+    const staleRaw = fs.readFileSync(stalePath, "utf8").replace(
+      /updated_at: "[^"]+"/,
+      'updated_at: "2020-01-01T00:00:00Z"'
+    );
+    fs.writeFileSync(stalePath, staleRaw);
+
+    const entities = runWbJson(["entity", "list", "--bucket", bucket]);
+    assert.equal(entities.count, 2);
+    const macEnt = entities.entities.find((e) => e.entity_id === "mac-1");
+    const staleEnt = entities.entities.find((e) => e.entity_id === "stale-1");
+    assert.equal(macEnt.online, true);
+    assert.equal(staleEnt.online, false);
+    assert.equal(staleEnt.state, "stale");
+
+    const tagsRes = runWbJson(["tag", "list", "--bucket", bucket]);
+    const macTag = tagsRes.tags.find((t) => t.tag === "macos");
+    assert.equal(macTag.documented, true);
+    assert.equal(macTag.description, "Entities running on macOS hosts");
+    assert.deepEqual(macTag.online_entities, ["mac-1"]);
+
+    // Owner-only mode must ignore unclaimed pending/ tasks and intermediate log events, waking only on review/blocked or relevant messages
+    const tOwned = runWbJson([
+      "create",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--title",
+      "Owned task",
+    ]);
+    runWbJson([
+      "create",
+      "--bucket",
+      bucket,
+      "--entity",
+      "other-owner",
+      "--title",
+      "Unclaimed pool task",
+    ]);
+    runWbJson([
+      "claim",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-1",
+      "--task",
+      tOwned.task_id,
+    ]);
+
+    const ownerWatch = runWbAsync([
+      "watch",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--owner-only",
+      "--poll-ms",
+      "100",
+      "--timeout",
+      "4",
+      "--json",
+    ]);
+
+    await new Promise((r) => setTimeout(r, 120));
+    // Intermediate log event should NOT wake owner
+    runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-1",
+      "--task",
+      tOwned.task_id,
+      "--type",
+      "log",
+      "-m",
+      "Working on it",
+    ]);
+
+    await new Promise((r) => setTimeout(r, 150));
+    // Transition to review SHOULD wake owner
+    runWbJson([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "worker-1",
+      "--task",
+      tOwned.task_id,
+      "--type",
+      "review",
+      "--status",
+      "review",
+      "-m",
+      "Ready for review",
+    ]);
+
+    const ownerRes = await ownerWatch;
+    assert.equal(ownerRes.status, 0, ownerRes.stderr);
+    const ownerPayload = JSON.parse(ownerRes.stdout);
+    assert.equal(ownerPayload.mode, "owner");
+    assert.equal(ownerPayload.tasks.length, 0);
+    assert.equal(ownerPayload.owner_tasks.length, 1);
+    assert.equal(ownerPayload.owner_tasks[0].id, tOwned.task_id);
+    assert.equal(ownerPayload.owner_tasks[0].status, "review");
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
   }

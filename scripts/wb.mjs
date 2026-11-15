@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 
 const VALID_STATUSES = new Set([
+  "draft",
+  "ready",
   "pending",
   "in-progress",
   "blocked",
@@ -14,6 +16,21 @@ const VALID_STATUSES = new Set([
   "complete",
   "cancelled",
 ]);
+
+const DEFAULT_ENTITY_TTL_SECONDS = 300;
+const ENTITY_HEARTBEAT_MS = 60_000;
+const DEFAULT_MSG_COALESCE_MS = 500;
+const MAX_MSG_COALESCE_MS = 2000;
+const TASK_STAGES = ["active", "pending", "backlog", "archive"];
+const BUCKET_SUBDIRS = [
+  "backlog",
+  "pending",
+  "active",
+  "archive",
+  "messages",
+  "entities",
+  "tags",
+];
 
 const VALID_PRIORITIES = new Set(["low", "medium", "high", "critical"]);
 
@@ -130,7 +147,7 @@ function normalizeTags(tags) {
 }
 
 function ensureBucketDirs(bucketDir) {
-  for (const sub of ["pending", "active", "archive"]) {
+  for (const sub of BUCKET_SUBDIRS) {
     fs.mkdirSync(path.join(bucketDir, sub), { recursive: true });
   }
 }
@@ -299,7 +316,7 @@ function parseFrontmatter(rawText) {
     const stripped = stripInlineComment(rawVal);
     if (stripped === "") {
       // Could be start of a multi-line YAML array or empty value; default to [] for array keys
-      if (key === "tags" || key === "depends_on") {
+      if (key === "tags" || key === "depends_on" || key === "to") {
         data[key] = [];
         currentListKey = key;
       } else {
@@ -459,17 +476,18 @@ function listStageTasks(bucketDir, stage) {
 function scanAllTasks(bucketDir) {
   const active = listStageTasks(bucketDir, "active");
   const pending = listStageTasks(bucketDir, "pending");
+  const backlog = listStageTasks(bucketDir, "backlog");
   const archive = listStageTasks(bucketDir, "archive");
   const byId = new Map();
-  for (const item of [...active, ...pending, ...archive]) {
+  for (const item of [...active, ...pending, ...backlog, ...archive]) {
     byId.set(item.task.id || item.dirName, item);
   }
-  return { active, pending, archive, byId };
+  return { active, pending, backlog, archive, byId };
 }
 
 function findTask(bucketDir, taskId) {
   validateTaskId(taskId);
-  for (const stage of ["active", "pending", "archive"]) {
+  for (const stage of TASK_STAGES) {
     const dir = path.join(bucketDir, stage, taskId);
     const taskPath = path.join(dir, "task.md");
     try {
@@ -599,38 +617,26 @@ function isEventAfter(eventsDir, candidateName, afterName) {
   return compareEventFilenames(candidateName, afterName) > 0;
 }
 
-function writeUniqueEvent(eventsDir, entityId, eventType, body, now = new Date()) {
-  fs.mkdirSync(eventsDir, { recursive: true });
-  const compactUtc = formatCompactUtc(now);
-  const isoUtc = formatIsoUtc(now);
-  const content = formatEventMarkdown(
-    {
-      type: eventType,
-      entity_id: entityId,
-      timestamp: isoUtc,
-    },
-    body
-  );
-
+function writeUniqueMarkdown(targetDir, prefix, content, label = "file") {
+  fs.mkdirSync(targetDir, { recursive: true });
   for (let seq = 1; seq < 1000; seq += 1) {
     const suffix = seq === 1 ? "" : `-${seq}`;
-    const filename = `${compactUtc}-${entityId}-${eventType}${suffix}.md`;
-    const targetPath = path.join(eventsDir, filename);
+    const filename = `${prefix}${suffix}.md`;
+    const targetPath = path.join(targetDir, filename);
     if (fs.existsSync(targetPath)) continue;
     tmpCounter += 1;
     const tmpPath = path.join(
-      eventsDir,
+      targetDir,
       `.${filename}.${process.pid}.${tmpCounter}.tmp`
     );
     try {
       fs.writeFileSync(tmpPath, content, { encoding: "utf8", flag: "wx" });
-      // Ensure target wasn't created concurrently before rename
       if (fs.existsSync(targetPath)) {
         fs.unlinkSync(tmpPath);
         continue;
       }
       fs.renameSync(tmpPath, targetPath);
-      return { filename, path: targetPath, timestamp: isoUtc };
+      return { filename, path: targetPath };
     } catch (err) {
       try {
         fs.unlinkSync(tmpPath);
@@ -641,7 +647,454 @@ function writeUniqueEvent(eventsDir, entityId, eventType, body, now = new Date()
       throw err;
     }
   }
-  throw new CliError("Failed to allocate unique event filename after 1000 attempts.");
+  throw new CliError(`Failed to allocate unique ${label} filename after 1000 attempts.`);
+}
+
+function writeUniqueEvent(eventsDir, entityId, eventType, body, now = new Date()) {
+  const compactUtc = formatCompactUtc(now);
+  const isoUtc = formatIsoUtc(now);
+  const content = formatEventMarkdown(
+    {
+      type: eventType,
+      entity_id: entityId,
+      timestamp: isoUtc,
+    },
+    body
+  );
+  const res = writeUniqueMarkdown(
+    eventsDir,
+    `${compactUtc}-${entityId}-${eventType}`,
+    content,
+    "event"
+  );
+  return { ...res, timestamp: isoUtc };
+}
+
+function parseMessageFilenameParts(filename) {
+  const m = filename.match(/^(\d{8}T\d{6}Z)-(.+)\.md$/);
+  if (!m) return null;
+  return { utc: m[1], rest: m[2] };
+}
+
+function compareTimestampedPrefixAndSeq(aRest, bRest) {
+  if (aRest === bRest) return 0;
+  const ma = aRest.match(/^(.+)-(\d+)$/);
+  const mb = bRest.match(/^(.+)-(\d+)$/);
+  if (ma && ma[1] === bRest) return 1;
+  if (mb && mb[1] === aRest) return -1;
+  if (ma && mb && ma[1] === mb[1]) {
+    return Number.parseInt(ma[2], 10) - Number.parseInt(mb[2], 10);
+  }
+  return aRest < bRest ? -1 : 1;
+}
+
+function compareMessageFilenames(a, b) {
+  if (a === b) return 0;
+  const pa = parseMessageFilenameParts(a);
+  const pb = parseMessageFilenameParts(b);
+  if (pa && pb) {
+    if (pa.utc !== pb.utc) return pa.utc < pb.utc ? -1 : 1;
+    return compareTimestampedPrefixAndSeq(pa.rest, pb.rest);
+  }
+  return a < b ? -1 : 1;
+}
+
+function listMessageFiles(messagesDir) {
+  let entries;
+  try {
+    entries = fs.readdirSync(messagesDir, { withFileTypes: true });
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+  const files = entries
+    .filter((e) => !e.name.startsWith(".") && e.isFile() && e.name.endsWith(".md"))
+    .map((e) => ({
+      name: e.name,
+      parts: parseMessageFilenameParts(e.name),
+      mtimeNs: getFileMtimeNs(path.join(messagesDir, e.name)),
+    }));
+
+  files.sort((a, b) => {
+    if (a.parts && b.parts) {
+      if (a.parts.utc !== b.parts.utc) {
+        return a.parts.utc < b.parts.utc ? -1 : 1;
+      }
+      const seqCmp = compareTimestampedPrefixAndSeq(a.parts.rest, b.parts.rest);
+      const ma = a.parts.rest.match(/^(.+)-(\d+)$/);
+      const mb = b.parts.rest.match(/^(.+)-(\d+)$/);
+      if (
+        (ma && ma[1] === b.parts.rest) ||
+        (mb && mb[1] === a.parts.rest) ||
+        (ma && mb && ma[1] === mb[1])
+      ) {
+        return seqCmp;
+      }
+      if (a.mtimeNs !== b.mtimeNs) {
+        return a.mtimeNs < b.mtimeNs ? -1 : 1;
+      }
+    }
+    return compareMessageFilenames(a.name, b.name);
+  });
+  return files.map((f) => f.name);
+}
+
+function isMessageAfter(messagesDir, candidateName, afterName) {
+  if (!afterName) return true;
+  if (candidateName === afterName) return false;
+  const candParts = parseMessageFilenameParts(candidateName);
+  const afterParts = parseMessageFilenameParts(afterName);
+  if (candParts && afterParts) {
+    if (candParts.utc !== afterParts.utc) {
+      return candParts.utc > afterParts.utc;
+    }
+    const ma = candParts.rest.match(/^(.+)-(\d+)$/);
+    const mb = afterParts.rest.match(/^(.+)-(\d+)$/);
+    if (
+      (ma && ma[1] === afterParts.rest) ||
+      (mb && mb[1] === candParts.rest) ||
+      (ma && mb && ma[1] === mb[1])
+    ) {
+      return compareTimestampedPrefixAndSeq(candParts.rest, afterParts.rest) > 0;
+    }
+    const candMtime = getFileMtimeNs(path.join(messagesDir, candidateName));
+    const afterMtime = getFileMtimeNs(path.join(messagesDir, afterName));
+    if (candMtime !== afterMtime) {
+      return candMtime > afterMtime;
+    }
+  }
+  return compareMessageFilenames(candidateName, afterName) > 0;
+}
+
+function formatMessageMarkdown(data, body) {
+  const fm = serializeFrontmatter(data, ["from", "to", "tags", "timestamp"]);
+  const trimmedBody = String(body || "").replace(/\r/g, "").trim();
+  if (!trimmedBody) return `${fm}\n`;
+  return `${fm}\n\n${trimmedBody}\n`;
+}
+
+function writeUniqueMessage(messagesDir, fromEntity, toList, tags, slugText, body, now = new Date()) {
+  const compactUtc = formatCompactUtc(now);
+  const isoUtc = formatIsoUtc(now);
+  const slug = slugify(slugText || "msg");
+  const content = formatMessageMarkdown(
+    {
+      from: fromEntity,
+      to: toList,
+      tags,
+      timestamp: isoUtc,
+    },
+    body
+  );
+  const res = writeUniqueMarkdown(
+    messagesDir,
+    `${compactUtc}-${fromEntity}-${slug}`,
+    content,
+    "message"
+  );
+  return { ...res, timestamp: isoUtc };
+}
+
+function readMessageFile(msgPath) {
+  const filename = path.basename(msgPath);
+  const raw = fs.readFileSync(msgPath, "utf8");
+  try {
+    const { data, body } = parseFrontmatter(raw);
+    return {
+      filename,
+      from: String(data.from ?? ""),
+      to: coerceStringList(data.to),
+      tags: normalizeTags(coerceStringList(data.tags)),
+      timestamp: String(data.timestamp ?? ""),
+      body: body.trim(),
+    };
+  } catch (err) {
+    if (err instanceof CliError) {
+      return {
+        filename,
+        from: "",
+        to: ["*"],
+        tags: [],
+        timestamp: "",
+        body: raw.replace(/\r/g, "").trim(),
+      };
+    }
+    throw err;
+  }
+}
+
+function matchesMessage(msg, entityId, workerTags) {
+  if (entityId && msg.from === entityId) return false;
+  if (msg.to.includes("*")) return true;
+  if (entityId && msg.to.includes(entityId)) return true;
+  if (msg.tags.length > 0 && workerTags.size > 0) {
+    return msg.tags.some((t) => workerTags.has(t));
+  }
+  return false;
+}
+
+function findUnreadMessages(bucketDir, entityId, workerTags, afterMsg) {
+  const messagesDir = path.join(bucketDir, "messages");
+  const allFiles = listMessageFiles(messagesDir);
+  const latestFile = allFiles.length > 0 ? allFiles[allFiles.length - 1] : "";
+  const candidateFiles = afterMsg
+    ? allFiles.filter((f) => isMessageAfter(messagesDir, f, afterMsg))
+    : allFiles;
+  const matched = [];
+  for (const filename of candidateFiles) {
+    try {
+      const msg = readMessageFile(path.join(messagesDir, filename));
+      if (matchesMessage(msg, entityId, workerTags)) {
+        matched.push(msg);
+      }
+    } catch (err) {
+      if (err.code === "ENOENT") continue;
+      throw err;
+    }
+  }
+  return { matched, latestFile };
+}
+
+function formatEntityMarkdown(data, body) {
+  const fm = serializeFrontmatter(data, [
+    "entity_id",
+    "tags",
+    "include_untagged",
+    "mode",
+    "ttl_seconds",
+    "last_msg_seen",
+    "updated_at",
+  ]);
+  const trimmedBody = String(body || "").replace(/\r/g, "").trim();
+  if (!trimmedBody) return `${fm}\n`;
+  return `${fm}\n\n${trimmedBody}\n`;
+}
+
+function readEntityFile(bucketDir, entityId) {
+  const entityPath = path.join(bucketDir, "entities", `${entityId}.md`);
+  let raw;
+  try {
+    raw = fs.readFileSync(entityPath, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
+  try {
+    const { data, body } = parseFrontmatter(raw);
+    const ttl = Number.parseInt(String(data.ttl_seconds ?? DEFAULT_ENTITY_TTL_SECONDS), 10);
+    return {
+      entity_id: String(data.entity_id || entityId),
+      tags: normalizeTags(coerceStringList(data.tags)),
+      include_untagged: Boolean(data.include_untagged),
+      mode: String(data.mode ?? ""),
+      ttl_seconds: Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_ENTITY_TTL_SECONDS,
+      last_msg_seen: String(data.last_msg_seen ?? ""),
+      updated_at: String(data.updated_at ?? ""),
+      body: body.trim(),
+      path: entityPath,
+    };
+  } catch (err) {
+    if (err instanceof CliError) return null;
+    throw err;
+  }
+}
+
+function upsertEntityFile(bucketDir, entityId, updates = {}) {
+  const entitiesDir = path.join(bucketDir, "entities");
+  fs.mkdirSync(entitiesDir, { recursive: true });
+  const entityPath = path.join(entitiesDir, `${entityId}.md`);
+  const existing = readEntityFile(bucketDir, entityId);
+  let initialLastMsgSeen = existing ? existing.last_msg_seen : "";
+  if (!existing) {
+    const existingMsgs = listMessageFiles(path.join(bucketDir, "messages"));
+    if (existingMsgs.length > 0) {
+      initialLastMsgSeen = existingMsgs[existingMsgs.length - 1];
+    }
+  }
+  const isoUtc = formatIsoUtc(new Date());
+  const nextData = {
+    entity_id: entityId,
+    tags:
+      updates.tags !== undefined
+        ? normalizeTags(updates.tags)
+        : existing
+        ? existing.tags
+        : [],
+    include_untagged:
+      updates.include_untagged !== undefined
+        ? Boolean(updates.include_untagged)
+        : existing
+        ? existing.include_untagged
+        : false,
+    mode:
+      updates.mode !== undefined
+        ? String(updates.mode)
+        : existing
+        ? existing.mode
+        : "",
+    ttl_seconds:
+      updates.ttl_seconds !== undefined
+        ? updates.ttl_seconds
+        : existing
+        ? existing.ttl_seconds
+        : DEFAULT_ENTITY_TTL_SECONDS,
+    last_msg_seen:
+      updates.last_msg_seen !== undefined
+        ? String(updates.last_msg_seen)
+        : initialLastMsgSeen,
+    updated_at: isoUtc,
+  };
+  const nextBody =
+    updates.body !== undefined ? updates.body : existing ? existing.body : "";
+  atomicWriteFile(entityPath, formatEntityMarkdown(nextData, nextBody));
+  return { ...nextData, body: String(nextBody || "").trim(), path: entityPath };
+}
+
+function touchExistingEntity(bucketDir, entityId) {
+  if (readEntityFile(bucketDir, entityId)) {
+    upsertEntityFile(bucketDir, entityId);
+  }
+}
+
+function listEntities(bucketDir) {
+  const entitiesDir = path.join(bucketDir, "entities");
+  try {
+    fs.statSync(entitiesDir);
+  } catch {
+    return [];
+  }
+  let entries;
+  try {
+    entries = fs.readdirSync(entitiesDir, { withFileTypes: true });
+  } catch (err) {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  }
+  const nowMs = Date.now();
+  const out = [];
+  for (const entry of entries) {
+    if (entry.name.startsWith(".") || !entry.isFile() || !entry.name.endsWith(".md")) {
+      continue;
+    }
+    const entityId = entry.name.slice(0, -3);
+    const info = readEntityFile(bucketDir, entityId);
+    if (!info) continue;
+    let updatedMs = Date.parse(info.updated_at);
+    if (!Number.isFinite(updatedMs)) {
+      try {
+        updatedMs = fs.statSync(info.path).mtimeMs;
+      } catch {
+        updatedMs = 0;
+      }
+    }
+    const ageSec = Math.max(0, Math.round((nowMs - updatedMs) / 1000));
+    const online = ageSec <= info.ttl_seconds;
+    out.push({
+      ...info,
+      age_seconds: ageSec,
+      state: online ? "online" : "stale",
+      online,
+    });
+  }
+  out.sort((a, b) => a.entity_id.localeCompare(b.entity_id));
+  return out;
+}
+
+function formatTagMarkdown(data, body) {
+  const fm = serializeFrontmatter(data, ["tag", "updated_by", "updated_at"]);
+  const trimmedBody = String(body || "").replace(/\r/g, "").trim();
+  if (!trimmedBody) return `${fm}\n`;
+  return `${fm}\n\n${trimmedBody}\n`;
+}
+
+function readTagDoc(tagPath, tagName) {
+  const raw = fs.readFileSync(tagPath, "utf8");
+  try {
+    const { data, body } = parseFrontmatter(raw);
+    return {
+      tag: String(data.tag || tagName).trim().toLowerCase(),
+      updated_by: String(data.updated_by ?? ""),
+      updated_at: String(data.updated_at ?? ""),
+      description: body.trim(),
+    };
+  } catch (err) {
+    if (err instanceof CliError) {
+      return {
+        tag: tagName,
+        updated_by: "",
+        updated_at: "",
+        description: raw.replace(/\r/g, "").trim(),
+      };
+    }
+    throw err;
+  }
+}
+
+function listTagsInfo(bucketDir) {
+  const tagsDir = path.join(bucketDir, "tags");
+  try {
+    fs.statSync(tagsDir);
+  } catch {
+    // ignore
+  }
+  const map = new Map();
+  const ensureEntry = (name) => {
+    const key = String(name).trim().toLowerCase();
+    if (!key) return null;
+    if (!map.has(key)) {
+      map.set(key, {
+        tag: key,
+        documented: false,
+        description: "",
+        updated_by: "",
+        updated_at: "",
+        entities: [],
+        online_entities: [],
+        task_count: 0,
+      });
+    }
+    return map.get(key);
+  };
+
+  try {
+    const entries = fs.readdirSync(tagsDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith(".") || !entry.isFile() || !entry.name.endsWith(".md")) {
+        continue;
+      }
+      const tagName = entry.name.slice(0, -3).toLowerCase();
+      const doc = readTagDoc(path.join(tagsDir, entry.name), tagName);
+      const item = ensureEntry(doc.tag);
+      if (item) {
+        item.documented = true;
+        item.description = doc.description;
+        item.updated_by = doc.updated_by;
+        item.updated_at = doc.updated_at;
+      }
+    }
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+  }
+
+  for (const ent of listEntities(bucketDir)) {
+    for (const t of ent.tags) {
+      const item = ensureEntry(t);
+      if (item) {
+        item.entities.push(ent.entity_id);
+        if (ent.online) item.online_entities.push(ent.entity_id);
+      }
+    }
+  }
+
+  const { active, pending, backlog } = scanAllTasks(bucketDir);
+  for (const taskItem of [...active, ...pending, ...backlog]) {
+    for (const t of taskItem.task.tags || []) {
+      const item = ensureEntry(t);
+      if (item) item.task_count += 1;
+    }
+  }
+
+  return Array.from(map.values()).sort((a, b) => a.tag.localeCompare(b.tag));
 }
 
 function matchesTags(task, entityId, workerTags, includeUntagged) {
@@ -658,7 +1111,18 @@ function matchesTags(task, entityId, workerTags, includeUntagged) {
   if (taskTags.length === 0) {
     return Boolean(includeUntagged);
   }
-  return taskTags.every((t) => workerTags.has(t));
+  return taskTags.some((t) => workerTags.has(t));
+}
+
+function findOwnerActionableTasks(bucketDir, entityId) {
+  const active = listStageTasks(bucketDir, "active");
+  return active
+    .filter(
+      (item) =>
+        item.task.owner === entityId &&
+        (item.task.status === "blocked" || item.task.status === "review")
+    )
+    .sort(sortByPriorityAndAge);
 }
 
 function dependenciesSatisfied(task, byId) {
@@ -751,6 +1215,9 @@ function cmdCreate(argv) {
       "body-file": { type: "string" },
       stdin: { type: "boolean", default: false },
       slug: { type: "string" },
+      backlog: { type: "boolean", default: false },
+      draft: { type: "boolean", default: false },
+      status: { type: "string" },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -775,6 +1242,23 @@ function cmdCreate(argv) {
       `Invalid --priority "${priority}". Must be one of: low, medium, high, critical.`
     );
   }
+  const requestedBacklog = Boolean(values.backlog || values.draft);
+  const initialStatus = values.status
+    ? String(values.status).toLowerCase()
+    : requestedBacklog
+    ? "draft"
+    : "pending";
+  if (!["draft", "ready", "pending"].includes(initialStatus)) {
+    throw new CliError(
+      `Invalid initial --status "${initialStatus}". Must be one of: draft, ready, pending.`
+    );
+  }
+  if (requestedBacklog && initialStatus === "pending") {
+    throw new CliError("--backlog/--draft cannot be combined with --status pending.");
+  }
+  const targetStage =
+    initialStatus === "draft" || initialStatus === "ready" ? "backlog" : "pending";
+
   if (values.assignee) validateIdentifier(values.assignee, "--assignee");
   if (values.parent) validateTaskId(values.parent);
 
@@ -795,12 +1279,12 @@ function cmdCreate(argv) {
   let taskDir = null;
   for (let seq = 1; seq < 1000; seq += 1) {
     const candidate = `${compactUtc}-${baseSlug}${seq === 1 ? "" : `-${seq}`}`;
-    const inActiveOrArchive =
-      fs.existsSync(path.join(bucketDir, "active", candidate)) ||
-      fs.existsSync(path.join(bucketDir, "archive", candidate));
-    if (inActiveOrArchive) continue;
+    const existsElsewhere = TASK_STAGES.some(
+      (s) => s !== targetStage && fs.existsSync(path.join(bucketDir, s, candidate))
+    );
+    if (existsElsewhere) continue;
 
-    const candidateDir = path.join(bucketDir, "pending", candidate);
+    const candidateDir = path.join(bucketDir, targetStage, candidate);
     try {
       fs.mkdirSync(candidateDir, { recursive: false });
       taskId = candidate;
@@ -856,7 +1340,7 @@ function cmdCreate(argv) {
   const taskData = {
     id: taskId,
     title: values.title.trim(),
-    status: "pending",
+    status: initialStatus,
     priority,
     tags,
     owner: entityId,
@@ -871,13 +1355,14 @@ function cmdCreate(argv) {
 
   const taskPath = path.join(taskDir, "task.md");
   atomicWriteFile(taskPath, formatTaskMarkdown(taskData, body));
+  touchExistingEntity(bucketDir, entityId);
 
   if (values.json) {
     console.log(
       JSON.stringify(
         {
           task_id: taskId,
-          stage: "pending",
+          stage: targetStage,
           path: taskDir,
           task_path: taskPath,
           created_event: createdEvent.filename,
@@ -888,7 +1373,7 @@ function cmdCreate(argv) {
       )
     );
   } else {
-    console.log(`Created ${taskId} in ${taskDir}`);
+    console.log(`Created ${taskId} in ${taskDir} (status=${initialStatus})`);
     console.log(`Event: ${createdEvent.filename}`);
   }
   return 0;
@@ -1016,6 +1501,7 @@ function cmdClaim(argv) {
   freshTask.updated_by = entityId;
   freshTask.updated_at = isoUtc;
   atomicWriteFile(claimedEntry.taskPath, formatTaskMarkdown(freshTask, freshBody));
+  touchExistingEntity(bucketDir, entityId);
 
   const events = listEventFiles(claimedEntry.eventsDir);
   const lastEventSeen = events.length > 0 ? events[events.length - 1] : claimedEvent.filename;
@@ -1143,10 +1629,10 @@ function cmdPost(argv) {
           `Single-writer violation: task "${taskId}" is ${curStatus} (owner="${found.task.owner}"); only owner may modify task.md.`
         );
       }
-    } else if (curStatus === "pending" && found.stage === "pending") {
+    } else if (found.stage === "pending" || found.stage === "backlog") {
       if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
         throw new CliError(
-          `Single-writer violation: unclaimed pending task "${taskId}" belongs to owner "${found.task.owner}".`
+          `Single-writer violation: ${found.stage} task "${taskId}" belongs to owner "${found.task.owner}".`
         );
       }
     } else if (curStatus === "pending" && found.stage === "active") {
@@ -1155,6 +1641,16 @@ function cmdPost(argv) {
           `Single-writer violation: active pending task "${taskId}" may only be modified by owner "${found.task.owner}" (or claimed via 'claim').`
         );
       }
+    }
+
+    if (
+      (found.stage === "backlog" || found.stage === "pending") &&
+      targetStatus &&
+      ["in-progress", "blocked", "review"].includes(targetStatus)
+    ) {
+      throw new CliError(
+        `Invalid status transition: cannot set status "${targetStatus}" while task is in ${found.stage}/.`
+      );
     }
   }
 
@@ -1245,8 +1741,23 @@ function cmdPost(argv) {
       fs.renameSync(found.dir, pendingDir);
       finalStage = "pending";
       finalDir = pendingDir;
+    } else if (found.stage === "backlog" && updatedTask.status === "pending") {
+      const pendingDir = path.join(bucketDir, "pending", found.dirName);
+      fs.renameSync(found.dir, pendingDir);
+      finalStage = "pending";
+      finalDir = pendingDir;
+    } else if (
+      found.stage === "pending" &&
+      (updatedTask.status === "draft" || updatedTask.status === "ready")
+    ) {
+      const backlogDir = path.join(bucketDir, "backlog", found.dirName);
+      fs.renameSync(found.dir, backlogDir);
+      finalStage = "backlog";
+      finalDir = backlogDir;
     }
   }
+
+  touchExistingEntity(bucketDir, entityId);
 
   if (values.json) {
     console.log(
@@ -1385,9 +1896,16 @@ async function cmdWatch(argv) {
       tag: { type: "string", multiple: true },
       tags: { type: "string", multiple: true },
       "include-untagged": { type: "boolean", default: false },
+      "owner-only": { type: "boolean", default: false },
       "after-event": { type: "string" },
+      "after-msg": { type: "string" },
       "since-status": { type: "string" },
       "poll-ms": { type: "string", default: "1000" },
+      "msg-coalesce-ms": {
+        type: "string",
+        default: String(DEFAULT_MSG_COALESCE_MS),
+      },
+      ttl: { type: "string" },
       timeout: { type: "string", default: "0" },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -1405,9 +1923,15 @@ async function cmdWatch(argv) {
   const bucketDir = path.resolve(values.bucket);
   const watchTaskId = values.task ? validateTaskId(values.task) : null;
   const entityId = values.entity ? validateIdentifier(values.entity, "--entity") : null;
+  const ownerOnly = Boolean(values["owner-only"]);
 
   if (!watchTaskId && !entityId) {
-    throw new CliError("watch requires --entity <id> (for claimable tasks) or --task <id>.");
+    throw new CliError(
+      "watch requires --entity <id> (for worker/owner watch) or --task <id>."
+    );
+  }
+  if (watchTaskId && ownerOnly) {
+    throw new CliError("--owner-only cannot be combined with --task.");
   }
 
   const workerTags = new Set(
@@ -1418,9 +1942,25 @@ async function cmdWatch(argv) {
   );
   const includeUntagged = Boolean(values["include-untagged"]);
   const pollMs = Math.max(50, Number.parseInt(values["poll-ms"], 10) || 1000);
+  const parsedCoalesce = Number.parseInt(values["msg-coalesce-ms"], 10);
+  const msgCoalesceMs = Number.isFinite(parsedCoalesce)
+    ? Math.max(0, parsedCoalesce)
+    : DEFAULT_MSG_COALESCE_MS;
   const timeoutSec = Math.max(0, Number.parseFloat(values.timeout) || 0);
+  const ttlSec = values.ttl
+    ? Math.max(10, Number.parseInt(values.ttl, 10) || DEFAULT_ENTITY_TTL_SECONDS)
+    : undefined;
 
   ensureBucketDirs(bucketDir);
+
+  if (!watchTaskId && entityId) {
+    upsertEntityFile(bucketDir, entityId, {
+      tags: Array.from(workerTags),
+      include_untagged: includeUntagged,
+      mode: ownerOnly ? "owner" : "worker",
+      ...(ttlSec !== undefined ? { ttl_seconds: ttlSec } : {}),
+    });
+  }
 
   let initialTaskState = null;
   if (watchTaskId) {
@@ -1435,6 +1975,20 @@ async function cmdWatch(argv) {
   }
 
   let isInitialEval = true;
+
+  function serializeTaskSummary(item) {
+    return {
+      id: item.task.id,
+      title: item.task.title,
+      stage: item.stage,
+      status: item.task.status,
+      priority: item.task.priority,
+      tags: item.task.tags,
+      owner: item.task.owner,
+      assignee: item.task.assignee,
+      path: item.dir,
+    };
+  }
 
   function evaluateOnce() {
     if (watchTaskId) {
@@ -1499,8 +2053,8 @@ async function cmdWatch(argv) {
       return null;
     }
 
-    // Mode (a): watch for claimable tasks for entityId
-    for (const sub of ["pending", "active", "archive"]) {
+    // Stat stage and message dirs to keep SMB/NFS client caches fresh during polling
+    for (const sub of ["pending", "active", "archive", "backlog", "messages"]) {
       try {
         fs.statSync(path.join(bucketDir, sub));
       } catch {
@@ -1508,31 +2062,49 @@ async function cmdWatch(argv) {
       }
     }
 
-    const eligible = findEligibleTasks(
-      bucketDir,
-      entityId,
-      workerTags,
-      includeUntagged
-    );
-    if (eligible.length > 0) {
+    const eligible = ownerOnly
+      ? []
+      : findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged);
+    const ownerTasks = findOwnerActionableTasks(bucketDir, entityId);
+    const msgCursor =
+      values["after-msg"] !== undefined
+        ? values["after-msg"]
+        : readEntityFile(bucketDir, entityId)?.last_msg_seen ?? "";
+    const { matched: unreadMessages, latestFile: latestMsgFile } =
+      findUnreadMessages(bucketDir, entityId, workerTags, msgCursor);
+
+    if (
+      eligible.length > 0 ||
+      ownerTasks.length > 0 ||
+      unreadMessages.length > 0
+    ) {
       return {
-        mode: "ready",
+        mode: ownerOnly ? "owner" : "ready",
         entity_id: entityId,
         count: eligible.length,
-        tasks: eligible.map((item) => ({
-          id: item.task.id,
-          title: item.task.title,
-          stage: item.stage,
-          status: item.task.status,
-          priority: item.task.priority,
-          tags: item.task.tags,
-          owner: item.task.owner,
-          assignee: item.task.assignee,
-          path: item.dir,
-        })),
+        tasks: eligible.map(serializeTaskSummary),
+        owner_tasks: ownerTasks.map(serializeTaskSummary),
+        messages: unreadMessages,
+        last_msg_seen: latestMsgFile || msgCursor,
       };
     }
     return null;
+  }
+
+  function advanceMessageCursorIfNeeded(result) {
+    if (
+      !watchTaskId &&
+      entityId &&
+      result &&
+      Array.isArray(result.messages) &&
+      result.messages.length > 0 &&
+      values["after-msg"] === undefined &&
+      result.last_msg_seen
+    ) {
+      upsertEntityFile(bucketDir, entityId, {
+        last_msg_seen: result.last_msg_seen,
+      });
+    }
   }
 
   function printResult(result) {
@@ -1540,12 +2112,32 @@ async function cmdWatch(argv) {
       console.log(JSON.stringify(result, null, 2));
       return;
     }
-    if (result.mode === "ready") {
-      console.log(`Ready tasks for ${result.entity_id} (${result.count}):`);
-      for (const t of result.tasks) {
+    if (result.mode === "ready" || result.mode === "owner") {
+      if (result.tasks.length > 0) {
+        console.log(`Ready tasks for ${result.entity_id} (${result.count}):`);
+        for (const t of result.tasks) {
+          console.log(
+            `- ${t.id} [${t.priority}] (${t.stage}/${t.status}) tags=${JSON.stringify(t.tags)} :: ${t.title}`
+          );
+        }
+      }
+      if (result.owner_tasks.length > 0) {
         console.log(
-          `- ${t.id} [${t.priority}] (${t.stage}/${t.status}) tags=${JSON.stringify(t.tags)} :: ${t.title}`
+          `Owned tasks needing attention for ${result.entity_id} (${result.owner_tasks.length}):`
         );
+        for (const t of result.owner_tasks) {
+          console.log(
+            `- ${t.id} [${t.priority}] (${t.stage}/${t.status}) :: ${t.title}`
+          );
+        }
+      }
+      if (result.messages.length > 0) {
+        console.log(`Unread messages for ${result.entity_id} (${result.messages.length}):`);
+        for (const m of result.messages) {
+          console.log(
+            `- ${m.filename} from=${m.from} to=${JSON.stringify(m.to)} tags=${JSON.stringify(m.tags)}: ${m.body}`
+          );
+        }
       }
     } else {
       console.log(
@@ -1563,6 +2155,7 @@ async function cmdWatch(argv) {
   const immediate = evaluateOnce();
   isInitialEval = false;
   if (immediate) {
+    advanceMessageCursorIfNeeded(immediate);
     printResult(immediate);
     return 0;
   }
@@ -1570,13 +2163,19 @@ async function cmdWatch(argv) {
   return await new Promise((resolve) => {
     let settled = false;
     let debounceTimer = null;
+    let msgCoalesceTimer = null;
+    let firstMsgCoalesceAt = 0;
+    let coalesceLastSeen = "";
     let pollTimer = null;
+    let heartbeatTimer = null;
     let timeoutTimer = null;
     const watchers = [];
 
     function cleanup() {
       if (debounceTimer) clearTimeout(debounceTimer);
+      if (msgCoalesceTimer) clearTimeout(msgCoalesceTimer);
       if (pollTimer) clearInterval(pollTimer);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (timeoutTimer) clearTimeout(timeoutTimer);
       for (const w of watchers) {
         try {
@@ -1593,15 +2192,70 @@ async function cmdWatch(argv) {
       if (settled) return;
       settled = true;
       cleanup();
-      if (result) printResult(result);
+      if (result) {
+        advanceMessageCursorIfNeeded(result);
+        printResult(result);
+      }
       resolve(code);
+    }
+
+    function isMessageOnlyResult(res) {
+      return (
+        res &&
+        (res.mode === "ready" || res.mode === "owner") &&
+        res.tasks.length === 0 &&
+        res.owner_tasks.length === 0 &&
+        res.messages.length > 0
+      );
     }
 
     function checkAndFinish() {
       if (settled) return;
       try {
         const res = evaluateOnce();
-        if (res) finish(0, res);
+        if (!res) {
+          if (msgCoalesceTimer) {
+            clearTimeout(msgCoalesceTimer);
+            msgCoalesceTimer = null;
+            firstMsgCoalesceAt = 0;
+            coalesceLastSeen = "";
+          }
+          return;
+        }
+        if (isMessageOnlyResult(res) && msgCoalesceMs > 0) {
+          if (msgCoalesceTimer && res.last_msg_seen === coalesceLastSeen) {
+            return;
+          }
+          if (!firstMsgCoalesceAt) firstMsgCoalesceAt = Date.now();
+          coalesceLastSeen = res.last_msg_seen || "";
+          const elapsed = Date.now() - firstMsgCoalesceAt;
+          const remaining = Math.min(
+            msgCoalesceMs,
+            Math.max(0, MAX_MSG_COALESCE_MS - elapsed)
+          );
+          if (remaining <= 0) {
+            finish(0, res);
+            return;
+          }
+          if (msgCoalesceTimer) clearTimeout(msgCoalesceTimer);
+          msgCoalesceTimer = setTimeout(() => {
+            msgCoalesceTimer = null;
+            try {
+              const latest = evaluateOnce();
+              if (latest) {
+                finish(0, latest);
+              } else {
+                firstMsgCoalesceAt = 0;
+                coalesceLastSeen = "";
+              }
+            } catch {
+              firstMsgCoalesceAt = 0;
+              coalesceLastSeen = "";
+            }
+          }, remaining);
+          return;
+        }
+        finish(0, res);
       } catch {
         // Transient read errors during concurrent renames are retried on next tick
       }
@@ -1622,15 +2276,20 @@ async function cmdWatch(argv) {
     process.on("SIGTERM", onSig);
 
     const onWatchEvent = (_eventType, filename) => {
-      if (filename && path.basename(String(filename)).startsWith(".")) return;
+      if (filename) {
+        const str = String(filename);
+        if (path.basename(str).startsWith(".")) return;
+        const top = str.split(/[\\/]/)[0];
+        if (top === "entities") return;
+      }
       scheduleCheck();
     };
 
     try {
       watchers.push(fs.watch(bucketDir, { recursive: true }, onWatchEvent));
     } catch {
-      // Fallback on platforms/mounts without recursive fs.watch: watch top-level stage dirs + polling
-      for (const sub of ["pending", "active", "archive"]) {
+      // Fallback on platforms/mounts without recursive fs.watch: watch top-level dirs + polling
+      for (const sub of ["pending", "active", "archive", "backlog", "messages"]) {
         try {
           watchers.push(fs.watch(path.join(bucketDir, sub), onWatchEvent));
         } catch {
@@ -1641,6 +2300,16 @@ async function cmdWatch(argv) {
 
     pollTimer = setInterval(checkAndFinish, pollMs);
 
+    if (!watchTaskId && entityId) {
+      heartbeatTimer = setInterval(() => {
+        try {
+          upsertEntityFile(bucketDir, entityId);
+        } catch {
+          // ignore transient heartbeat failure
+        }
+      }, ENTITY_HEARTBEAT_MS);
+    }
+
     if (timeoutSec > 0) {
       timeoutTimer = setTimeout(() => {
         console.error(`Watch timed out after ${timeoutSec}s.`);
@@ -1650,15 +2319,389 @@ async function cmdWatch(argv) {
   });
 }
 
+function cmdMsg(argv) {
+  const [action, ...rest] = argv;
+  if (!action || action === "--help" || action === "-h") {
+    printMsgHelp();
+    return 0;
+  }
+
+  if (action === "send") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        bucket: { type: "string", short: "b" },
+        entity: { type: "string", short: "e" },
+        to: { type: "string", multiple: true },
+        tag: { type: "string", multiple: true },
+        tags: { type: "string", multiple: true },
+        slug: { type: "string" },
+        message: { type: "string", short: "m" },
+        body: { type: "string" },
+        "body-file": { type: "string" },
+        stdin: { type: "boolean", default: false },
+        json: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      printMsgHelp();
+      return 0;
+    }
+    if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+    const bucketDir = path.resolve(values.bucket);
+    const entityId = validateIdentifier(values.entity, "--entity");
+    const body = readBodyInput(values);
+    if (!body.trim()) {
+      throw new CliError("Message body cannot be empty (pass -m, --body-file, or --stdin).");
+    }
+
+    const rawTo = parseListFlags(values.to);
+    for (const r of rawTo) {
+      if (r !== "*") validateIdentifier(r, "--to");
+    }
+    const tags = normalizeTags([
+      ...parseListFlags(values.tag),
+      ...parseListFlags(values.tags),
+    ]);
+    const toList = rawTo.length > 0 ? rawTo : tags.length > 0 ? [] : ["*"];
+
+    ensureBucketDirs(bucketDir);
+    const now = new Date();
+    const res = writeUniqueMessage(
+      path.join(bucketDir, "messages"),
+      entityId,
+      toList,
+      tags,
+      values.slug || "msg",
+      body,
+      now
+    );
+    touchExistingEntity(bucketDir, entityId);
+
+    const payload = {
+      filename: res.filename,
+      path: res.path,
+      from: entityId,
+      to: toList,
+      tags,
+      timestamp: res.timestamp,
+    };
+    if (values.json) {
+      console.log(JSON.stringify(payload, null, 2));
+    } else {
+      console.log(`Sent message ${res.filename} (to=${JSON.stringify(toList)} tags=${JSON.stringify(tags)})`);
+    }
+    return 0;
+  }
+
+  if (action === "list") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        bucket: { type: "string", short: "b" },
+        entity: { type: "string", short: "e" },
+        tag: { type: "string", multiple: true },
+        tags: { type: "string", multiple: true },
+        "after-msg": { type: "string" },
+        unread: { type: "boolean", default: false },
+        all: { type: "boolean", default: false },
+        json: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      printMsgHelp();
+      return 0;
+    }
+    if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+    const bucketDir = path.resolve(values.bucket);
+    const entityId = values.entity ? validateIdentifier(values.entity, "--entity") : null;
+    if (values.unread && !entityId) {
+      throw new CliError("--unread requires --entity <id>.");
+    }
+    const workerTags = new Set(
+      normalizeTags([
+        ...parseListFlags(values.tag),
+        ...parseListFlags(values.tags),
+      ])
+    );
+
+    const messagesDir = path.join(bucketDir, "messages");
+    try {
+      fs.statSync(messagesDir);
+    } catch {
+      // ignore
+    }
+    let files = listMessageFiles(messagesDir);
+    let afterCursor = values["after-msg"] ?? "";
+    if (!afterCursor && values.unread && entityId) {
+      afterCursor = readEntityFile(bucketDir, entityId)?.last_msg_seen ?? "";
+    }
+    if (afterCursor) {
+      files = files.filter((f) => isMessageAfter(messagesDir, f, afterCursor));
+    }
+
+    const messages = [];
+    for (const filename of files) {
+      try {
+        const msg = readMessageFile(path.join(messagesDir, filename));
+        if (!values.all && entityId) {
+          if (!matchesMessage(msg, entityId, workerTags)) continue;
+        } else if (!values.all && workerTags.size > 0) {
+          if (!msg.tags.some((t) => workerTags.has(t))) continue;
+        }
+        messages.push(msg);
+      } catch (err) {
+        if (err.code === "ENOENT") continue;
+        throw err;
+      }
+    }
+
+    if (values.json) {
+      console.log(
+        JSON.stringify(
+          {
+            count: messages.length,
+            messages,
+          },
+          null,
+          2
+        )
+      );
+    } else if (messages.length === 0) {
+      console.log("No matching messages.");
+    } else {
+      for (const m of messages) {
+        console.log(
+          `- ${m.filename} | from=${m.from} to=${JSON.stringify(m.to)} tags=${JSON.stringify(m.tags)} | ${m.timestamp}`
+        );
+        if (m.body) console.log(`  ${m.body}`);
+      }
+    }
+    return 0;
+  }
+
+  throw new CliError(`Unknown msg action "${action}". Expected: send, list.`);
+}
+
+function cmdEntity(argv) {
+  const [action, ...rest] = argv;
+  if (!action || action === "--help" || action === "-h") {
+    printEntityHelp();
+    return 0;
+  }
+
+  if (action === "register") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        bucket: { type: "string", short: "b" },
+        entity: { type: "string", short: "e" },
+        tag: { type: "string", multiple: true },
+        tags: { type: "string", multiple: true },
+        "include-untagged": { type: "boolean", default: false },
+        mode: { type: "string" },
+        ttl: { type: "string" },
+        message: { type: "string", short: "m" },
+        body: { type: "string" },
+        "body-file": { type: "string" },
+        stdin: { type: "boolean", default: false },
+        json: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      printEntityHelp();
+      return 0;
+    }
+    if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+    const bucketDir = path.resolve(values.bucket);
+    const entityId = validateIdentifier(values.entity, "--entity");
+    if (values.mode && !["once", "one-shot", "continuous", "owner", "worker"].includes(values.mode)) {
+      throw new CliError(`Invalid --mode "${values.mode}".`);
+    }
+    ensureBucketDirs(bucketDir);
+    const tags = normalizeTags([
+      ...parseListFlags(values.tag),
+      ...parseListFlags(values.tags),
+    ]);
+    const ttlSec = values.ttl
+      ? Math.max(10, Number.parseInt(values.ttl, 10) || DEFAULT_ENTITY_TTL_SECONDS)
+      : undefined;
+    const note = readBodyInput(values);
+    const saved = upsertEntityFile(bucketDir, entityId, {
+      ...(values.tag || values.tags ? { tags } : {}),
+      ...(values["include-untagged"] ? { include_untagged: true } : {}),
+      ...(values.mode ? { mode: values.mode } : {}),
+      ...(ttlSec !== undefined ? { ttl_seconds: ttlSec } : {}),
+      ...(note ? { body: note } : {}),
+    });
+    if (values.json) {
+      console.log(JSON.stringify(saved, null, 2));
+    } else {
+      console.log(
+        `Registered entity ${saved.entity_id} (tags=${JSON.stringify(saved.tags)}, ttl=${saved.ttl_seconds}s)`
+      );
+    }
+    return 0;
+  }
+
+  if (action === "list") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        bucket: { type: "string", short: "b" },
+        online: { type: "boolean", default: false },
+        json: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      printEntityHelp();
+      return 0;
+    }
+    if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+    const bucketDir = path.resolve(values.bucket);
+    let entities = listEntities(bucketDir);
+    if (values.online) {
+      entities = entities.filter((e) => e.online);
+    }
+    if (values.json) {
+      console.log(JSON.stringify({ count: entities.length, entities }, null, 2));
+    } else if (entities.length === 0) {
+      console.log("No registered entities.");
+    } else {
+      for (const e of entities) {
+        console.log(
+          `- ${e.entity_id} [${e.state}] mode=${e.mode || "-"} tags=${JSON.stringify(e.tags)} age=${e.age_seconds}s/${e.ttl_seconds}s`
+        );
+      }
+    }
+    return 0;
+  }
+
+  throw new CliError(`Unknown entity action "${action}". Expected: register, list.`);
+}
+
+function cmdTag(argv) {
+  const [action, ...rest] = argv;
+  if (!action || action === "--help" || action === "-h") {
+    printTagHelp();
+    return 0;
+  }
+
+  if (action === "set") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        bucket: { type: "string", short: "b" },
+        entity: { type: "string", short: "e" },
+        tag: { type: "string" },
+        message: { type: "string", short: "m" },
+        body: { type: "string" },
+        "body-file": { type: "string" },
+        stdin: { type: "boolean", default: false },
+        json: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      printTagHelp();
+      return 0;
+    }
+    if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+    const bucketDir = path.resolve(values.bucket);
+    const entityId = validateIdentifier(values.entity, "--entity");
+    const tagName = validateIdentifier(
+      String(values.tag || "").trim().toLowerCase(),
+      "--tag"
+    );
+    const description = readBodyInput(values);
+    ensureBucketDirs(bucketDir);
+    const isoUtc = formatIsoUtc(new Date());
+    const tagPath = path.join(bucketDir, "tags", `${tagName}.md`);
+    atomicWriteFile(
+      tagPath,
+      formatTagMarkdown(
+        { tag: tagName, updated_by: entityId, updated_at: isoUtc },
+        description
+      )
+    );
+    touchExistingEntity(bucketDir, entityId);
+    const payload = {
+      tag: tagName,
+      path: tagPath,
+      description: description.trim(),
+      updated_by: entityId,
+      updated_at: isoUtc,
+    };
+    if (values.json) {
+      console.log(JSON.stringify(payload, null, 2));
+    } else {
+      console.log(`Saved tag ${tagName} (${tagPath})`);
+    }
+    return 0;
+  }
+
+  if (action === "list") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        bucket: { type: "string", short: "b" },
+        json: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      printTagHelp();
+      return 0;
+    }
+    if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+    const bucketDir = path.resolve(values.bucket);
+    const tags = listTagsInfo(bucketDir);
+    if (values.json) {
+      console.log(JSON.stringify({ count: tags.length, tags }, null, 2));
+    } else if (tags.length === 0) {
+      console.log("No tags found.");
+    } else {
+      for (const t of tags) {
+        const desc = t.description ? ` :: ${t.description}` : "";
+        console.log(
+          `- ${t.tag} (online_entities=${JSON.stringify(t.online_entities)}, tasks=${t.task_count})${desc}`
+        );
+      }
+    }
+    return 0;
+  }
+
+  throw new CliError(`Unknown tag action "${action}". Expected: set, list.`);
+}
+
 function printMainHelp() {
   console.log(`Usage: wb.mjs <subcommand> [options]
 
 Subcommands:
-  create   Create a new task in pending/ with initial created event
+  create   Create a new task in pending/ or backlog/ with initial created event
   claim    Atomically claim an eligible task from pending/ or resume assigned active/ task
   post     Append an immutable event to events/ and optionally transition task.md
-  watch    Block with native fs.watch + 1000ms stat polling until work or update arrives
+  watch    Block with native fs.watch + 1000ms stat polling until work, owner update, or messages arrive
   render   Render task.md and chronologically sorted events/*.md
+  msg      Send or list public messages in messages/
+  entity   Register or list advisory entity presence in entities/
+  tag      Document or list capability tags in tags/
 
 Run "wb.mjs <subcommand> --help" for subcommand options.`);
 }
@@ -1670,6 +2713,8 @@ function printCreateHelp() {
   --assignee <entity_id>                 Optional target executor
   --parent <task_id>                     Optional parent task_id
   --depends-on <id1,id2>                 Upstream task_ids that must be complete
+  --backlog / --draft                    Create in backlog/ with status "draft"
+  --status <draft|ready|pending>         Initial status (draft/ready create in backlog/)
   --workspace <path>                     Workspace path for default template
   --files <f1,f2>                        Relevant files for default template
   --description <text>                   Description for default template
@@ -1691,7 +2736,7 @@ function printPostHelp() {
   console.log(`Usage: wb.mjs post --bucket <dir> --entity <id> --task <id> --type <type> [options]
   --type <type>                          created|claimed|amend|question|answer|log|review|feedback|complete|cancelled|reset
   --message <text> | --body-file <path> | --stdin    Event body
-  --status <status>                      pending|in-progress|blocked|review|complete|cancelled
+  --status <status>                      draft|ready|pending|in-progress|blocked|review|complete|cancelled
   --bump-revision                        Increment task.md revision
   --assignee <id>                        Update assignee (pass "" to clear)
   --claimed-by <id>                      Update claimed_by (pass "" to clear)
@@ -1704,13 +2749,17 @@ function printPostHelp() {
 
 function printWatchHelp() {
   console.log(`Usage: wb.mjs watch --bucket <dir> [--entity <id>] [--task <id>] [options]
-  --entity <id>                          Watch for claimable tasks for entity
+  --entity <id>                          Watch for tasks, owned blocked/review tasks, and unread messages
+  --owner-only                           Do not wake for claimable tasks (owner updates + messages only)
   --task <task_id>                       Watch a specific task for new events or status change
   --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
   --include-untagged                     Also match untagged tasks when --tag is set
   --after-event <filename>               Wake immediately if events newer than filename exist
+  --after-msg <filename>                 Override stored last_msg_seen cursor
   --since-status <status>                Wake immediately if task status differs from status
   --poll-ms <ms>                         Stat polling fallback interval (default: 1000)
+  --msg-coalesce-ms <ms>                 Quiet window for message-only bursts (default: 500)
+  --ttl <seconds>                        Entity presence TTL in seconds (default: 300)
   --timeout <seconds>                    Optional timeout (exits 124)
   --json                                 Output JSON`);
 }
@@ -1719,6 +2768,24 @@ function printRenderHelp() {
   console.log(`Usage: wb.mjs render --bucket <dir> --task <task_id> [options]
   --after-event <filename>               Only include events newer than filename
   --json                                 Output JSON`);
+}
+
+function printMsgHelp() {
+  console.log(`Usage: wb.mjs msg <send|list> --bucket <dir> [options]
+  send --entity <id> [--to <id|*,...>] [--tag <t>] [--slug <s>] -m <text> [--json]
+  list [--entity <id>] [--tag <t>] [--after-msg <file>] [--unread] [--all] [--json]`);
+}
+
+function printEntityHelp() {
+  console.log(`Usage: wb.mjs entity <register|list> --bucket <dir> [options]
+  register --entity <id> [--tag <t>] [--include-untagged] [--mode <m>] [--ttl <sec>] [-m <note>] [--json]
+  list [--online] [--json]`);
+}
+
+function printTagHelp() {
+  console.log(`Usage: wb.mjs tag <set|list> --bucket <dir> [options]
+  set --entity <id> --tag <name> [-m <description>] [--json]
+  list [--json]`);
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -1739,6 +2806,12 @@ async function main(argv = process.argv.slice(2)) {
       return await cmdWatch(rest);
     case "render":
       return cmdRender(rest);
+    case "msg":
+      return cmdMsg(rest);
+    case "entity":
+      return cmdEntity(rest);
+    case "tag":
+      return cmdTag(rest);
     default:
       throw new CliError(`Unknown subcommand "${sub}". Run "wb.mjs --help".`);
   }
@@ -1766,6 +2839,7 @@ if (isEntrypoint) {
 
 export {
   compareEventFilenames,
+  compareMessageFilenames,
   parseFrontmatter,
   serializeFrontmatter,
   slugify,

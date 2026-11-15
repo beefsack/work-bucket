@@ -651,7 +651,7 @@ function readEventFile(eventsDir, filename, includeFullBody = true, eventLines =
   const lines = body.trim().split("\n");
   return {
     filename,
-    type: String(data.type ?? "note"),
+    type: String(data.type ?? parseEventFilenameParts(filename)?.type ?? "note"),
     entity_id: String(data.entity_id ?? ""),
     timestamp: String(data.timestamp ?? ""),
     body: includeFullBody ? body.trim() : lines.slice(0, eventLines).join("\n"),
@@ -1017,6 +1017,7 @@ function readEntityFile(bucketDir, entityId) {
       ttl_seconds: Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_ENTITY_TTL_SECONDS,
       last_msg_seen: String(data.last_msg_seen ?? ""),
       owner_task_seen: coerceStringList(data.owner_task_seen),
+      stale_task_seen: coerceStringList(data.stale_task_seen),
       updated_at: String(data.updated_at ?? ""),
       body: body.trim(),
       path: entityPath,
@@ -1071,6 +1072,7 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
         ? String(updates.last_msg_seen)
         : initialLastMsgSeen,
     owner_task_seen: updates.owner_task_seen ?? existing?.owner_task_seen ?? [],
+    stale_task_seen: updates.stale_task_seen ?? existing?.stale_task_seen ?? [],
     updated_at: isoUtc,
   };
   const nextBody =
@@ -1257,6 +1259,38 @@ function findOwnerActionableTasks(bucketDir, entityId, allActionable = false) {
           !seen.has(item.task.id) || isEventAfter(item.eventsDir, filename, seen.get(item.task.id))))
     )
     .sort(sortByPriorityAndAge);
+}
+
+function findOwnerStaleTasks(bucketDir, entityId) {
+  const seen = new Set(readEntityFile(bucketDir, entityId)?.stale_task_seen ?? []);
+  return listTasks(bucketDir).filter((item) => {
+    if (item.task.owner !== entityId || item.task.status !== "in-progress" || !item.task.claimed_by) return false;
+    const entity = readEntityFile(bucketDir, item.task.claimed_by);
+    if (!entity) return false;
+    const ageSeconds = (Date.now() - Date.parse(entity.updated_at)) / 1000;
+    if (!Number.isFinite(ageSeconds) || ageSeconds <= entity.ttl_seconds) return false;
+    item.heartbeat = {
+      entity_id: entity.entity_id,
+      updated_at: entity.updated_at,
+      ttl_seconds: entity.ttl_seconds,
+      age_seconds: Math.floor(ageSeconds),
+    };
+    return !seen.has(`${item.task.id}/${item.task.claim_round}/${item.task.claimed_by}/${entity.updated_at}`);
+  }).sort(sortByPriorityAndAge);
+}
+
+function unreadTaskInstructions(item) {
+  const files = listEventFiles(item.eventsDir);
+  const previousClaim = item.task.claim_round > 1
+    ? getRoundClaims(item.eventsDir, item.task.claim_round - 1).winner?.filename
+    : null;
+  return files.filter((filename) => {
+    const type = parseEventFilenameParts(filename)?.type;
+    if (type === "amend") {
+      return !item.task.last_amend_seen || isEventAfter(item.eventsDir, filename, item.task.last_amend_seen);
+    }
+    return type === "feedback" && (!previousClaim || isEventAfter(item.eventsDir, filename, previousClaim));
+  }).map((filename) => readEventFile(item.eventsDir, filename));
 }
 
 function dependenciesSatisfied(task, byId) {
@@ -1570,6 +1604,10 @@ async function cmdClaim(argv) {
 
   ensureBucketDirs(bucketDir);
 
+  if (fs.existsSync(path.join(bucketDir, "PAUSED"))) {
+    throw new CliError("Bucket is paused (PAUSED exists); no tasks may be claimed.", 2);
+  }
+
   const wip = getActiveWipTasks(bucketDir, entityId);
   if (wip.length > 0) {
     throw new CliError(
@@ -1669,6 +1707,10 @@ async function cmdClaim(argv) {
       continue;
     }
 
+    if (fs.existsSync(path.join(bucketDir, "PAUSED"))) {
+      throw new CliError("Bucket was paused during claim; task remains pending.", 2);
+    }
+
     postTask.status = "in-progress";
     postTask.claimed_by = entityId;
     postTask.claim_round = claimRound;
@@ -1704,6 +1746,7 @@ async function cmdClaim(argv) {
           events,
           task: finalTask,
           instructions: readStandingInstructions(bucketDir, finalTask),
+          unread_events: unreadTaskInstructions({ ...claimedEntry, task: finalTask }),
         },
         null,
         2
@@ -1732,6 +1775,8 @@ function cmdPost(argv) {
       stdin: { type: "boolean", default: false },
       status: { type: "string" },
       "bump-revision": { type: "boolean", default: false },
+      "accept-amends": { type: "boolean", default: false },
+      outcome: { type: "string" },
       assignee: { type: "string" },
       "claimed-by": { type: "string" },
       "add-depends-on": { type: "string", multiple: true },
@@ -1785,6 +1830,21 @@ function cmdPost(argv) {
     else if (values.reopen) targetStatus = "pending";
   }
 
+  if (values.outcome !== undefined &&
+      (!["complete", "cancelled"].includes(targetStatus) ||
+       !["pass", "partial", "fail", "abandoned"].includes(values.outcome))) {
+    throw new CliError("--outcome requires complete/cancelled status and pass|partial|fail|abandoned.");
+  }
+  if (values["accept-amends"] && (eventType !== "log" || found.task.status !== "in-progress")) {
+    throw new CliError("--accept-amends requires --type log on an in-progress task.");
+  }
+  const acceptedAmends = values["accept-amends"]
+    ? unreadTaskInstructions(found).filter((event) => event.type === "amend")
+    : [];
+  if (values["accept-amends"] && acceptedAmends.length === 0) {
+    throw new CliError("No unaccepted amend events.");
+  }
+
   const addDeps = parseListFlags(values["add-depends-on"]);
   const removeDeps = new Set(parseListFlags(values["remove-depends-on"]));
   for (const dep of addDeps) validateTaskId(dep);
@@ -1797,7 +1857,8 @@ function cmdPost(argv) {
       addDeps.length > 0 ||
       removeDeps.size > 0 ||
       values["check-ac"] ||
-      values.reopen
+      values.reopen ||
+      values["accept-amends"]
   );
 
   // Enforce single-writer rule and late-sync split-brain guard on task.md
@@ -1850,7 +1911,10 @@ function cmdPost(argv) {
 
   const now = new Date();
   const isoUtc = formatIsoUtc(now);
-  const message = readBodyInput(values);
+  const message = [
+    readBodyInput(values),
+    ...(acceptedAmends.length ? [`Accepted amendments:\n${acceptedAmends.map((event) => `- ${event.filename}`).join("\n")}`] : []),
+  ].filter(Boolean).join("\n\n");
   if (eventType === "amend" && ["review", "blocked"].includes(found.task.status)) {
     console.error(`Warning: task "${taskId}" is ${found.task.status}; amend does not reopen it. Use feedback/answer --status pending to resume execution.`);
   }
@@ -1886,7 +1950,7 @@ function cmdPost(argv) {
     if (returningFromActive) {
       updatedTask.claim_round = (Number(updatedTask.claim_round) || 1) + 1;
     }
-    if (values["bump-revision"] ||
+    if (values["bump-revision"] || values["accept-amends"] ||
         (["review", "blocked"].includes(found.task.status) &&
          targetStatus === "pending" && ["feedback", "answer"].includes(eventType))) {
       updatedTask.revision = (Number(updatedTask.revision) || 1) + 1;
@@ -1920,6 +1984,12 @@ function cmdPost(argv) {
     if (values["check-ac"]) {
       updatedBody = updatedBody.replace(/^(\s*[-*]\s+)\[ \]/gm, "$1[x]");
     }
+    if (acceptedAmends.length) {
+      updatedBody = `${updatedBody.trimEnd()}\n\n${acceptedAmends.map((event) =>
+        `## Amendment: ${event.filename}\n\n${event.body}`).join("\n\n")}\n`;
+      updatedTask.last_amend_seen = acceptedAmends.at(-1).filename;
+    }
+    if (values.outcome !== undefined) updatedTask.outcome = values.outcome;
 
     if (addDeps.length > 0 || removeDeps.size > 0) {
       const nextDeps = updatedTask.depends_on.filter((d) => !removeDeps.has(d));
@@ -1972,6 +2042,8 @@ function cmdRender(argv) {
       bucket: { type: "string", short: "b" },
       task: { type: "string" },
       "after-event": { type: "string" },
+      "tail-events": { type: "string" },
+      "latest-event": { type: "boolean", default: false },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -1987,6 +2059,14 @@ function cmdRender(argv) {
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
   const bucketDir = path.resolve(values.bucket);
   const taskId = validateTaskId(values.task);
+  if (values["latest-event"] && values["tail-events"] !== undefined) {
+    throw new CliError("Use either --latest-event or --tail-events, not both.");
+  }
+  const tailEvents = values["latest-event"] ? 1
+    : values["tail-events"] !== undefined ? Number(values["tail-events"]) : null;
+  if (tailEvents !== null && (!Number.isInteger(tailEvents) || tailEvents < 0)) {
+    throw new CliError("--tail-events must be a non-negative integer.");
+  }
 
   const found = findTask(bucketDir, taskId);
   if (!found) {
@@ -1999,6 +2079,7 @@ function cmdRender(argv) {
       isEventAfter(found.eventsDir, f, values["after-event"])
     );
   }
+  if (tailEvents !== null) eventFiles = tailEvents === 0 ? [] : eventFiles.slice(-tailEvents);
 
   const events = eventFiles.map((filename) => {
     const fullPath = path.join(found.eventsDir, filename);
@@ -2067,6 +2148,90 @@ function cmdRender(argv) {
     }
   }
   console.log(out.join("\n"));
+  return 0;
+}
+
+function cmdList(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      bucket: { type: "string", short: "b" },
+      status: { type: "string", multiple: true },
+      tag: { type: "string", multiple: true },
+      tags: { type: "string", multiple: true },
+      owner: { type: "string" },
+      json: { type: "boolean", default: false },
+      help: { type: "boolean", short: "h", default: false },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+  if (values.help) {
+    printListHelp();
+    return 0;
+  }
+  if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+  if (values.owner) validateIdentifier(values.owner, "--owner");
+  const statuses = new Set(parseListFlags(values.status));
+  for (const status of statuses) {
+    if (!VALID_STATUSES.has(status)) throw new CliError(`Invalid --status "${status}".`);
+  }
+  const tags = new Set(normalizeTags([...parseListFlags(values.tag), ...parseListFlags(values.tags)]));
+  const tasks = listTasks(path.resolve(values.bucket))
+    .filter(({ task }) =>
+      (!statuses.size || statuses.has(task.status)) &&
+      (!tags.size || task.tags.some((tag) => tags.has(tag))) &&
+      (!values.owner || task.owner === values.owner))
+    .sort(sortByPriorityAndAge)
+    .map((item) => serializeTaskSummary(item));
+  if (values.json) {
+    console.log(JSON.stringify({ count: tasks.length, tasks }, null, 2));
+  } else {
+    for (const task of tasks) {
+      console.log(`${task.id} status=${task.status} assignee=${task.assignee || "-"} claimed_by=${task.claimed_by || "-"} revision=${task.revision} claim_round=${task.claim_round} latest=${task.latest_event?.filename ?? "-"} type=${task.latest_event?.type ?? "-"}`);
+    }
+  }
+  return 0;
+}
+
+function cmdBucket(argv) {
+  const [action, ...rest] = argv;
+  if (!action || action === "--help" || action === "-h") {
+    printBucketHelp();
+    return 0;
+  }
+  if (!["pause", "resume"].includes(action)) throw new CliError(`Unknown bucket action "${action}". Expected: pause, resume.`);
+  const { values } = parseArgs({
+    args: rest,
+    options: {
+      bucket: { type: "string", short: "b" },
+      message: { type: "string", short: "m" },
+      json: { type: "boolean", default: false },
+      help: { type: "boolean", short: "h", default: false },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+  if (values.help) {
+    printBucketHelp();
+    return 0;
+  }
+  if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+  const bucketDir = path.resolve(values.bucket);
+  ensureBucketDirs(bucketDir);
+  const pausePath = path.join(bucketDir, "PAUSED");
+  if (action === "pause") {
+    atomicWriteFile(pausePath, `${String(values.message || "Paused.").replace(/\r/g, "").trim()}\n`);
+  } else {
+    try {
+      fs.unlinkSync(pausePath);
+    } catch (err) {
+      if (err.code !== "ENOENT") throw err;
+    }
+  }
+  const result = { paused: action === "pause", path: pausePath };
+  if (values.json) console.log(JSON.stringify(result, null, 2));
+  else console.log(`Bucket ${result.paused ? "paused" : "resumed"}.`);
   return 0;
 }
 
@@ -2230,6 +2395,7 @@ async function cmdWatch(argv) {
           last_event_seen:
             currentEvents.length > 0 ? currentEvents[currentEvents.length - 1] : "",
           task: current.task,
+          paused: fs.existsSync(path.join(bucketDir, "PAUSED")),
           revision: current.task.revision,
           claim_round: current.task.claim_round,
           claimed_by: current.task.claimed_by,
@@ -2250,11 +2416,14 @@ async function cmdWatch(argv) {
       }
     }
 
-    const eligible = ownerOnly
+    const paused = fs.existsSync(path.join(bucketDir, "PAUSED"));
+    const eligible = ownerOnly || paused
       ? []
       : findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged)
         .filter((item) => !excludedTasks.has(item.task.id));
     const ownerTasks = findOwnerActionableTasks(bucketDir, entityId, values["all-actionable"])
+      .filter((item) => !excludedTasks.has(item.task.id));
+    const staleTasks = findOwnerStaleTasks(bucketDir, entityId)
       .filter((item) => !excludedTasks.has(item.task.id));
     const msgCursor =
       values["after-msg"] !== undefined
@@ -2266,14 +2435,22 @@ async function cmdWatch(argv) {
     if (
       eligible.length > 0 ||
       ownerTasks.length > 0 ||
+      staleTasks.length > 0 ||
+      (paused && !ownerOnly) ||
       unreadMessages.length > 0
     ) {
       return {
         mode: ownerOnly ? "owner" : "ready",
+        reason: paused && !ownerOnly ? "paused" : staleTasks.length ? "stale" : ownerTasks.length ? "owner_update" : eligible.length ? "work" : "messages",
+        paused,
         entity_id: entityId,
         count: eligible.length,
         tasks: eligible.map((item) => serializeTaskSummary(item, values["include-events"], eventLines)),
         owner_tasks: ownerTasks.map((item) => serializeTaskSummary(item, values["include-events"], eventLines)),
+        stale_tasks: staleTasks.map((item) => ({
+          ...serializeTaskSummary(item, values["include-events"], eventLines),
+          heartbeat: item.heartbeat,
+        })),
         messages: unreadMessages,
         last_msg_seen: latestMsgFile || msgCursor,
       };
@@ -2281,7 +2458,7 @@ async function cmdWatch(argv) {
     return null;
   }
 
-  function advanceMessageCursorIfNeeded(result) {
+  function advanceDeliveryCursors(result) {
     if (!watchTaskId && entityId && result?.owner_tasks?.length) {
       const seen = new Map((readEntityFile(bucketDir, entityId)?.owner_task_seen ?? [])
         .map((cursor) => cursor.split("/")));
@@ -2291,6 +2468,14 @@ async function cmdWatch(argv) {
       upsertEntityFile(bucketDir, entityId, {
         owner_task_seen: Array.from(seen, ([id, event]) => `${id}/${event}`),
       });
+    }
+    if (!watchTaskId && entityId && result?.stale_tasks?.length) {
+      const seen = new Map((readEntityFile(bucketDir, entityId)?.stale_task_seen ?? [])
+        .map((cursor) => [cursor.split("/")[0], cursor]));
+      for (const task of result.stale_tasks) {
+        seen.set(task.id, `${task.id}/${task.claim_round}/${task.claimed_by}/${task.heartbeat.updated_at}`);
+      }
+      upsertEntityFile(bucketDir, entityId, { stale_task_seen: Array.from(seen.values()) });
     }
     if (
       !watchTaskId &&
@@ -2313,6 +2498,7 @@ async function cmdWatch(argv) {
       return;
     }
     if (result.mode === "ready" || result.mode === "owner") {
+      if (result.paused) console.log("Bucket is paused; no work is handed out.");
       if (result.tasks.length > 0) {
         console.log(`Ready tasks for ${result.entity_id} (${result.count}):`);
         for (const t of result.tasks) {
@@ -2341,6 +2527,10 @@ async function cmdWatch(argv) {
           );
         }
       }
+      for (const task of result.stale_tasks) {
+        console.log(`Stale: ${task.id} status=${task.status} revision=${task.revision} claim_round=${task.claim_round} claimed_by=${task.claimed_by} assignee=${task.assignee || "-"} heartbeat=${task.heartbeat.updated_at} age=${task.heartbeat.age_seconds}s ttl=${task.heartbeat.ttl_seconds}s`);
+        printEvent(task.latest_event);
+      }
     } else {
       console.log(
         `Task update for ${result.task_id}: stage=${result.stage} status=${result.status} revision=${result.revision ?? "-"} claim_round=${result.claim_round ?? "-"} claimed_by=${result.claimed_by || "-"} assignee=${result.assignee || "-"}`
@@ -2368,7 +2558,7 @@ async function cmdWatch(argv) {
   const immediate = evaluateOnce();
   isInitialEval = false;
   if (immediate) {
-    advanceMessageCursorIfNeeded(immediate);
+    advanceDeliveryCursors(immediate);
     printResult(immediate);
     return 0;
   }
@@ -2406,7 +2596,7 @@ async function cmdWatch(argv) {
       settled = true;
       cleanup();
       if (result) {
-        advanceMessageCursorIfNeeded(result);
+        advanceDeliveryCursors(result);
         printResult(result);
       }
       resolve(code);
@@ -2418,6 +2608,8 @@ async function cmdWatch(argv) {
         (res.mode === "ready" || res.mode === "owner") &&
         res.tasks.length === 0 &&
         res.owner_tasks.length === 0 &&
+        res.stale_tasks.length === 0 &&
+        !res.paused &&
         res.messages.length > 0
       );
     }
@@ -2913,6 +3105,8 @@ Subcommands:
   post     Append an immutable event to events/ and optionally transition task.md
   watch    Block with native fs.watch + 1000ms stat polling until work, owner update, or messages arrive
   render   Render task.md and chronologically sorted events/*.md
+  list     List one compact line per task, with optional filters
+  bucket   Pause or resume executor claims via the plain PAUSED file
   msg      Send or list public messages in messages/
   entity   Register or list advisory entity presence in entities/
   tag      Document or list capability tags in tags/
@@ -2944,8 +3138,11 @@ function printClaimHelp() {
   --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
   --include-untagged                     Also accept untagged tasks when --tag is set
   --claim-settle-ms <ms>                 Settle wait before electing round winner (default: ${DEFAULT_CLAIM_SETTLE_MS})
-  --json                                 Output JSON, including instructions: [{file, body}]
-  Read optional INSTRUCTIONS.md and each task tag's tags/<tag>.md body before claiming/executing.`);
+  --json                                 Output JSON, including instructions: [{file, body}] and unread_events
+  unread_events includes full unaccepted amend bodies (including pre-claim amends) and feedback since
+  the previous round's claim. Read these before executing; accepted amendments are not repeated.
+  Read optional INSTRUCTIONS.md and each task tag's tags/<tag>.md body before claiming/executing.
+  PAUSED refuses claims (exit 2), including a pause detected during settle.`);
 }
 
 function printPostHelp() {
@@ -2954,6 +3151,9 @@ function printPostHelp() {
   --message <text> | --body-file <path> | --stdin    Event body
   --status <status>                      draft|ready|pending|in-progress|blocked|review|complete|cancelled
   --bump-revision                        Increment revision (feedback/answer to pending already bump once)
+  --accept-amends                        With --type log: append unaccepted amend bodies to task.md,
+                                        bump revision once, record last_amend_seen and log filenames
+  --outcome <pass|partial|fail|abandoned>  Optional result on complete/cancelled status
   --assignee <id>                        Update assignee (pass "" to clear)
   --claimed-by <id>                      Update claimed_by (pass "" to clear)
   --add-depends-on <id1,id2>             Append task IDs to depends_on
@@ -2962,7 +3162,10 @@ function printPostHelp() {
   --reopen                               Reset status to pending, increment claim_round, clear claimed_by/assignee
   --json                                 Output JSON, including previous_revision/previous_claim_round
   Feedback/answer returning review/blocked to pending automatically increment revision and claim_round.
-  Amend on review/blocked warns; it does not reopen the task.`);
+  Amend on review/blocked warns; it does not reopen the task.
+  --accept-amends is executor-only on in-progress tasks, preserves original text and appends amendments
+  verbatim in chronological sections. No unaccepted amends is an error; it never double-applies them.
+  A completed investigation can have outcome fail/partial; abandoned means work was not finished.`);
 }
 
 function printWatchHelp() {
@@ -2986,6 +3189,11 @@ function printWatchHelp() {
   --json                                 Output JSON
   Pool watches skip pending tasks with any claimed event for the current claim_round.
   Owner updates are edge-triggered; delivery stores per-task owner_task_seen cursors in entities/<id>.md.
+  Stale owned in-progress tasks wake with reason "stale" and stale_tasks containing heartbeat details.
+  Requires a registered claimed_by entity; each claim-round/heartbeat is delivered once (stale_task_seen).
+  Pool watch returns reason "paused", paused:true and no ready tasks while PAUSED exists: stop the
+  executor loop until explicitly resumed. Owner-only watches still deliver reviews/messages/stalls,
+  but do not wake solely for pause; task watches retain lifecycle updates and include paused.
   Task summaries include revision, claim_round, claimed_by, assignee and latest_event
   {filename,type,entity_id,timestamp,body,truncated}. --task also includes events for new_events filenames.
   --include-events expands only the surfaced events, not the entire task history.`);
@@ -2994,7 +3202,30 @@ function printWatchHelp() {
 function printRenderHelp() {
   console.log(`Usage: wb.mjs render --bucket <dir> --task <task_id> [options]
   --after-event <filename>               Only include events newer than filename
-  --json                                 Output JSON`);
+  --tail-events <N>                      Last N events after filtering (0 for no events)
+  --latest-event                         Alias for --tail-events 1; cannot combine both
+  --json                                 Output {task_id,stage,path,claim_winner,task,body,events}
+  task holds frontmatter fields (e.g. task.status); events is an array of
+  {filename,type,entity_id,timestamp,body}. Default includes the full event history.`);
+}
+
+function printListHelp() {
+  console.log(`Usage: wb.mjs list --bucket <dir> [options]
+  --status <status>                      Filter lifecycle states (repeatable / comma-separated)
+  --tag <tag> / --tags <a,b>             Filter task tags (OR; repeatable / comma-separated)
+  --owner <id>                           Filter owner (combined with other filters using AND)
+  --json                                 Output {count,tasks:[{id,status,assignee,claimed_by,
+                                        revision,claim_round,latest_event,...}]}
+  Text output is one line per task with the latest event filename/type; JSON previews 5 body lines.`);
+}
+
+function printBucketHelp() {
+  console.log(`Usage: wb.mjs bucket <pause|resume> --bucket <dir> [options]
+  pause [-m <reason>]                    Atomically create plain PAUSED file; stop new claims
+  resume                                Remove PAUSED (also succeeds if already absent)
+  --json                                 Output {paused,path}
+  Humans may create/remove PAUSED directly. Pause is not cancellation; owners may still review.
+  Executors stop at checkpoints and wait for explicit resume instructions before re-arming pool watch.`);
 }
 
 function printMsgHelp() {
@@ -3033,6 +3264,10 @@ async function main(argv = process.argv.slice(2)) {
       return await cmdWatch(rest);
     case "render":
       return cmdRender(rest);
+    case "list":
+      return cmdList(rest);
+    case "bucket":
+      return cmdBucket(rest);
     case "msg":
       return cmdMsg(rest);
     case "entity":

@@ -206,6 +206,223 @@ test("watch summaries and task updates include bounded event evidence or full bo
   }
 });
 
+test("render bounds history after the cursor and documents its nested JSON shape", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "History"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    const first = runWbJson(["post", ...args, "--entity", "owner", "--type", "log", "-m", "First"]);
+    const second = runWbJson(["post", ...args, "--entity", "owner", "--type", "log", "-m", "Second"]);
+    const rendered = runWbJson(["render", ...args, "--tail-events", "2"]);
+    assert.deepEqual(rendered.events.map((event) => event.filename), [first.event, second.event]);
+    assert.equal(rendered.task.status, "pending");
+    assert.deepEqual(runWbJson(["render", ...args, "--latest-event"]).events.map((event) => event.filename), [second.event]);
+    assert.deepEqual(runWbJson(["render", ...args, "--after-event", second.event, "--latest-event"]).events, []);
+    assert.deepEqual(runWbJson(["render", ...args, "--tail-events", "0"]).events, []);
+    const text = runWb(["render", ...args, "--after-event", first.event, "--tail-events", "10"]);
+    assert.equal(text.status, 0, text.stderr);
+    assert.ok(text.stdout.includes(second.event));
+    assert.ok(!text.stdout.includes(first.event));
+    for (const invalid of [["--tail-events", "-1"], ["--tail-events", "1.5"], ["--latest-event", "--tail-events", "1"]]) {
+      assert.equal(runWb(["render", ...args, ...invalid]).status, 1);
+    }
+    assert.match(runWb(["render", "--help"]).stdout, /task holds frontmatter fields/);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("list emits one line per task and combines status, OR-tag and owner filters", () => {
+  const bucket = makeTempBucket();
+  try {
+    const first = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Listed", "--tag", "linux", "--assignee", "worker"]);
+    runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Held", "--tag", "windows", "--status", "ready"]);
+    runWbJson(["create", "--bucket", bucket, "--entity", "other", "--title", "Other", "--tag", "linux"]);
+    const args = ["list", "--bucket", bucket];
+    const all = runWbJson(args);
+    assert.equal(all.count, 3);
+    const selected = runWbJson([...args, "--status", "pending,ready", "--tags", "LINUX,macos", "--owner", "owner"]);
+    assert.equal(selected.count, 1);
+    assert.equal(selected.tasks[0].id, first.task_id);
+    assert.equal(selected.tasks[0].revision, 1);
+    assert.equal(selected.tasks[0].claim_round, 1);
+    assert.equal(selected.tasks[0].assignee, "worker");
+    assert.equal(selected.tasks[0].claimed_by, "");
+    assert.equal(selected.tasks[0].latest_event.filename, first.created_event);
+    const text = runWb(args);
+    assert.equal(text.status, 0, text.stderr);
+    assert.equal(text.stdout.trim().split("\n").length, 3);
+    assert.match(text.stdout, /status=pending assignee=worker claimed_by=- revision=1 claim_round=1 latest=/);
+    assert.equal(runWbJson([...args, "--status", "review"]).count, 0);
+    assert.equal(runWb([...args, "--status", "nonsense"]).status, 1);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("claim surfaces pre-claim/unaccepted amends and feedback; accept-amends merges once with an atomic revision/log", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Amends"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    const pre = runWbJson(["post", ...args, "--entity", "owner", "--type", "amend", "-m", "Pre-claim correction"]);
+    const claim = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    assert.deepEqual(claim.unread_events.map((event) => event.filename), [pre.event]);
+    assert.equal(claim.unread_events[0].body, "Pre-claim correction");
+    const mid = runWbJson(["post", ...args, "--entity", "owner", "--type", "amend", "-m", "Mid-flight correction"]);
+    assert.equal(runWb(["post", ...args, "--entity", "other", "--type", "log", "--accept-amends"]).status, 1);
+    assert.equal(runWb(["post", ...args, "--entity", "worker", "--type", "amend", "--accept-amends"]).status, 1);
+    const accepted = runWbJson(["post", ...args, "--entity", "worker", "--type", "log", "--accept-amends", "--bump-revision", "-m", "Applied"]);
+    assert.equal(accepted.task.revision, 2);
+    assert.equal(accepted.task.claim_round, 1);
+    assert.equal(accepted.task.status, "in-progress");
+    assert.equal(accepted.task.last_amend_seen, mid.event);
+    const render = runWbJson(["render", ...args]);
+    assert.ok(render.body.includes(`## Amendment: ${pre.event}\n\nPre-claim correction`));
+    assert.ok(render.body.includes(`## Amendment: ${mid.event}\n\nMid-flight correction`));
+    assert.match(render.body, /## Acceptance Criteria/);
+    assert.ok(render.events.at(-1).body.includes(pre.event));
+    assert.ok(render.events.at(-1).body.includes(mid.event));
+    assert.equal(runWb(["post", ...args, "--entity", "worker", "--type", "log", "--accept-amends"]).status, 1);
+    assert.equal(runWbJson(["render", ...args]).events.length, render.events.length);
+    runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
+    const feedback = runWbJson(["post", ...args, "--entity", "owner", "--type", "feedback", "--status", "pending", "-m", "Fix the test"]);
+    const rework = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    assert.deepEqual(rework.unread_events.map((event) => event.filename), [feedback.event]);
+    const later = runWbJson(["post", ...args, "--entity", "owner", "--type", "amend", "-m", "Still unaccepted"]);
+    runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
+    const nextFeedback = runWbJson(["post", ...args, "--entity", "owner", "--type", "feedback", "--status", "pending", "-m", "Another fix"]);
+    const nextClaim = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    assert.deepEqual(nextClaim.unread_events.map((event) => event.filename), [later.event, nextFeedback.event]);
+    runWbJson(["post", ...args, "--entity", "worker", "--type", "log", "--accept-amends"]);
+    const merged = runWbJson(["render", ...args]);
+    assert.equal(merged.body.split("Pre-claim correction").length, 2);
+    assert.equal(merged.body.split("Still unaccepted").length, 2);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("owner watches signal stale registered executors once per round/heartbeat and preserve delivery cursors", () => {
+  const bucket = makeTempBucket();
+  try {
+    runWbJson(["entity", "register", "--bucket", bucket, "--entity", "worker", "--ttl", "10"]);
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Stalled"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "0"]);
+    const entityPath = path.join(bucket, "entities", "worker.md");
+    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, 'updated_at: "2000-01-01T00:00:00Z"'));
+    const args = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--poll-ms", "50"];
+    const stale = runWbJson(args);
+    assert.equal(stale.reason, "stale");
+    assert.equal(stale.stale_tasks.length, 1);
+    assert.equal(stale.stale_tasks[0].id, created.task_id);
+    assert.equal(stale.stale_tasks[0].heartbeat.ttl_seconds, 10);
+    assert.equal(stale.stale_tasks[0].heartbeat.updated_at, "2000-01-01T00:00:00Z");
+    assert.equal(runWb([...args, "--timeout", "0.1"]).status, 124);
+    const entity = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "owner"]);
+    assert.equal(entity.stale_task_seen.length, 1);
+    runWbJson(["entity", "register", "--bucket", bucket, "--entity", "worker"]);
+    assert.equal(runWb([...args, "--timeout", "0.1"]).status, 124);
+    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, 'updated_at: "2000-01-01T00:00:01Z"'));
+    assert.equal(runWbJson(args).reason, "stale");
+    assert.equal(runWb(["watch", "--bucket", bucket, "--entity", "other", "--owner-only", "--timeout", "0.1"]).status, 124);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("owner watch notices TTL expiry while armed, without requiring task events", async () => {
+  const bucket = makeTempBucket();
+  try {
+    runWbJson(["entity", "register", "--bucket", bucket, "--entity", "worker"]);
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Expiry"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "0"]);
+    const entityPath = path.join(bucket, "entities", "worker.md");
+    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/ttl_seconds: \d+/, "ttl_seconds: 2"));
+    const result = await runWbAsync(["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--poll-ms", "50", "--timeout", "4", "--json"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).reason, "stale");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("terminal outcomes are optional, validated, and preserved without redefining lifecycle status", () => {
+  const bucket = makeTempBucket();
+  try {
+    for (const [index, outcome] of ["pass", "partial", "fail", "abandoned"].entries()) {
+      const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", outcome]);
+      const args = ["post", "--bucket", bucket, "--entity", "owner", "--task", created.task_id];
+      assert.equal(runWb([...args, "--type", "log", "--outcome", outcome]).status, 1);
+      assert.equal(runWb([...args, "--type", "complete", "--outcome", "unknown"]).status, 1);
+      const type = index === 3 ? "cancelled" : "complete";
+      const closed = runWbJson([...args, "--type", type, "--outcome", outcome]);
+      assert.equal(closed.task.status, type);
+      assert.equal(closed.task.outcome, outcome);
+      const rendered = runWbJson(["render", "--bucket", bucket, "--task", created.task_id]);
+      assert.equal(rendered.task.outcome, outcome);
+      assert.equal(runWb([...args, "--type", "log", "--outcome", outcome]).status, 1);
+    }
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("plain PAUSED blocks claims and pool delivery while owners can still review; resume is idempotent", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Paused"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    const pause = runWbJson(["bucket", "pause", "--bucket", bucket, "-m", "Await decision"]);
+    assert.equal(pause.paused, true);
+    assert.equal(fs.readFileSync(pause.path, "utf8"), "Await decision\n");
+    assert.equal(runWb(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]).status, 2);
+    const watch = runWbJson(["watch", "--bucket", bucket, "--entity", "worker"]);
+    assert.equal(watch.reason, "paused");
+    assert.equal(watch.paused, true);
+    assert.deepEqual(watch.tasks, []);
+    assert.equal(runWb(["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--timeout", "0.1"]).status, 124);
+    assert.equal(runWbJson(["bucket", "resume", "--bucket", bucket]).paused, false);
+    runWbJson(["bucket", "resume", "--bucket", bucket]);
+    const claim = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    fs.writeFileSync(pause.path, "Human pause\n");
+    runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
+    const taskUpdate = runWbJson(["watch", ...args, "--after-event", claim.last_event_seen]);
+    assert.equal(taskUpdate.paused, true);
+    const owner = runWbJson(["watch", "--bucket", bucket, "--entity", "owner", "--owner-only"]);
+    assert.equal(owner.paused, true);
+    assert.equal(owner.owner_tasks[0].id, created.task_id);
+    assert.equal(runWbJson(["post", ...args, "--entity", "owner", "--type", "complete", "--outcome", "pass"]).task.status, "complete");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("a pause during claim settle leaves the task pending and wakes an armed pool watcher", async () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Settle pause"]);
+    const claiming = runWbAsync(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "500", "--json"]);
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    const watching = runWbAsync(["watch", "--bucket", bucket, "--entity", "observer", "--owner-only", "--timeout", "0.2"]);
+    runWbJson(["bucket", "pause", "--bucket", bucket]);
+    const claim = await claiming;
+    assert.equal(claim.status, 2, claim.stderr);
+    assert.match(claim.stderr, /paused during claim/);
+    assert.equal(runWbJson(["render", "--bucket", bucket, "--task", created.task_id]).task.status, "pending");
+    assert.equal((await watching).status, 124);
+    runWbJson(["bucket", "resume", "--bucket", bucket]);
+    const poolWatch = runWbAsync(["watch", "--bucket", bucket, "--entity", "observer", "--poll-ms", "50", "--timeout", "2", "--json"]);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    runWbJson(["bucket", "pause", "--bucket", bucket]);
+    const result = await poolWatch;
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).reason, "paused");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
 test("YAML frontmatter parsing handles CRLF, comments, quotes, and multiline arrays", () => {
   const raw = [
     "---",

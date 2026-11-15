@@ -52,6 +52,14 @@ In background-completion harnesses, each re-arm runs in the background without `
 - Confirm pool watches do not re-offer a pending task during a child's claim-settle window. With several pending tasks, repeat `--exclude-task <id>` for dispatched IDs and confirm only other work appears.
 - Submit a review body longer than 5 lines. Verify watch summary revision/round/executor/assignee and latest filename/type/body preview; `--event-lines 2` truncates to two lines, `--include-events` returns the full body. Task-specific watches retain `new_events` filenames and include matching `events` objects.
 
+## Inspection and Control Checks
+
+- Register executors before execution; refresh entity heartbeats at checkpoints. On an extra fixture task, stop refreshing the executor's short-TTL heartbeat while `in-progress`; an armed owner watch must wake with `reason: "stale"` and heartbeat age/TTL. Re-arm without changing the heartbeat and confirm no duplicate alert. Inspect before resetting; TTL expiry is not proof of stopped execution.
+- Post an amendment before a fixture claim and another during execution. Confirm claim `unread_events` includes the pre-claim body. Executor runs `post --type log --accept-amends`; inspect appended chronological sections, one revision increment, `last_amend_seen`, and immutable log filenames. Repeat with no new amendment: error and no additional task/event writes. After feedback/reclaim, confirm feedback appears but accepted amendments do not.
+- Compare `render --tail-events 2`, `--latest-event`, and `--after-event <file> --latest-event` with the full stream. JSON status is `task.status`. `list --status review,blocked --tag e2e --owner lead --json` returns `{count,tasks}`; text lists one line per matching task.
+- Use `bucket pause -m "Await decision"` before claiming a pending fixture: claim exits 2, pool watch reports paused/no work, task remains pending. Do not re-arm paused pool watches in a loop. Owners can review an existing review task while paused. Resume, explicitly resume executor loops, then confirm claims work. Also create/remove `PAUSED` directly.
+- Close a completed negative investigation with `complete --outcome fail` and an unfinished fixture task with `cancelled --outcome abandoned`; inspect outcome separately from lifecycle. Use `partial` only with an explicit unverified list, not an acceptance PASS claim.
+
 ## Loose Pass Gates
 
 After both agents finish, run these checks against `$BUCKET`:

@@ -21,12 +21,9 @@ const DEFAULT_ENTITY_TTL_SECONDS = 300;
 const ENTITY_HEARTBEAT_MS = 60_000;
 const DEFAULT_MSG_COALESCE_MS = 500;
 const MAX_MSG_COALESCE_MS = 2000;
-const TASK_STAGES = ["active", "pending", "backlog", "archive"];
+const DEFAULT_CLAIM_SETTLE_MS = 2000;
 const BUCKET_SUBDIRS = [
-  "backlog",
-  "pending",
-  "active",
-  "archive",
+  "tasks",
   "messages",
   "entities",
   "tags",
@@ -67,6 +64,7 @@ const CANONICAL_TASK_KEYS = [
   "parent",
   "depends_on",
   "revision",
+  "claim_round",
   "updated_by",
   "updated_at",
 ];
@@ -374,13 +372,35 @@ function formatTaskMarkdown(data, body) {
 }
 
 function formatEventMarkdown(data, body) {
-  const fm = serializeFrontmatter(data, ["type", "entity_id", "timestamp"]);
+  const fm = serializeFrontmatter(data, ["type", "entity_id", "timestamp", "round"]);
   const trimmedBody = String(body || "").replace(/\r/g, "").trim();
   if (!trimmedBody) return `${fm}\n`;
   return `${fm}\n\n${trimmedBody}\n`;
 }
 
 const warnedMalformedTasks = new Set();
+const warnedConflictFiles = new Set();
+
+function isSyncConflictFilename(name) {
+  return /(\.sync-conflict-|conflicted copy)/i.test(String(name || ""));
+}
+
+function warnIfSyncConflictPresent(dirPath) {
+  try {
+    const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (isSyncConflictFilename(entry.name)) {
+        const full = path.join(dirPath, entry.name);
+        if (!warnedConflictFiles.has(full)) {
+          warnedConflictFiles.add(full);
+          process.stderr.write(`Warning: cloud sync conflict copy detected at ${full}\n`);
+        }
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
 
 function coerceStringList(val, emptySentinel = false) {
   if (Array.isArray(val)) {
@@ -417,6 +437,10 @@ function readTaskFile(taskPath) {
       typeof data.revision === "number"
         ? data.revision
         : Number.parseInt(String(data.revision || "1"), 10) || 1,
+    claim_round:
+      typeof data.claim_round === "number"
+        ? data.claim_round
+        : Number.parseInt(String(data.claim_round || "1"), 10) || 1,
     updated_by: String(data.updated_by ?? ""),
     updated_at: String(data.updated_at ?? ""),
   };
@@ -428,11 +452,11 @@ function readTaskFile(taskPath) {
   return { task, body };
 }
 
-function listStageTasks(bucketDir, stage) {
-  const stageDir = path.join(bucketDir, stage);
+function listTasks(bucketDir) {
+  const tasksDir = path.join(bucketDir, "tasks");
   let entries;
   try {
-    entries = fs.readdirSync(stageDir, { withFileTypes: true });
+    entries = fs.readdirSync(tasksDir, { withFileTypes: true });
   } catch (err) {
     if (err.code === "ENOENT") return [];
     throw err;
@@ -441,13 +465,14 @@ function listStageTasks(bucketDir, stage) {
   for (const entry of entries) {
     if (entry.name.startsWith(".")) continue;
     if (!entry.isDirectory()) continue;
-    const dir = path.join(stageDir, entry.name);
+    const dir = path.join(tasksDir, entry.name);
+    warnIfSyncConflictPresent(dir);
     const taskPath = path.join(dir, "task.md");
     try {
       const { task, body } = readTaskFile(taskPath);
       if (!task.id) task.id = entry.name;
       tasks.push({
-        stage,
+        stage: "tasks",
         dirName: entry.name,
         dir,
         taskPath,
@@ -457,7 +482,7 @@ function listStageTasks(bucketDir, stage) {
       });
     } catch (err) {
       if (err.code === "ENOENT" || err.code === "ENOTDIR") {
-        // Ignore folders missing task.md or moved mid-scan
+        // Ignore folders missing task.md or synced mid-scan
         continue;
       }
       if (err instanceof CliError) {
@@ -474,40 +499,35 @@ function listStageTasks(bucketDir, stage) {
 }
 
 function scanAllTasks(bucketDir) {
-  const active = listStageTasks(bucketDir, "active");
-  const pending = listStageTasks(bucketDir, "pending");
-  const backlog = listStageTasks(bucketDir, "backlog");
-  const archive = listStageTasks(bucketDir, "archive");
+  const tasks = listTasks(bucketDir);
   const byId = new Map();
-  for (const item of [...active, ...pending, ...backlog, ...archive]) {
+  for (const item of tasks) {
     byId.set(item.task.id || item.dirName, item);
   }
-  return { active, pending, backlog, archive, byId };
+  return { tasks, byId };
 }
 
 function findTask(bucketDir, taskId) {
   validateTaskId(taskId);
-  for (const stage of TASK_STAGES) {
-    const dir = path.join(bucketDir, stage, taskId);
-    const taskPath = path.join(dir, "task.md");
-    try {
-      const { task, body } = readTaskFile(taskPath);
-      if (!task.id) task.id = taskId;
-      return {
-        stage,
-        dirName: taskId,
-        dir,
-        taskPath,
-        eventsDir: path.join(dir, "events"),
-        task,
-        body,
-      };
-    } catch (err) {
-      if (err.code === "ENOENT" || err.code === "ENOTDIR") continue;
-      throw err;
-    }
+  const dir = path.join(bucketDir, "tasks", taskId);
+  const taskPath = path.join(dir, "task.md");
+  try {
+    const { task, body } = readTaskFile(taskPath);
+    if (!task.id) task.id = taskId;
+    warnIfSyncConflictPresent(dir);
+    return {
+      stage: "tasks",
+      dirName: taskId,
+      dir,
+      taskPath,
+      eventsDir: path.join(dir, "events"),
+      task,
+      body,
+    };
+  } catch (err) {
+    if (err.code === "ENOENT" || err.code === "ENOTDIR") return null;
+    throw err;
   }
-  return null;
 }
 
 function parseEventFilenameParts(filename) {
@@ -558,6 +578,7 @@ function listEventFiles(eventsDir) {
     .filter(
       (e) =>
         !e.name.startsWith(".") &&
+        !isSyncConflictFilename(e.name) &&
         e.isFile() &&
         e.name.endsWith(".md")
     )
@@ -650,7 +671,14 @@ function writeUniqueMarkdown(targetDir, prefix, content, label = "file") {
   throw new CliError(`Failed to allocate unique ${label} filename after 1000 attempts.`);
 }
 
-function writeUniqueEvent(eventsDir, entityId, eventType, body, now = new Date()) {
+function writeUniqueEvent(
+  eventsDir,
+  entityId,
+  eventType,
+  body,
+  now = new Date(),
+  extraFrontmatter = {}
+) {
   const compactUtc = formatCompactUtc(now);
   const isoUtc = formatIsoUtc(now);
   const content = formatEventMarkdown(
@@ -658,6 +686,7 @@ function writeUniqueEvent(eventsDir, entityId, eventType, body, now = new Date()
       type: eventType,
       entity_id: entityId,
       timestamp: isoUtc,
+      ...extraFrontmatter,
     },
     body
   );
@@ -668,6 +697,58 @@ function writeUniqueEvent(eventsDir, entityId, eventType, body, now = new Date()
     "event"
   );
   return { ...res, timestamp: isoUtc };
+}
+
+function getRoundClaims(eventsDir, claimRound = 1) {
+  const targetRound = Number(claimRound) || 1;
+  const eventNames = listEventFiles(eventsDir);
+  let lastBoundaryIdx = -1;
+  for (let i = 0; i < eventNames.length; i += 1) {
+    const parts = parseEventFilenameParts(eventNames[i]);
+    if (parts && ["created", "answer", "feedback", "reset"].includes(parts.type)) {
+      lastBoundaryIdx = i;
+    }
+  }
+  const claims = [];
+  for (let i = 0; i < eventNames.length; i += 1) {
+    const name = eventNames[i];
+    const parts = parseEventFilenameParts(name);
+    if (!parts || parts.type !== "claimed") continue;
+    let data = {};
+    try {
+      ({ data } = parseFrontmatter(fs.readFileSync(path.join(eventsDir, name), "utf8")));
+    } catch {
+      data = {};
+    }
+    const hasExplicitRound = data.round !== undefined && data.round !== "";
+    if (hasExplicitRound) {
+      if (Number(data.round) !== targetRound) continue;
+    } else if (i <= lastBoundaryIdx) {
+      continue;
+    }
+    const entityId =
+      typeof data.entity_id === "string" && data.entity_id.trim()
+        ? data.entity_id.trim()
+        : parts.entityId;
+    claims.push({
+      filename: name,
+      utc: parts.utc,
+      entityId,
+      round: hasExplicitRound ? Number(data.round) : targetRound,
+    });
+  }
+  claims.sort((a, b) => {
+    if (a.utc !== b.utc) return a.utc < b.utc ? -1 : 1;
+    if (a.entityId !== b.entityId) return a.entityId < b.entityId ? -1 : 1;
+    return compareEventFilenames(a.filename, b.filename);
+  });
+  return { claims, winner: claims[0] || null };
+}
+
+function hasCompetingRoundClaim(item, entityId) {
+  const claimRound = Number(item.task.claim_round) || 1;
+  const { winner } = getRoundClaims(item.eventsDir, claimRound);
+  return Boolean(winner && winner.entityId !== entityId);
 }
 
 function parseMessageFilenameParts(filename) {
@@ -708,7 +789,13 @@ function listMessageFiles(messagesDir) {
     throw err;
   }
   const files = entries
-    .filter((e) => !e.name.startsWith(".") && e.isFile() && e.name.endsWith(".md"))
+    .filter(
+      (e) =>
+        !e.name.startsWith(".") &&
+        !isSyncConflictFilename(e.name) &&
+        e.isFile() &&
+        e.name.endsWith(".md")
+    )
     .map((e) => ({
       name: e.name,
       parts: parseMessageFilenameParts(e.name),
@@ -1086,8 +1173,10 @@ function listTagsInfo(bucketDir) {
     }
   }
 
-  const { active, pending, backlog } = scanAllTasks(bucketDir);
-  for (const taskItem of [...active, ...pending, ...backlog]) {
+  const { tasks } = scanAllTasks(bucketDir);
+  for (const taskItem of tasks.filter(
+    (t) => t.task.status !== "complete" && t.task.status !== "cancelled"
+  )) {
     for (const t of taskItem.task.tags || []) {
       const item = ensureEntry(t);
       if (item) item.task_count += 1;
@@ -1115,8 +1204,7 @@ function matchesTags(task, entityId, workerTags, includeUntagged) {
 }
 
 function findOwnerActionableTasks(bucketDir, entityId) {
-  const active = listStageTasks(bucketDir, "active");
-  return active
+  return listTasks(bucketDir)
     .filter(
       (item) =>
         item.task.owner === entityId &&
@@ -1146,33 +1234,36 @@ function sortByPriorityAndAge(a, b) {
 }
 
 function findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged) {
-  const { active, pending, byId } = scanAllTasks(bucketDir);
+  const { tasks, byId } = scanAllTasks(bucketDir);
 
-  const activeMine = active
-    .filter(
-      (item) =>
-        item.task.status === "pending" &&
-        item.task.assignee === entityId &&
-        dependenciesSatisfied(item.task, byId)
-    )
-    .sort(sortByPriorityAndAge);
-
-  const pendingPool = pending
+  const assignedToMe = tasks
     .filter(
       (item) =>
         item.task.status === "pending" &&
         item.task.claimed_by === "" &&
-        matchesTags(item.task, entityId, workerTags, includeUntagged) &&
-        dependenciesSatisfied(item.task, byId)
+        item.task.assignee === entityId &&
+        dependenciesSatisfied(item.task, byId) &&
+        !hasCompetingRoundClaim(item, entityId)
     )
     .sort(sortByPriorityAndAge);
 
-  return [...activeMine, ...pendingPool];
+  const openPool = tasks
+    .filter(
+      (item) =>
+        item.task.status === "pending" &&
+        item.task.claimed_by === "" &&
+        item.task.assignee === "" &&
+        matchesTags(item.task, entityId, workerTags, includeUntagged) &&
+        dependenciesSatisfied(item.task, byId) &&
+        !hasCompetingRoundClaim(item, entityId)
+    )
+    .sort(sortByPriorityAndAge);
+
+  return [...assignedToMe, ...openPool];
 }
 
 function getActiveWipTasks(bucketDir, entityId) {
-  const active = listStageTasks(bucketDir, "active");
-  return active.filter(
+  return listTasks(bucketDir).filter(
     (item) =>
       item.task.status === "in-progress" && item.task.claimed_by === entityId
   );
@@ -1256,8 +1347,6 @@ function cmdCreate(argv) {
   if (requestedBacklog && initialStatus === "pending") {
     throw new CliError("--backlog/--draft cannot be combined with --status pending.");
   }
-  const targetStage =
-    initialStatus === "draft" || initialStatus === "ready" ? "backlog" : "pending";
 
   if (values.assignee) validateIdentifier(values.assignee, "--assignee");
   if (values.parent) validateTaskId(values.parent);
@@ -1277,14 +1366,11 @@ function cmdCreate(argv) {
 
   let taskId = null;
   let taskDir = null;
+  const tasksRoot = path.join(bucketDir, "tasks");
   for (let seq = 1; seq < 1000; seq += 1) {
     const candidate = `${compactUtc}-${baseSlug}${seq === 1 ? "" : `-${seq}`}`;
-    const existsElsewhere = TASK_STAGES.some(
-      (s) => s !== targetStage && fs.existsSync(path.join(bucketDir, s, candidate))
-    );
-    if (existsElsewhere) continue;
-
-    const candidateDir = path.join(bucketDir, targetStage, candidate);
+    const candidateDir = path.join(tasksRoot, candidate);
+    if (fs.existsSync(candidateDir)) continue;
     try {
       fs.mkdirSync(candidateDir, { recursive: false });
       taskId = candidate;
@@ -1345,6 +1431,7 @@ function cmdCreate(argv) {
     tags,
     owner: entityId,
     claimed_by: "",
+    claim_round: 1,
     assignee: values.assignee || "",
     parent: values.parent || "",
     depends_on: dependsOn,
@@ -1362,7 +1449,7 @@ function cmdCreate(argv) {
       JSON.stringify(
         {
           task_id: taskId,
-          stage: targetStage,
+          stage: "tasks",
           path: taskDir,
           task_path: taskPath,
           created_event: createdEvent.filename,
@@ -1379,7 +1466,7 @@ function cmdCreate(argv) {
   return 0;
 }
 
-function cmdClaim(argv) {
+async function cmdClaim(argv) {
   const { values } = parseArgs({
     args: argv,
     options: {
@@ -1389,6 +1476,7 @@ function cmdClaim(argv) {
       tag: { type: "string", multiple: true },
       tags: { type: "string", multiple: true },
       "include-untagged": { type: "boolean", default: false },
+      "claim-settle-ms": { type: "string", default: String(DEFAULT_CLAIM_SETTLE_MS) },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -1404,6 +1492,10 @@ function cmdClaim(argv) {
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
   const bucketDir = path.resolve(values.bucket);
   const entityId = validateIdentifier(values.entity, "--entity");
+  const settleMs = Number.parseInt(values["claim-settle-ms"], 10);
+  if (!Number.isFinite(settleMs) || settleMs < 0) {
+    throw new CliError(`Invalid --claim-settle-ms "${values["claim-settle-ms"]}".`);
+  }
   const workerTags = new Set(
     normalizeTags([
       ...parseListFlags(values.tag),
@@ -1431,18 +1523,16 @@ function cmdClaim(argv) {
       throw new CliError(`Task "${values.task}" not found.`, 2);
     }
     const eligible =
-      (found.stage === "active" &&
-        found.task.status === "pending" &&
-        found.task.assignee === entityId &&
-        dependenciesSatisfied(found.task, byId)) ||
-      (found.stage === "pending" &&
-        found.task.status === "pending" &&
-        found.task.claimed_by === "" &&
-        matchesTags(found.task, entityId, workerTags, includeUntagged) &&
-        dependenciesSatisfied(found.task, byId));
+      found.task.status === "pending" &&
+      found.task.claimed_by === "" &&
+      (found.task.assignee === entityId ||
+        (found.task.assignee === "" &&
+          matchesTags(found.task, entityId, workerTags, includeUntagged))) &&
+      dependenciesSatisfied(found.task, byId) &&
+      !hasCompetingRoundClaim(found, entityId);
     if (!eligible) {
       throw new CliError(
-        `Task "${values.task}" is not eligible for "${entityId}" (stage=${found.stage}, status=${found.task.status}).`,
+        `Task "${values.task}" is not eligible for "${entityId}" (status=${found.task.status}, claimed_by=${found.task.claimed_by || "none"}).`,
         2
       );
     }
@@ -1455,52 +1545,83 @@ function cmdClaim(argv) {
   }
 
   let claimedEntry = null;
+  let claimedEvent = null;
+  let finalTask = null;
+
   for (const candidate of candidates) {
-    if (candidate.stage === "pending") {
-      const destDir = path.join(bucketDir, "active", candidate.dirName);
-      try {
-        fs.renameSync(candidate.dir, destDir);
-      } catch (err) {
-        if (err.code === "ENOENT" || err.code === "EEXIST" || err.code === "ENOTEMPTY") {
-          // Lost claim race to another entity
-          continue;
-        }
-        throw err;
-      }
-      claimedEntry = {
-        ...candidate,
-        stage: "active",
-        dir: destDir,
-        taskPath: path.join(destDir, "task.md"),
-        eventsDir: path.join(destDir, "events"),
-      };
-      break;
-    } else {
-      claimedEntry = candidate;
-      break;
+    let preTask;
+    try {
+      ({ task: preTask } = readTaskFile(candidate.taskPath));
+    } catch {
+      continue;
     }
+    if (preTask.status !== "pending" || preTask.claimed_by !== "") {
+      continue;
+    }
+
+    const claimRound = Number(preTask.claim_round) || 1;
+    const { winner: preWinner } = getRoundClaims(candidate.eventsDir, claimRound);
+    if (preWinner && preWinner.entityId !== entityId) {
+      continue;
+    }
+
+    let myClaimEvent;
+    if (preWinner && preWinner.entityId === entityId) {
+      myClaimEvent = { filename: preWinner.filename };
+    } else {
+      myClaimEvent = writeUniqueEvent(
+        candidate.eventsDir,
+        entityId,
+        "claimed",
+        `Claimed by ${entityId} (round ${claimRound}).`,
+        new Date(),
+        { round: claimRound }
+      );
+    }
+
+    if (settleMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, settleMs));
+    }
+
+    let postTask;
+    let postBody;
+    try {
+      ({ task: postTask, body: postBody } = readTaskFile(candidate.taskPath));
+    } catch {
+      continue;
+    }
+    if (
+      postTask.status !== "pending" &&
+      !(postTask.status === "in-progress" && postTask.claimed_by === entityId)
+    ) {
+      continue;
+    }
+    if ((Number(postTask.claim_round) || 1) !== claimRound) {
+      continue;
+    }
+
+    const { winner } = getRoundClaims(candidate.eventsDir, claimRound);
+    if (!winner || winner.entityId !== entityId) {
+      continue;
+    }
+
+    postTask.status = "in-progress";
+    postTask.claimed_by = entityId;
+    postTask.claim_round = claimRound;
+    postTask.updated_by = entityId;
+    postTask.updated_at = formatIsoUtc(new Date());
+    atomicWriteFile(candidate.taskPath, formatTaskMarkdown(postTask, postBody));
+
+    claimedEntry = candidate;
+    claimedEvent = myClaimEvent;
+    finalTask = postTask;
+    break;
   }
 
-  if (!claimedEntry) {
+  if (!claimedEntry || !finalTask) {
     throw new CliError("Lost claim race; no remaining eligible tasks.", 2);
   }
 
-  const now = new Date();
-  const isoUtc = formatIsoUtc(now);
-  const { task: freshTask, body: freshBody } = readTaskFile(claimedEntry.taskPath);
-  const claimedEvent = writeUniqueEvent(
-    claimedEntry.eventsDir,
-    entityId,
-    "claimed",
-    `Claimed by ${entityId}.`,
-    now
-  );
-
-  freshTask.status = "in-progress";
-  freshTask.claimed_by = entityId;
-  freshTask.updated_by = entityId;
-  freshTask.updated_at = isoUtc;
-  atomicWriteFile(claimedEntry.taskPath, formatTaskMarkdown(freshTask, freshBody));
   touchExistingEntity(bucketDir, entityId);
 
   const events = listEventFiles(claimedEntry.eventsDir);
@@ -1510,23 +1631,23 @@ function cmdClaim(argv) {
     console.log(
       JSON.stringify(
         {
-          task_id: freshTask.id,
-          stage: "active",
+          task_id: finalTask.id,
+          stage: "tasks",
           path: claimedEntry.dir,
           task_path: claimedEntry.taskPath,
           claimed_event: claimedEvent.filename,
           last_event_seen: lastEventSeen,
           events,
-          task: freshTask,
+          task: finalTask,
         },
         null,
         2
       )
     );
   } else {
-    console.log(`Claimed ${freshTask.id} (${claimedEntry.dir})`);
-    console.log(`Title: ${freshTask.title}`);
-    console.log(`Priority: ${freshTask.priority} | Tags: ${JSON.stringify(freshTask.tags)}`);
+    console.log(`Claimed ${finalTask.id} (${claimedEntry.dir})`);
+    console.log(`Title: ${finalTask.title}`);
+    console.log(`Priority: ${finalTask.priority} | Tags: ${JSON.stringify(finalTask.tags)}`);
     console.log(`Claimed Event: ${claimedEvent.filename}`);
     console.log(`last_event_seen: ${lastEventSeen}`);
   }
@@ -1580,8 +1701,8 @@ function cmdPost(argv) {
   if (!found) {
     throw new CliError(`Task "${taskId}" not found.`);
   }
-  if (found.stage === "archive") {
-    throw new CliError(`Task "${taskId}" is already in archive/ and cannot be modified.`);
+  if (found.task.status === "complete" || found.task.status === "cancelled") {
+    throw new CliError(`Task "${taskId}" is already ${found.task.status} and cannot be modified.`);
   }
 
   let targetStatus = values.status ? String(values.status).toLowerCase() : null;
@@ -1614,7 +1735,7 @@ function cmdPost(argv) {
       values.reopen
   );
 
-  // Enforce single-writer rule on task.md
+  // Enforce single-writer rule and late-sync split-brain guard on task.md
   if (mutatesTaskMd) {
     const curStatus = found.task.status;
     if (curStatus === "in-progress") {
@@ -1623,33 +1744,37 @@ function cmdPost(argv) {
           `Single-writer violation: task "${taskId}" is in-progress (claimed_by="${found.task.claimed_by}"); "${entityId}" may only append events without modifying task.md.`
         );
       }
+      if (entityId === found.task.claimed_by && eventType !== "reset") {
+        const claimRound = Number(found.task.claim_round) || 1;
+        const { winner } = getRoundClaims(found.eventsDir, claimRound);
+        if (winner && winner.entityId !== entityId) {
+          throw new CliError(
+            `Split-brain claim conflict: round ${claimRound} winner is "${winner.entityId}", not "${entityId}".`,
+            2
+          );
+        }
+      }
     } else if (curStatus === "blocked" || curStatus === "review") {
-      if (found.task.owner && entityId !== found.task.owner) {
+      if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
         throw new CliError(
           `Single-writer violation: task "${taskId}" is ${curStatus} (owner="${found.task.owner}"); only owner may modify task.md.`
         );
       }
-    } else if (found.stage === "pending" || found.stage === "backlog") {
+    } else if (curStatus === "draft" || curStatus === "ready" || curStatus === "pending") {
       if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
         throw new CliError(
-          `Single-writer violation: ${found.stage} task "${taskId}" belongs to owner "${found.task.owner}".`
-        );
-      }
-    } else if (curStatus === "pending" && found.stage === "active") {
-      if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
-        throw new CliError(
-          `Single-writer violation: active pending task "${taskId}" may only be modified by owner "${found.task.owner}" (or claimed via 'claim').`
+          `Single-writer violation: ${curStatus} task "${taskId}" belongs to owner "${found.task.owner}".`
         );
       }
     }
 
     if (
-      (found.stage === "backlog" || found.stage === "pending") &&
+      (curStatus === "draft" || curStatus === "ready" || curStatus === "pending") &&
       targetStatus &&
       ["in-progress", "blocked", "review"].includes(targetStatus)
     ) {
       throw new CliError(
-        `Invalid status transition: cannot set status "${targetStatus}" while task is in ${found.stage}/.`
+        `Invalid status transition: cannot set status "${targetStatus}" directly from status "${curStatus}".`
       );
     }
   }
@@ -1667,15 +1792,17 @@ function cmdPost(argv) {
     now
   );
 
-  let finalStage = found.stage;
-  let finalDir = found.dir;
   const updatedTask = { ...found.task };
   let updatedBody = found.body;
 
   // 2. Atomically update task.md if requested
   if (mutatesTaskMd) {
-    const returningToActivePending =
-      found.stage === "active" &&
+    const returningFromActive =
+      (found.task.status === "in-progress" ||
+        found.task.status === "blocked" ||
+        found.task.status === "review") &&
+      targetStatus === "pending";
+    const returningToPinnedPending =
       (found.task.status === "blocked" || found.task.status === "review") &&
       targetStatus === "pending" &&
       !values.reopen &&
@@ -1683,6 +1810,9 @@ function cmdPost(argv) {
 
     if (targetStatus) {
       updatedTask.status = targetStatus;
+    }
+    if (returningFromActive) {
+      updatedTask.claim_round = (Number(updatedTask.claim_round) || 1) + 1;
     }
     if (values["bump-revision"]) {
       updatedTask.revision = (Number(updatedTask.revision) || 1) + 1;
@@ -1695,7 +1825,8 @@ function cmdPost(argv) {
       targetStatus === "cancelled" ||
       eventType === "reset" ||
       values.reopen ||
-      returningToActivePending
+      returningToPinnedPending ||
+      returningFromActive
     ) {
       updatedTask.claimed_by = "";
     }
@@ -1705,7 +1836,7 @@ function cmdPost(argv) {
       updatedTask.assignee = values.assignee;
     } else if (values.reopen || eventType === "reset") {
       updatedTask.assignee = "";
-    } else if (returningToActivePending && !updatedTask.assignee && found.task.claimed_by) {
+    } else if (returningToPinnedPending && !updatedTask.assignee && found.task.claimed_by) {
       updatedTask.assignee = found.task.claimed_by;
     }
 
@@ -1725,36 +1856,6 @@ function cmdPost(argv) {
     updatedTask.updated_at = isoUtc;
 
     atomicWriteFile(found.taskPath, formatTaskMarkdown(updatedTask, updatedBody));
-
-    // 3. Directory stage moves (after payload & task.md update)
-    if (updatedTask.status === "complete" || updatedTask.status === "cancelled") {
-      const archiveDir = path.join(bucketDir, "archive", found.dirName);
-      fs.renameSync(found.dir, archiveDir);
-      finalStage = "archive";
-      finalDir = archiveDir;
-    } else if (
-      found.stage === "active" &&
-      (values.reopen || eventType === "reset") &&
-      updatedTask.status === "pending"
-    ) {
-      const pendingDir = path.join(bucketDir, "pending", found.dirName);
-      fs.renameSync(found.dir, pendingDir);
-      finalStage = "pending";
-      finalDir = pendingDir;
-    } else if (found.stage === "backlog" && updatedTask.status === "pending") {
-      const pendingDir = path.join(bucketDir, "pending", found.dirName);
-      fs.renameSync(found.dir, pendingDir);
-      finalStage = "pending";
-      finalDir = pendingDir;
-    } else if (
-      found.stage === "pending" &&
-      (updatedTask.status === "draft" || updatedTask.status === "ready")
-    ) {
-      const backlogDir = path.join(bucketDir, "backlog", found.dirName);
-      fs.renameSync(found.dir, backlogDir);
-      finalStage = "backlog";
-      finalDir = backlogDir;
-    }
   }
 
   touchExistingEntity(bucketDir, entityId);
@@ -1764,8 +1865,8 @@ function cmdPost(argv) {
       JSON.stringify(
         {
           task_id: updatedTask.id,
-          stage: finalStage,
-          path: finalDir,
+          stage: "tasks",
+          path: found.dir,
           event: eventResult.filename,
           task_updated: mutatesTaskMd,
           task: updatedTask,
@@ -1778,7 +1879,7 @@ function cmdPost(argv) {
     console.log(`Posted ${eventResult.filename} to ${updatedTask.id}`);
     if (mutatesTaskMd) {
       console.log(
-        `State: stage=${finalStage} status=${updatedTask.status} revision=${updatedTask.revision}`
+        `State: status=${updatedTask.status} revision=${updatedTask.revision}`
       );
     }
   }
@@ -1846,6 +1947,9 @@ function cmdRender(argv) {
     }
   });
 
+  const { winner } = getRoundClaims(found.eventsDir, found.task.claim_round || 1);
+  const claimWinner = winner ? winner.entityId : "";
+
   if (values.json) {
     console.log(
       JSON.stringify(
@@ -1853,6 +1957,7 @@ function cmdRender(argv) {
           task_id: found.task.id,
           stage: found.stage,
           path: found.dir,
+          claim_winner: claimWinner,
           task: found.task,
           body: found.body.trim(),
           events,
@@ -1865,7 +1970,7 @@ function cmdRender(argv) {
   }
 
   const out = [];
-  out.push(`<!-- stage: ${found.stage} | path: ${found.dir} -->`);
+  out.push(`<!-- stage: ${found.stage} | path: ${found.dir} | claim_winner: ${claimWinner} -->`);
   out.push(formatTaskMarkdown(found.task, found.body).trimEnd());
   out.push("");
   out.push("## Event Stream");
@@ -2006,9 +2111,10 @@ async function cmdWatch(argv) {
         }
         return null;
       }
-      // Stat task.md to keep SMB/NFS client cache fresh during polling
+      // Stat task.md and events/ to keep SMB/NFS client cache fresh during polling
       try {
         fs.statSync(current.taskPath);
+        fs.statSync(current.eventsDir);
       } catch {
         // ignore
       }
@@ -2053,8 +2159,8 @@ async function cmdWatch(argv) {
       return null;
     }
 
-    // Stat stage and message dirs to keep SMB/NFS client caches fresh during polling
-    for (const sub of ["pending", "active", "archive", "backlog", "messages"]) {
+    // Stat task and message dirs to keep SMB/NFS/sync client caches fresh during polling
+    for (const sub of ["tasks", "messages"]) {
       try {
         fs.statSync(path.join(bucketDir, sub));
       } catch {
@@ -2278,7 +2384,8 @@ async function cmdWatch(argv) {
     const onWatchEvent = (_eventType, filename) => {
       if (filename) {
         const str = String(filename);
-        if (path.basename(str).startsWith(".")) return;
+        const base = path.basename(str);
+        if (base.startsWith(".") || isSyncConflictFilename(base)) return;
         const top = str.split(/[\\/]/)[0];
         if (top === "entities") return;
       }
@@ -2289,7 +2396,7 @@ async function cmdWatch(argv) {
       watchers.push(fs.watch(bucketDir, { recursive: true }, onWatchEvent));
     } catch {
       // Fallback on platforms/mounts without recursive fs.watch: watch top-level dirs + polling
-      for (const sub of ["pending", "active", "archive", "backlog", "messages"]) {
+      for (const sub of ["tasks", "messages"]) {
         try {
           watchers.push(fs.watch(path.join(bucketDir, sub), onWatchEvent));
         } catch {
@@ -2694,8 +2801,8 @@ function printMainHelp() {
   console.log(`Usage: wb.mjs <subcommand> [options]
 
 Subcommands:
-  create   Create a new task in pending/ or backlog/ with initial created event
-  claim    Atomically claim an eligible task from pending/ or resume assigned active/ task
+  create   Create a new task in tasks/ with initial created event
+  claim    Claim an eligible task via lockless 2-phase event election
   post     Append an immutable event to events/ and optionally transition task.md
   watch    Block with native fs.watch + 1000ms stat polling until work, owner update, or messages arrive
   render   Render task.md and chronologically sorted events/*.md
@@ -2713,8 +2820,8 @@ function printCreateHelp() {
   --assignee <entity_id>                 Optional target executor
   --parent <task_id>                     Optional parent task_id
   --depends-on <id1,id2>                 Upstream task_ids that must be complete
-  --backlog / --draft                    Create in backlog/ with status "draft"
-  --status <draft|ready|pending>         Initial status (draft/ready create in backlog/)
+  --backlog / --draft                    Create with status "draft"
+  --status <draft|ready|pending>         Initial status (default: pending)
   --workspace <path>                     Workspace path for default template
   --files <f1,f2>                        Relevant files for default template
   --description <text>                   Description for default template
@@ -2729,6 +2836,7 @@ function printClaimHelp() {
   --task <task_id>                       Claim a specific task (otherwise picks top eligible)
   --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
   --include-untagged                     Also accept untagged tasks when --tag is set
+  --claim-settle-ms <ms>                 Settle wait before electing round winner (default: ${DEFAULT_CLAIM_SETTLE_MS})
   --json                                 Output JSON`);
 }
 
@@ -2743,7 +2851,7 @@ function printPostHelp() {
   --add-depends-on <id1,id2>             Append task IDs to depends_on
   --remove-depends-on <id1,id2>          Remove task IDs from depends_on
   --check-ac                             Check all '- [ ]' acceptance criteria boxes to '- [x]'
-  --reopen                               Move active task back to pending/ and clear claimed_by/assignee
+  --reopen                               Reset status to pending, increment claim_round, clear claimed_by/assignee
   --json                                 Output JSON`);
 }
 
@@ -2799,7 +2907,7 @@ async function main(argv = process.argv.slice(2)) {
     case "create":
       return cmdCreate(rest);
     case "claim":
-      return cmdClaim(rest);
+      return await cmdClaim(rest);
     case "post":
       return cmdPost(rest);
     case "watch":
@@ -2840,6 +2948,8 @@ if (isEntrypoint) {
 export {
   compareEventFilenames,
   compareMessageFilenames,
+  getRoundClaims,
+  isSyncConflictFilename,
   parseFrontmatter,
   serializeFrontmatter,
   slugify,

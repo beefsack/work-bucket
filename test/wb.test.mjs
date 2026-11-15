@@ -8,6 +8,8 @@ import { fileURLToPath } from "node:url";
 import {
   compareEventFilenames,
   compareMessageFilenames,
+  getRoundClaims,
+  isSyncConflictFilename,
   parseFrontmatter,
   serializeFrontmatter,
   slugify,
@@ -140,12 +142,14 @@ test("create handles same-second ID collisions and populates task.md + created e
     ]);
 
     assert.notEqual(first.task_id, second.task_id);
-    assert.ok(fs.existsSync(path.join(bucket, "pending", first.task_id, "task.md")));
+    assert.ok(fs.existsSync(path.join(bucket, "tasks", first.task_id, "task.md")));
     assert.ok(
       fs.existsSync(
-        path.join(bucket, "pending", first.task_id, "events", first.created_event)
+        path.join(bucket, "tasks", first.task_id, "events", first.created_event)
       )
     );
+    assert.equal(first.stage, "tasks");
+    assert.equal(first.task.claim_round, 1);
     assert.deepEqual(first.task.tags, ["linux", "gpu"]);
     assert.equal(first.task.priority, "high");
     assert.equal(first.task.status, "pending");
@@ -225,6 +229,8 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
         "win-worker",
         "--tag",
         "windows",
+        "--claim-settle-ms",
+        "0",
       ]);
       claimedIds.push(c.task_id);
       runWbJson([
@@ -266,6 +272,8 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "win-worker",
       "--tag",
       "windows",
+      "--claim-settle-ms",
+      "0",
     ]);
     assert.equal(noMatch.status, 2);
 
@@ -279,6 +287,8 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "--tag",
       "windows",
       "--include-untagged",
+      "--claim-settle-ms",
+      "0",
     ]);
     assert.equal(c3.task_id, tUntagged.task_id);
 
@@ -291,6 +301,8 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "win-cert-worker",
       "--tag",
       "windows-signing",
+      "--claim-settle-ms",
+      "0",
     ]);
     assert.equal(c4.task_id, tWinSigned.task_id);
   } finally {
@@ -364,11 +376,11 @@ test("depends_on blocks until complete, stays blocked if cancelled, and priority
     ]);
 
     // Next claimable must be `dep` (because downstream & blockedByCancel have unmet deps)
-    const c1 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
+    const c1 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
     assert.equal(c1.task_id, dep.task_id);
 
     // WIP limit prevents exec-1 from claiming anything else while in-progress
-    const wipErr = runWb(["claim", "--bucket", bucket, "--entity", "exec-1"]);
+    const wipErr = runWb(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
     assert.equal(wipErr.status, 2);
 
     // Complete dep
@@ -398,10 +410,10 @@ test("depends_on blocks until complete, stays blocked if cancelled, and priority
     ]);
 
     // Now downstream is claimable, while blockedByCancel remains blocked
-    const c2 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
+    const c2 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
     assert.equal(c2.task_id, downstream.task_id);
 
-    const noneLeft = runWb(["claim", "--bucket", bucket, "--entity", "exec-2"]);
+    const noneLeft = runWb(["claim", "--bucket", bucket, "--entity", "exec-2", "--claim-settle-ms", "0"]);
     assert.equal(noneLeft.status, 2);
 
     // Removing cancelled dep makes blockedByCancel claimable
@@ -418,7 +430,7 @@ test("depends_on blocks until complete, stays blocked if cancelled, and priority
       "--remove-depends-on",
       cancelledUpstream.task_id,
     ]);
-    const c3 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2"]);
+    const c3 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2", "--claim-settle-ms", "0"]);
     assert.equal(c3.task_id, blockedByCancel.task_id);
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
@@ -442,10 +454,11 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
     const id = created.task_id;
 
     // Claim
-    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b", "--claim-settle-ms", "0"]);
     assert.equal(claimed.task_id, id);
     assert.equal(claimed.task.status, "in-progress");
     assert.equal(claimed.task.claimed_by, "worker-b");
+    assert.equal(claimed.task.claim_round, 1);
 
     // Owner posts mid-flight amend without mutating task.md
     const amend1 = runWbJson([
@@ -496,7 +509,7 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
       "blocked",
     ]);
 
-    // Owner answers, bumps revision, sets pending (stays in active/ with assignee=worker-b)
+    // Owner answers, bumps revision, sets pending (stays in tasks/ with assignee=worker-b and claim_round=2)
     const answered = runWbJson([
       "post",
       "--bucket",
@@ -513,17 +526,18 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
       "pending",
       "--bump-revision",
     ]);
-    assert.equal(answered.stage, "active");
+    assert.equal(answered.stage, "tasks");
     assert.equal(answered.task.status, "pending");
     assert.equal(answered.task.revision, 2);
+    assert.equal(answered.task.claim_round, 2);
     assert.equal(answered.task.assignee, "worker-b");
 
-    // Worker-b re-claims from active/
-    const reclaimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b"]);
+    // Worker-b re-claims
+    const reclaimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b", "--claim-settle-ms", "0"]);
     assert.equal(reclaimed.task_id, id);
     assert.equal(reclaimed.task.status, "in-progress");
 
-    // Stale reset moves back to pending/
+    // Stale reset increments claim_round and clears assignee/claimed_by
     const reset = runWbJson([
       "post",
       "--bucket",
@@ -537,13 +551,14 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
       "-m",
       "Timed out",
     ]);
-    assert.equal(reset.stage, "pending");
+    assert.equal(reset.stage, "tasks");
     assert.equal(reset.task.status, "pending");
+    assert.equal(reset.task.claim_round, 3);
     assert.equal(reset.task.claimed_by, "");
     assert.equal(reset.task.assignee, "");
 
     // Another worker can now claim and complete
-    runWbJson(["claim", "--bucket", bucket, "--entity", "worker-c"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "worker-c", "--claim-settle-ms", "0"]);
     runWbJson([
       "post",
       "--bucket",
@@ -572,13 +587,13 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
       "-m",
       "Approved",
     ]);
-    assert.equal(done.stage, "archive");
+    assert.equal(done.stage, "tasks");
     assert.equal(done.task.status, "complete");
     assert.equal(done.task.claimed_by, "");
 
     // Render returns task + sorted events
     const rendered = runWbJson(["render", "--bucket", bucket, "--task", id]);
-    assert.equal(rendered.stage, "archive");
+    assert.equal(rendered.stage, "tasks");
     assert.ok(rendered.events.length >= 6);
     assert.equal(rendered.events[0].type, "created");
     assert.equal(rendered.events[rendered.events.length - 1].type, "complete");
@@ -601,9 +616,9 @@ test("concurrent claim race allows only one winner", async () => {
     ]);
 
     const racers = await Promise.all([
-      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-1", "--json"]),
-      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-2", "--json"]),
-      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-3", "--json"]),
+      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "250", "--json"]),
+      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-2", "--claim-settle-ms", "250", "--json"]),
+      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-3", "--claim-settle-ms", "250", "--json"]),
     ]);
 
     const winners = racers.filter((r) => r.status === 0);
@@ -613,6 +628,9 @@ test("concurrent claim race allows only one winner", async () => {
 
     const winData = JSON.parse(winners[0].stdout);
     assert.equal(winData.task_id, created.task_id);
+    assert.equal(winData.task.claimed_by, winData.task.updated_by);
+    const rendered = runWbJson(["render", "--bucket", bucket, "--task", created.task_id]);
+    assert.equal(rendered.claim_winner, winData.task.claimed_by);
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
   }
@@ -680,6 +698,8 @@ test("watch blocks and wakes on matching task creation and on task event arrival
       "win-1",
       "--task",
       winTask.task_id,
+      "--claim-settle-ms",
+      "0",
     ]);
 
     const watchTaskPromise = runWbAsync([
@@ -729,8 +749,8 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
   const bucket = makeTempBucket();
   try {
     // Create noisy dotfiles and an incomplete directory missing task.md
-    fs.mkdirSync(path.join(bucket, "pending", ".hidden-dir"), { recursive: true });
-    fs.mkdirSync(path.join(bucket, "pending", "incomplete-no-task"), { recursive: true });
+    fs.mkdirSync(path.join(bucket, "tasks", ".hidden-dir"), { recursive: true });
+    fs.mkdirSync(path.join(bucket, "tasks", "incomplete-no-task"), { recursive: true });
 
     const parent = runWbJson([
       "create",
@@ -742,7 +762,7 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
       "Parent epic",
     ]);
 
-    const cParent = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
+    const cParent = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
     assert.equal(cParent.task_id, parent.task_id);
 
     // Decompose into a child task and release WIP slot on parent
@@ -783,10 +803,11 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
     assert.equal(parked.task.status, "pending");
     assert.equal(parked.task.claimed_by, "");
     assert.equal(parked.task.assignee, "exec-1");
+    assert.equal(parked.task.claim_round, 2);
     assert.deepEqual(parked.task.depends_on, [child.task_id]);
 
     // exec-1 can now claim child because parent WIP was freed (and parent is blocked by child)
-    const cChild = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
+    const cChild = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
     assert.equal(cChild.task_id, child.task_id);
 
     // Complete child
@@ -815,8 +836,8 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
       "complete",
     ]);
 
-    // Resume parent from active/
-    const resumed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
+    // Resume parent
+    const resumed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
     assert.equal(resumed.task_id, parent.task_id);
 
     // Submit review -> owner sends feedback -> exec-1 re-claims -> review -> complete
@@ -852,6 +873,7 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
       "--bump-revision",
     ]);
     assert.equal(fb.task.revision, 2);
+    assert.equal(fb.task.claim_round, 3);
 
     //watch --after-event on an amend emitted BEFORE watch starts must exit immediately
     const preAmend = runWbJson([
@@ -882,7 +904,7 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
 
     // Write a dotfile inside events/ and ensure render ignores it
     fs.writeFileSync(
-      path.join(bucket, "active", parent.task_id, "events", ".tmp-event.tmp"),
+      path.join(bucket, "tasks", parent.task_id, "events", ".tmp-event.tmp"),
       "junk"
     );
     const mdRender = runWb(["render", "--bucket", bucket, "--task", parent.task_id]);
@@ -918,6 +940,8 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       bucket,
       "--entity",
       "worker-1",
+      "--claim-settle-ms",
+      "0",
     ]);
     assert.equal(claimed.task.claimed_by, "worker-1");
     assert.equal(claimed.task.assignee, "");
@@ -966,34 +990,39 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       "pending",
       "--bump-revision",
     ]);
-    assert.equal(fb.stage, "active");
+    assert.equal(fb.stage, "tasks");
     assert.equal(fb.task.status, "pending");
     assert.equal(fb.task.assignee, "worker-1");
     assert.equal(fb.task.claimed_by, "");
+    assert.equal(fb.task.claim_round, 2);
     assert.equal(fb.task.revision, 2);
 
-    // Another worker cannot claim worker-1's pinned active task
+    // Another worker cannot claim worker-1's pinned task
     const otherBlocked = runWb([
       "claim",
       "--bucket",
       bucket,
       "--entity",
       "worker-2",
+      "--claim-settle-ms",
+      "0",
     ]);
     assert.equal(otherBlocked.status, 2);
 
-    // worker-1 automatically picks it back up from active/
+    // worker-1 automatically picks it back up
     const reclaimed = runWbJson([
       "claim",
       "--bucket",
       bucket,
       "--entity",
       "worker-1",
+      "--claim-settle-ms",
+      "0",
     ]);
     assert.equal(reclaimed.task_id, created.task_id);
     assert.equal(reclaimed.task.status, "in-progress");
 
-    // Reopening to general pool clears assignee and moves back to pending/
+    // Reopening to general pool clears assignee and increments claim_round
     runWbJson([
       "post",
       "--bucket",
@@ -1023,9 +1052,11 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       "Opening to pool",
       "--reopen",
     ]);
-    assert.equal(reopened.stage, "pending");
+    assert.equal(reopened.stage, "tasks");
+    assert.equal(reopened.task.status, "pending");
     assert.equal(reopened.task.assignee, "");
     assert.equal(reopened.task.claimed_by, "");
+    assert.equal(reopened.task.claim_round, 3);
 
     // Now worker-2 can claim it
     const claimedBy2 = runWbJson([
@@ -1034,6 +1065,8 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       bucket,
       "--entity",
       "worker-2",
+      "--claim-settle-ms",
+      "0",
     ]);
     assert.equal(claimedBy2.task_id, created.task_id);
   } finally {
@@ -1044,17 +1077,17 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
 test("human-created minimal/malformed tasks do not crash watch/render or deadlock completion", () => {
   const bucket = makeTempBucket();
   try {
-    // 1) Malformed task.md in pending/ and archive/ must not crash watch on valid tasks
-    fs.mkdirSync(path.join(bucket, "pending", "bad-no-frontmatter"), { recursive: true });
-    fs.writeFileSync(path.join(bucket, "pending", "bad-no-frontmatter", "task.md"), "# Raw note\nno yaml");
-    fs.mkdirSync(path.join(bucket, "archive", "bad-unclosed"), { recursive: true });
-    fs.writeFileSync(path.join(bucket, "archive", "bad-unclosed", "task.md"), "---\ntitle: broken\n");
+    // 1) Malformed task.md folders must not crash watch on valid tasks
+    fs.mkdirSync(path.join(bucket, "tasks", "bad-no-frontmatter"), { recursive: true });
+    fs.writeFileSync(path.join(bucket, "tasks", "bad-no-frontmatter", "task.md"), "# Raw note\nno yaml");
+    fs.mkdirSync(path.join(bucket, "tasks", "bad-unclosed"), { recursive: true });
+    fs.writeFileSync(path.join(bucket, "tasks", "bad-unclosed", "task.md"), "---\ntitle: broken\n");
 
     // 2) Minimal human task omitting id/owner/events/ and using scalar tags & depends_on
     const blocker = runWbJson(["create", "--bucket", bucket, "--entity", "human", "--title", "Blocker"]);
-    fs.mkdirSync(path.join(bucket, "pending", "human-minimal"), { recursive: true });
+    fs.mkdirSync(path.join(bucket, "tasks", "human-minimal"), { recursive: true });
     fs.writeFileSync(
-      path.join(bucket, "pending", "human-minimal", "task.md"),
+      path.join(bucket, "tasks", "human-minimal", "task.md"),
       `---\ntitle: Human minimal\nstatus: pending\ntags: linux\ndepends_on: ${blocker.task_id}\n---\nDo it\n`
     );
 
@@ -1063,7 +1096,7 @@ test("human-created minimal/malformed tasks do not crash watch/render or deadloc
     assert.equal(watchBlocked.status, 124);
 
     // Complete blocker
-    runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2", "--include-untagged", "--task", blocker.task_id]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2", "--include-untagged", "--task", blocker.task_id, "--claim-settle-ms", "0"]);
     runWbJson(["post", "--bucket", bucket, "--entity", "exec-2", "--task", blocker.task_id, "--type", "review", "--status", "review"]);
     runWbJson(["post", "--bucket", bucket, "--entity", "human", "--task", blocker.task_id, "--type", "complete"]);
 
@@ -1073,18 +1106,18 @@ test("human-created minimal/malformed tasks do not crash watch/render or deadloc
     assert.equal(ready.tasks[0].id, "human-minimal");
 
     // Claiming must populate task_id from folder name and allow completion when owner is omitted
-    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--tag", "linux", "--task", "human-minimal"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--tag", "linux", "--task", "human-minimal", "--claim-settle-ms", "0"]);
     assert.equal(claimed.task_id, "human-minimal");
     assert.equal(claimed.task.id, "human-minimal");
 
     // Plain-text note in events/ must not crash render
-    fs.writeFileSync(path.join(bucket, "active", "human-minimal", "events", "human-note.md"), "Remember edge cases");
+    fs.writeFileSync(path.join(bucket, "tasks", "human-minimal", "events", "human-note.md"), "Remember edge cases");
     const rendered = runWbJson(["render", "--bucket", bucket, "--task", "human-minimal"]);
     assert.equal(rendered.events.some((e) => e.type === "note" && e.body === "Remember edge cases"), true);
 
     runWbJson(["post", "--bucket", bucket, "--entity", "exec-1", "--task", "human-minimal", "--type", "review", "--status", "review"]);
     const completed = runWbJson(["post", "--bucket", bucket, "--entity", "reviewer-1", "--task", "human-minimal", "--type", "complete"]);
-    assert.equal(completed.stage, "archive");
+    assert.equal(completed.stage, "tasks");
     assert.equal(completed.task.status, "complete");
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
@@ -1104,14 +1137,14 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "Backlog draft item",
       "--backlog",
     ]);
-    assert.equal(draftTask.stage, "backlog");
+    assert.equal(draftTask.stage, "tasks");
     assert.equal(draftTask.task.status, "draft");
-    assert.ok(fs.existsSync(path.join(bucket, "backlog", draftTask.task_id, "task.md")));
+    assert.ok(fs.existsSync(path.join(bucket, "tasks", draftTask.task_id, "task.md")));
 
-    // Worker cannot claim draft in backlog
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+    // Worker cannot claim draft task
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
 
-    // Mark ready inside backlog (still held back from workers)
+    // Mark ready (still held back from workers)
     const markedReady = runWbJson([
       "post",
       "--bucket",
@@ -1127,29 +1160,25 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "--status",
       "ready",
     ]);
-    assert.equal(markedReady.stage, "backlog");
+    assert.equal(markedReady.stage, "tasks");
     assert.equal(markedReady.task.status, "ready");
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
 
-    // Human accidentally placing a draft task in pending/ must also not be claimable
-    const misplaced = runWbJson([
+    // Another draft task also remains unclaimable until promoted
+    const cancelledDraft = runWbJson([
       "create",
       "--bucket",
       bucket,
       "--entity",
       "owner-1",
       "--title",
-      "Misplaced draft",
+      "Draft to cancel",
       "--status",
       "draft",
     ]);
-    fs.renameSync(
-      path.join(bucket, "backlog", misplaced.task_id),
-      path.join(bucket, "pending", misplaced.task_id)
-    );
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
 
-    // Promote draftTask to pending/ -> now claimable
+    // Promote draftTask to pending -> now claimable
     const promoted = runWbJson([
       "post",
       "--bucket",
@@ -1165,11 +1194,10 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "--status",
       "pending",
     ]);
-    assert.equal(promoted.stage, "pending");
+    assert.equal(promoted.stage, "tasks");
     assert.equal(promoted.task.status, "pending");
-    assert.ok(fs.existsSync(path.join(bucket, "pending", draftTask.task_id, "task.md")));
 
-    // Pull back to backlog as ready, then re-promote and claim
+    // Pull back to ready, then re-promote and claim
     const pulledBack = runWbJson([
       "post",
       "--bucket",
@@ -1185,8 +1213,9 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "--status",
       "ready",
     ]);
-    assert.equal(pulledBack.stage, "backlog");
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
+    assert.equal(pulledBack.stage, "tasks");
+    assert.equal(pulledBack.task.status, "ready");
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
 
     runWbJson([
       "post",
@@ -1203,10 +1232,10 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "--status",
       "pending",
     ]);
-    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "w-1"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]);
     assert.equal(claimed.task_id, draftTask.task_id);
 
-    // Cancel misplaced task directly from pending/
+    // Cancel draft task directly
     const cancelled = runWbJson([
       "post",
       "--bucket",
@@ -1214,13 +1243,13 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "--entity",
       "owner-1",
       "--task",
-      misplaced.task_id,
+      cancelledDraft.task_id,
       "--type",
       "cancelled",
       "-m",
       "Not needed",
     ]);
-    assert.equal(cancelled.stage, "archive");
+    assert.equal(cancelled.stage, "tasks");
     assert.equal(cancelled.task.status, "cancelled");
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
@@ -1462,6 +1491,8 @@ test("entities, tags registry, and owner-only watch mode", async () => {
       "worker-1",
       "--task",
       tOwned.task_id,
+      "--claim-settle-ms",
+      "0",
     ]);
 
     const ownerWatch = runWbAsync([
@@ -1522,5 +1553,206 @@ test("entities, tags registry, and owner-only watch mode", async () => {
     assert.equal(ownerPayload.owner_tasks[0].status, "review");
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("lockless claim election tie-breaks deterministically, rejects split-brain post, and ignores sync-conflict files", () => {
+  const bucket = makeTempBucket();
+  try {
+    assert.equal(isSyncConflictFilename("task.sync-conflict-20261115-120000-ABCD.md"), true);
+    assert.equal(isSyncConflictFilename("note (alice's conflicted copy 2026-11-15).md"), true);
+    assert.equal(isSyncConflictFilename("task.md"), false);
+
+    const created = runWbJson([
+      "create",
+      "--bucket",
+      bucket,
+      "--entity",
+      "owner-1",
+      "--title",
+      "Tie-break & conflict resilience",
+    ]);
+    const taskDir = path.join(bucket, "tasks", created.task_id);
+    const eventsDir = path.join(taskDir, "events");
+
+    // Simulate two late-synced same-second claims for round 1 where "bob" > "alice" lexicographically,
+    // even if "bob" mistakenly wrote task.md first before "alice"'s claim arrived.
+    fs.writeFileSync(
+      path.join(eventsDir, "20261115T120000Z-bob-claimed.md"),
+      "---\ntype: claimed\nentity_id: bob\ntimestamp: \"2026-11-15T12:00:00Z\"\nround: 1\n---\n\nClaimed by bob\n"
+    );
+    fs.writeFileSync(
+      path.join(eventsDir, "20261115T120000Z-alice-claimed.md"),
+      "---\ntype: claimed\nentity_id: alice\ntimestamp: \"2026-11-15T12:00:00Z\"\nround: 1\n---\n\nClaimed by alice\n"
+    );
+
+    const election = getRoundClaims(eventsDir, 1);
+    assert.equal(election.claims.length, 2);
+    assert.equal(election.winner.entityId, "alice");
+
+    // Update task.md to simulate bob having temporarily thought he won before sync settled
+    const rawTask = fs.readFileSync(path.join(taskDir, "task.md"), "utf8");
+    fs.writeFileSync(
+      path.join(taskDir, "task.md"),
+      rawTask
+        .replace('status: "pending"', 'status: "in-progress"')
+        .replace('claimed_by: ""', 'claimed_by: "bob"')
+    );
+
+    // Add Syncthing & Dropbox conflict artifacts across task dir, events/, and messages/
+    fs.writeFileSync(path.join(taskDir, "task.sync-conflict-20261115-120001-HOST1.md"), "conflict");
+    fs.writeFileSync(
+      path.join(eventsDir, "20261115T120000Z-bob-claimed.sync-conflict-20261115-120001.md"),
+      "conflict event"
+    );
+    fs.writeFileSync(
+      path.join(bucket, "messages", "20261115T120000Z-owner-hi (alice's conflicted copy 2026-11-15).md"),
+      "conflict msg"
+    );
+
+    // Render reports claim_winner === "alice", ignores conflict event file, and warns to stderr on conflict artifact
+    const renderedRes = runWb(["render", "--bucket", bucket, "--task", created.task_id, "--json"]);
+    assert.equal(renderedRes.status, 0, renderedRes.stderr);
+    assert.match(renderedRes.stderr, /sync conflict copy detected/i);
+    const rendered = JSON.parse(renderedRes.stdout);
+    assert.equal(rendered.claim_winner, "alice");
+    assert.equal(rendered.events.some((e) => isSyncConflictFilename(e.filename)), false);
+
+    // Bob's mutating post (in-progress) fails split-brain guard (exit 2)
+    const splitRes = runWb([
+      "post",
+      "--bucket",
+      bucket,
+      "--entity",
+      "bob",
+      "--task",
+      created.task_id,
+      "--type",
+      "review",
+      "--status",
+      "review",
+    ]);
+    assert.equal(splitRes.status, 2);
+    assert.match(splitRes.stderr, /Split-brain claim conflict/);
+
+    // Public message list ignores conflict message file
+    const msgs = runWbJson(["msg", "list", "--bucket", bucket, "--all"]);
+    assert.equal(msgs.count, 0);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("two-replica async-sync simulator executes concurrent claims without double-claim or corruption", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wb-cloud-sim-"));
+  const replicaA = path.join(root, "replica-a");
+  const replicaB = path.join(root, "replica-b");
+
+  // Simple bidirectional eventual-consistency folder syncer:
+  // - Immutable/unique files (events/, messages/, tags/, entities/) are union-copied.
+  // - Mutable task.md propagates newer mtime, or emits a .sync-conflict- copy if both changed since last sync.
+  const lastSyncState = new Map();
+  function syncDirTree(dirA, dirB, rel = "") {
+    fs.mkdirSync(dirA, { recursive: true });
+    fs.mkdirSync(dirB, { recursive: true });
+    const entriesA = fs.readdirSync(dirA, { withFileTypes: true });
+    const entriesB = fs.readdirSync(dirB, { withFileTypes: true });
+    const mapA = new Map(entriesA.filter((e) => !e.name.startsWith(".")).map((e) => [e.name, e]));
+    const mapB = new Map(entriesB.filter((e) => !e.name.startsWith(".")).map((e) => [e.name, e]));
+    const allNames = new Set([...mapA.keys(), ...mapB.keys()]);
+
+    for (const name of allNames) {
+      const pA = path.join(dirA, name);
+      const pB = path.join(dirB, name);
+      const key = rel ? `${rel}/${name}` : name;
+      const eA = mapA.get(name);
+      const eB = mapB.get(name);
+      if ((eA && eA.isDirectory()) || (eB && eB.isDirectory())) {
+        syncDirTree(pA, pB, key);
+        continue;
+      }
+      if (eA && !eB) {
+        const buf = fs.readFileSync(pA);
+        fs.writeFileSync(pB, buf);
+        lastSyncState.set(key, buf.toString("utf8"));
+      } else if (!eA && eB) {
+        const buf = fs.readFileSync(pB);
+        fs.writeFileSync(pA, buf);
+        lastSyncState.set(key, buf.toString("utf8"));
+      } else if (eA && eB) {
+        const strA = fs.readFileSync(pA, "utf8");
+        const strB = fs.readFileSync(pB, "utf8");
+        if (strA === strB) {
+          lastSyncState.set(key, strA);
+          continue;
+        }
+        const prev = lastSyncState.get(key);
+        const statA = fs.statSync(pA);
+        const statB = fs.statSync(pB);
+        if (prev !== undefined && strA !== prev && strB !== prev && name === "task.md") {
+          const loserBuf = statA.mtimeMs >= statB.mtimeMs ? strB : strA;
+          const winnerBuf = statA.mtimeMs >= statB.mtimeMs ? strA : strB;
+          const conflictName = `task.sync-conflict-20261115-sim-${Date.now()}.md`;
+          fs.writeFileSync(path.join(dirA, conflictName), loserBuf);
+          fs.writeFileSync(path.join(dirB, conflictName), loserBuf);
+          fs.writeFileSync(pA, winnerBuf);
+          fs.writeFileSync(pB, winnerBuf);
+          lastSyncState.set(key, winnerBuf);
+        } else if (statA.mtimeMs >= statB.mtimeMs) {
+          fs.writeFileSync(pB, strA);
+          lastSyncState.set(key, strA);
+        } else {
+          fs.writeFileSync(pA, strB);
+          lastSyncState.set(key, strB);
+        }
+      }
+    }
+  }
+
+  let syncStopped = false;
+  const syncTimer = setInterval(() => {
+    if (!syncStopped) syncDirTree(replicaA, replicaB);
+  }, 40);
+
+  try {
+    const t1 = runWbJson(["create", "--bucket", replicaA, "--entity", "owner-a", "--title", "Sim task 1"]);
+    const t2 = runWbJson(["create", "--bucket", replicaA, "--entity", "owner-a", "--title", "Sim task 2"]);
+    await new Promise((r) => setTimeout(r, 120));
+
+    // Both replicas race to claim from their local directories while async sync runs every 40ms
+    const [resA, resB] = await Promise.all([
+      runWbAsync(["claim", "--bucket", replicaA, "--entity", "worker-a", "--claim-settle-ms", "300", "--json"]),
+      runWbAsync(["claim", "--bucket", replicaB, "--entity", "worker-b", "--claim-settle-ms", "300", "--json"]),
+    ]);
+
+    assert.equal(resA.status, 0, `worker-a failed: ${resA.stderr}`);
+    assert.equal(resB.status, 0, `worker-b failed: ${resB.stderr}`);
+    const claimA = JSON.parse(resA.stdout);
+    const claimB = JSON.parse(resB.stdout);
+
+    // Wait for async replication to settle
+    await new Promise((r) => setTimeout(r, 150));
+
+    // Each task must be exclusively claimed (one by worker-a, the other by worker-b, since worker-a loses round 1 on t1 or gets t2)
+    assert.notEqual(claimA.task_id, claimB.task_id);
+    assert.deepEqual(new Set([claimA.task_id, claimB.task_id]), new Set([t1.task_id, t2.task_id]));
+
+    // Both workers finish their tasks on their respective replicas and owner completes them
+    runWbJson(["post", "--bucket", replicaA, "--entity", "worker-a", "--task", claimA.task_id, "--type", "review", "--status", "review"]);
+    runWbJson(["post", "--bucket", replicaB, "--entity", "worker-b", "--task", claimB.task_id, "--type", "review", "--status", "review"]);
+    await new Promise((r) => setTimeout(r, 150));
+
+    runWbJson(["post", "--bucket", replicaA, "--entity", "owner-a", "--task", t1.task_id, "--type", "complete"]);
+    runWbJson(["post", "--bucket", replicaA, "--entity", "owner-a", "--task", t2.task_id, "--type", "complete"]);
+    await new Promise((r) => setTimeout(r, 120));
+
+    const r1B = runWbJson(["render", "--bucket", replicaB, "--task", t1.task_id]);
+    const r2B = runWbJson(["render", "--bucket", replicaB, "--task", t2.task_id]);
+    assert.equal(r1B.task.status, "complete");
+    assert.equal(r2B.task.status, "complete");
+  } finally {
+    syncStopped = true;
+    clearInterval(syncTimer);
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });

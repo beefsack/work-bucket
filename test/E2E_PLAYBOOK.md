@@ -19,12 +19,12 @@ Run these in one continuous flow in `$BUCKET`:
 
 1. **Discovery & Backlog Guard (`lead`):**
    - Document tag `e2e` via `wb.mjs tag set --bucket "$BUCKET" --entity lead --tag e2e -m "E2E test tasks"`.
-   - Create **Task 1** in `backlog/` (`--backlog --tags "e2e,alt"`): write `ok-1` to `$WORKDIR/t1.txt` (`- [ ] #1` verified by `grep -qx ok-1 $WORKDIR/t1.txt`).
-   - Mark **Task 1** `ready` inside `backlog/` (`post --type log --status ready`). Confirm it stays in `backlog/` and is not claimed by `worker-1`.
-   - Promote **Task 1** to `pending/` (`post --type log --status pending`).
+   - Create **Task 1** as draft (`--backlog --tags "e2e,alt"`): write `ok-1` to `$WORKDIR/t1.txt` (`- [ ] #1` verified by `grep -qx ok-1 $WORKDIR/t1.txt`).
+   - Mark **Task 1** `ready` (`post --type log --status ready`). Confirm `status` is `ready` in `tasks/` and it is not claimed by `worker-1`.
+   - Promote **Task 1** to `pending` (`post --type log --status pending`).
 
 2. **Ambiguous Task + Targeted Message (`lead`):**
-   - Create **Task 2** in `pending/` (`--tag e2e`): *"Write either `alpha` or `beta` to `$WORKDIR/t2.txt` (do not guess - ask `lead` which value is wanted before writing)."*
+   - Create **Task 2** in `pending` state (`--tag e2e`): *"Write either `alpha` or `beta` to `$WORKDIR/t2.txt` (do not guess - ask `lead` which value is wanted before writing)."*
    - Send a targeted message: `wb.mjs msg send --bucket "$BUCKET" --entity lead --to worker-1 -m "Reply via msg send --to lead confirming you saw this."`
    - Start watching in `owner` mode: `wb.mjs watch --bucket "$BUCKET" --entity lead --owner-only --json`.
 
@@ -36,9 +36,9 @@ Run these in one continuous flow in `$BUCKET`:
 4. **Review, Answer & Feedback Rework (`lead` <-> `worker-1`):**
    - `lead` wakes in `--owner-only` mode:
      - Approves **Task 1** (`post --type complete`).
-     - Answers **Task 2** (`post --type answer -m "Use alpha." --status pending --bump-revision`), keeping `assignee: "worker-1"` in `active/`.
+     - Answers **Task 2** (`post --type answer -m "Use alpha." --status pending --bump-revision`), keeping `assignee: "worker-1"` and incrementing `claim_round`.
      - Re-arms `watch --owner-only`.
-   - `worker-1` reclaims **Task 2** from `active/`, writes `alpha` to `$WORKDIR/t2.txt`, submits `review` (`--check-ac`).
+   - `worker-1` reclaims **Task 2**, writes `alpha` to `$WORKDIR/t2.txt`, submits `review` (`--check-ac`).
    - `lead` sends **1 feedback round** (`post --type feedback -m "Append a second line 'verified' to $WORKDIR/t2.txt" --status pending --bump-revision`) and re-arms `watch --owner-only`.
    - `worker-1` reclaims **Task 2**, appends `verified`, re-submits `review` (`--check-ac`).
    - `lead` approves **Task 2** (`post --type complete`) and exits/reports done.
@@ -52,13 +52,13 @@ WB="node $SKILL_DIR/scripts/wb.mjs"
 $WB entity list --bucket "$BUCKET" --json
 $WB tag list --bucket "$BUCKET" --json
 $WB msg list --bucket "$BUCKET" --all --json
-ls "$BUCKET/backlog" "$BUCKET/pending" "$BUCKET/active" "$BUCKET/archive"
+ls "$BUCKET/tasks"
 ```
 
 - [ ] `entity list` contains both `lead` (`mode: "owner"`) and `worker-1` (`mode: "worker"`, `tags: ["e2e"]`), both `online: true` with non-empty `last_msg_seen`.
 - [ ] `tag list` shows `e2e` as `documented: true`.
-- [ ] `backlog/`, `pending/`, and `active/` are empty; `archive/` contains **2** completed tasks (`status: "complete"`, `- [x]` boxes checked).
+- [ ] `tasks/` contains **2** completed tasks (`status: "complete"`, `- [x]` boxes checked).
 - [ ] `wb.mjs render --bucket "$BUCKET" --task <task1_id> --json` shows `created` -> `log` (`ready`) -> `log` (`pending`) -> `claimed` -> `review` -> `complete`.
-- [ ] `wb.mjs render --bucket "$BUCKET" --task <task2_id> --json` shows `revision >= 3` and events including `question`, `answer`, `review`, `feedback`, `review`, `complete`.
+- [ ] `wb.mjs render --bucket "$BUCKET" --task <task2_id> --json` shows `revision >= 3`, `claim_round >= 3`, and events including `question`, `answer`, `review`, `feedback`, `review`, `complete`.
 - [ ] `msg list --all` shows at least 2 messages (`lead` -> `worker-1` and `worker-1` -> `lead`).
 - [ ] `$WORKDIR/t1.txt` equals `ok-1` and `$WORKDIR/t2.txt` contains `alpha` and `verified`.

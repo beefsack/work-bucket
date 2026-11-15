@@ -19,7 +19,7 @@ Node.js 20+ is optional at runtime. If `node` is present, agents use `scripts/wb
 When starting an agent session, provide three required inputs:
 - `bucket_dir`: Path to the bucket root directory.
 - `entity_id`: The opaque name for that participant (e.g. `alex`, `worker-linux-1`).
-- `mode`: `once` (handle one task through review/completion) or `ongoing` (keep watching for new and reopened tasks).
+- `mode`: `once` (handle one task through review/completion) or `continuous` (keep watching for new and reopened tasks).
 - Optional capability tags (e.g. `--tag linux`) and `--include-untagged`.
 
 ## How Humans Interact with the Bucket

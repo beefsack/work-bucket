@@ -363,22 +363,39 @@ function formatEventMarkdown(data, body) {
   return `${fm}\n\n${trimmedBody}\n`;
 }
 
+const warnedMalformedTasks = new Set();
+
+function coerceStringList(val, emptySentinel = false) {
+  if (Array.isArray(val)) {
+    return val.map((item) => String(item).trim()).filter(Boolean);
+  }
+  if (typeof val === "string") {
+    const trimmed = val.trim();
+    if (!trimmed) return [];
+    if (emptySentinel && trimmed.toLowerCase() === "none") return [];
+    return trimmed
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return [];
+}
+
 function readTaskFile(taskPath) {
   const raw = fs.readFileSync(taskPath, "utf8");
   const { data, body } = parseFrontmatter(raw);
+  const fallbackId = path.basename(path.dirname(taskPath));
   const task = {
-    id: String(data.id ?? ""),
+    id: String(data.id || fallbackId),
     title: String(data.title ?? ""),
     status: String(data.status ?? "pending"),
     priority: String(data.priority ?? "medium"),
-    tags: normalizeTags(Array.isArray(data.tags) ? data.tags : []),
+    tags: normalizeTags(coerceStringList(data.tags)),
     owner: String(data.owner ?? ""),
     claimed_by: String(data.claimed_by ?? ""),
     assignee: String(data.assignee ?? ""),
     parent: String(data.parent ?? ""),
-    depends_on: Array.isArray(data.depends_on)
-      ? data.depends_on.map((d) => String(d))
-      : [],
+    depends_on: coerceStringList(data.depends_on, true),
     revision:
       typeof data.revision === "number"
         ? data.revision
@@ -424,6 +441,13 @@ function listStageTasks(bucketDir, stage) {
     } catch (err) {
       if (err.code === "ENOENT" || err.code === "ENOTDIR") {
         // Ignore folders missing task.md or moved mid-scan
+        continue;
+      }
+      if (err instanceof CliError) {
+        if (!warnedMalformedTasks.has(taskPath)) {
+          warnedMalformedTasks.add(taskPath);
+          process.stderr.write(`Warning: skipping malformed task ${taskPath}: ${err.message}\n`);
+        }
         continue;
       }
       throw err;
@@ -1114,19 +1138,19 @@ function cmdPost(argv) {
         );
       }
     } else if (curStatus === "blocked" || curStatus === "review") {
-      if (entityId !== found.task.owner) {
+      if (found.task.owner && entityId !== found.task.owner) {
         throw new CliError(
           `Single-writer violation: task "${taskId}" is ${curStatus} (owner="${found.task.owner}"); only owner may modify task.md.`
         );
       }
     } else if (curStatus === "pending" && found.stage === "pending") {
-      if (entityId !== found.task.owner && eventType !== "reset") {
+      if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
         throw new CliError(
           `Single-writer violation: unclaimed pending task "${taskId}" belongs to owner "${found.task.owner}".`
         );
       }
     } else if (curStatus === "pending" && found.stage === "active") {
-      if (entityId !== found.task.owner && eventType !== "reset") {
+      if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
         throw new CliError(
           `Single-writer violation: active pending task "${taskId}" may only be modified by owner "${found.task.owner}" (or claimed via 'claim').`
         );
@@ -1288,14 +1312,27 @@ function cmdRender(argv) {
   const events = eventFiles.map((filename) => {
     const fullPath = path.join(found.eventsDir, filename);
     const raw = fs.readFileSync(fullPath, "utf8");
-    const { data, body } = parseFrontmatter(raw);
-    return {
-      filename,
-      type: String(data.type ?? ""),
-      entity_id: String(data.entity_id ?? ""),
-      timestamp: String(data.timestamp ?? ""),
-      body: body.trim(),
-    };
+    try {
+      const { data, body } = parseFrontmatter(raw);
+      return {
+        filename,
+        type: String(data.type ?? ""),
+        entity_id: String(data.entity_id ?? ""),
+        timestamp: String(data.timestamp ?? ""),
+        body: body.trim(),
+      };
+    } catch (err) {
+      if (err instanceof CliError) {
+        return {
+          filename,
+          type: "note",
+          entity_id: "",
+          timestamp: "",
+          body: raw.replace(/\r/g, "").trim(),
+        };
+      }
+      throw err;
+    }
   });
 
   if (values.json) {

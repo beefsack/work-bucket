@@ -1063,3 +1063,53 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
     fs.rmSync(bucket, { recursive: true, force: true });
   }
 });
+
+test("human-created minimal/malformed tasks do not crash watch/render or deadlock completion", () => {
+  const bucket = makeTempBucket();
+  try {
+    // 1) Malformed task.md in pending/ and archive/ must not crash watch on valid tasks
+    fs.mkdirSync(path.join(bucket, "pending", "bad-no-frontmatter"), { recursive: true });
+    fs.writeFileSync(path.join(bucket, "pending", "bad-no-frontmatter", "task.md"), "# Raw note\nno yaml");
+    fs.mkdirSync(path.join(bucket, "archive", "bad-unclosed"), { recursive: true });
+    fs.writeFileSync(path.join(bucket, "archive", "bad-unclosed", "task.md"), "---\ntitle: broken\n");
+
+    // 2) Minimal human task omitting id/owner/events/ and using scalar tags & depends_on
+    const blocker = runWbJson(["create", "--bucket", bucket, "--entity", "human", "--title", "Blocker"]);
+    fs.mkdirSync(path.join(bucket, "pending", "human-minimal"), { recursive: true });
+    fs.writeFileSync(
+      path.join(bucket, "pending", "human-minimal", "task.md"),
+      `---\ntitle: Human minimal\nstatus: pending\ntags: linux\ndepends_on: ${blocker.task_id}\n---\nDo it\n`
+    );
+
+    // Scalar depends_on must keep human-minimal blocked until blocker is complete
+    const watchBlocked = runWb(["watch", "--bucket", bucket, "--entity", "exec-1", "--tag", "linux", "--timeout", "1", "--json"]);
+    assert.equal(watchBlocked.status, 124);
+
+    // Complete blocker
+    runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2", "--include-untagged", "--task", blocker.task_id]);
+    runWbJson(["post", "--bucket", bucket, "--entity", "exec-2", "--task", blocker.task_id, "--type", "review", "--status", "review"]);
+    runWbJson(["post", "--bucket", bucket, "--entity", "human", "--task", blocker.task_id, "--type", "complete"]);
+
+    // Scalar tag "linux" must now surface human-minimal via watch despite broken neighbors
+    const ready = runWbJson(["watch", "--bucket", bucket, "--entity", "exec-1", "--tag", "linux", "--timeout", "2"]);
+    assert.equal(ready.count, 1);
+    assert.equal(ready.tasks[0].id, "human-minimal");
+
+    // Claiming must populate task_id from folder name and allow completion when owner is omitted
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--tag", "linux", "--task", "human-minimal"]);
+    assert.equal(claimed.task_id, "human-minimal");
+    assert.equal(claimed.task.id, "human-minimal");
+
+    // Plain-text note in events/ must not crash render
+    fs.writeFileSync(path.join(bucket, "active", "human-minimal", "events", "human-note.md"), "Remember edge cases");
+    const rendered = runWbJson(["render", "--bucket", bucket, "--task", "human-minimal"]);
+    assert.equal(rendered.events.some((e) => e.type === "note" && e.body === "Remember edge cases"), true);
+
+    runWbJson(["post", "--bucket", bucket, "--entity", "exec-1", "--task", "human-minimal", "--type", "review", "--status", "review"]);
+    const completed = runWbJson(["post", "--bucket", bucket, "--entity", "reviewer-1", "--task", "human-minimal", "--type", "complete"]);
+    assert.equal(completed.stage, "archive");
+    assert.equal(completed.task.status, "complete");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});

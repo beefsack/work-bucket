@@ -70,6 +70,15 @@ REVIEW
 
 - `render --after-event <filename>` limits history to newer events.
 
+## Watch Delivery
+
+- Pool watches skip pending tasks with any `claimed` event for the current `claim_round`, including elections still settling. Explicit/unscoped `claim` can still resume its own interrupted election.
+- Dispatchers use repeatable `watch --exclude-task <id>` for tasks already handed to children. Exclusions apply to pool and owned-task results, not `--task` watches or messages.
+- Owner watches are edge-triggered: only owned `review`/`blocked` tasks with events newer than their delivered cursor wake again. Delivery stores `owner_task_seen: ["<task_id>/<event_file>"]` in the entity file; ordinary heartbeats/registration preserve it. Existing buckets need no migration.
+- Use `watch --owner-only --all-actionable` to include all currently actionable owned tasks, including previously delivered tasks and hand-written tasks without events. This still delivers/advances cursors.
+- Task summaries include `revision`, `claim_round`, `claimed_by`, `assignee`, and `latest_event: {filename, type, entity_id, timestamp, body, truncated}`. Event bodies default to the first 5 lines (`--event-lines N`, including `0` for metadata only).
+- `watch --task` preserves `new_events` filename arrays and adds `events` with the same event details, plus top-level revision/round/executor/assignee and `latest_event`. `--include-events` includes full bodies of surfaced events, not the entire historical stream.
+
 ## License
 
 [MIT](LICENSE)

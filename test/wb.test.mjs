@@ -111,6 +111,101 @@ test("claim JSON includes bucket/tag instructions and multiline stdin/file bodie
   }
 });
 
+test("pool watches skip current-round claim events, preserve claim recovery, and allow repeatable exclusions", () => {
+  const bucket = makeTempBucket();
+  try {
+    const first = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Election pending"]);
+    const second = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Available"]);
+    const third = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Also available"]);
+    const eventsDir = path.join(first.path, "events");
+    fs.writeFileSync(path.join(eventsDir, "20200101T000000Z-worker-claimed.md"),
+      '---\ntype: "claimed"\nentity_id: "worker"\nround: 1\n---\nElection in flight\n');
+    const ready = runWbJson(["watch", "--bucket", bucket, "--entity", "worker", "--exclude-task", second.task_id, "--timeout", "1"]);
+    assert.deepEqual(ready.tasks.map((t) => t.id), [third.task_id]);
+    assert.equal(runWb(["watch", "--bucket", bucket, "--entity", "dispatcher", "--exclude-task", second.task_id, "--exclude-task", third.task_id, "--timeout", "0.1"]).status, 124);
+    const recovered = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", first.task_id, "--claim-settle-ms", "0"]);
+    assert.equal(recovered.task_id, first.task_id);
+    runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", first.task_id, "--type", "review", "--status", "review"]);
+    runWbJson(["post", "--bucket", bucket, "--entity", "owner", "--task", first.task_id, "--type", "feedback", "--reopen"]);
+    const nextRound = runWbJson(["watch", "--bucket", bucket, "--entity", "dispatcher", "--exclude-task", second.task_id, "--exclude-task", third.task_id, "--timeout", "1"]);
+    assert.equal(nextRound.tasks[0].id, first.task_id);
+    assert.equal(nextRound.tasks[0].claim_round, 2);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("owner watches deliver each task edge once, persist cursors, and can list all actionable tasks", () => {
+  const bucket = makeTempBucket();
+  try {
+    const first = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "First review"]);
+    const second = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Second review"]);
+    for (const task of [first, second]) {
+      runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", task.task_id, "--claim-settle-ms", "0"]);
+      runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", task.task_id, "--type", "review", "--status", "review", "-m", "Evidence"]);
+    }
+    const watchArgs = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only"];
+    const firstEdge = runWbJson([...watchArgs, "--exclude-task", second.task_id]);
+    assert.deepEqual(firstEdge.owner_tasks.map((t) => t.id), [first.task_id]);
+    const secondEdge = runWbJson(watchArgs);
+    assert.deepEqual(secondEdge.owner_tasks.map((t) => t.id), [second.task_id]);
+    const registered = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "owner"]);
+    assert.equal(registered.owner_task_seen.length, 2);
+    assert.equal(runWb([...watchArgs, "--timeout", "0.1"]).status, 124);
+    const note = runWbJson(["post", "--bucket", bucket, "--entity", "owner", "--task", first.task_id, "--type", "log", "-m", "Additional evidence"]);
+    const nextEdge = runWbJson(watchArgs);
+    assert.equal(nextEdge.owner_tasks.length, 1);
+    assert.equal(nextEdge.owner_tasks[0].latest_event.filename, note.event);
+    assert.equal(runWb([...watchArgs, "--timeout", "0.1"]).status, 124);
+    const all = runWbJson([...watchArgs, "--all-actionable"]);
+    assert.equal(all.owner_tasks.length, 2);
+    assert.equal(runWb([...watchArgs, "--timeout", "0.1"]).status, 124);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("watch summaries and task updates include bounded event evidence or full bodies on request", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Preview"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "0"]);
+    const body = "one\ntwo\nthree\nfour\nfive\nsix";
+    const review = runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--type", "review", "--status", "review", "-m", body]);
+    const args = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--all-actionable"];
+    const summary = runWbJson(args).owner_tasks[0];
+    assert.equal(summary.revision, 1);
+    assert.equal(summary.claim_round, 1);
+    assert.equal(summary.claimed_by, "worker");
+    assert.equal(summary.assignee, "");
+    assert.equal(summary.latest_event.filename, review.event);
+    assert.equal(summary.latest_event.type, "review");
+    assert.equal(summary.latest_event.body, "one\ntwo\nthree\nfour\nfive");
+    assert.equal(summary.latest_event.truncated, true);
+    assert.equal(runWbJson([...args, "--include-events"]).owner_tasks[0].latest_event.body, body);
+    const taskArgs = ["watch", "--bucket", bucket, "--task", created.task_id, "--after-event", claimed.last_event_seen];
+    const update = runWbJson([...taskArgs, "--event-lines", "2"]);
+    assert.deepEqual(update.new_events, [review.event]);
+    assert.equal(update.latest_event.body, "one\ntwo");
+    assert.equal(update.events[0].body, "one\ntwo");
+    assert.equal(update.revision, 1);
+    assert.equal(update.claim_round, 1);
+    assert.equal(update.claimed_by, "worker");
+    assert.equal(update.assignee, "");
+    const full = runWbJson([...taskArgs, "--include-events"]);
+    assert.equal(full.events[0].body, body);
+    assert.equal(full.events[0].truncated, false);
+    assert.equal(runWbJson([...taskArgs, "--event-lines", "0"]).events[0].body, "");
+    const text = runWb([...taskArgs, "--event-lines", "2"]);
+    assert.equal(text.status, 0, text.stderr);
+    assert.match(text.stdout, /revision=1 claim_round=1 claimed_by=worker/);
+    assert.ok(text.stdout.includes(`Event: ${review.event} type=review (truncated)\none\ntwo`));
+    assert.equal(runWb([...taskArgs, "--event-lines", "-1"]).status, 1);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
 test("YAML frontmatter parsing handles CRLF, comments, quotes, and multiline arrays", () => {
   const raw = [
     "---",

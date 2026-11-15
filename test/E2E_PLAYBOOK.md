@@ -45,6 +45,13 @@ Run these in one continuous flow in `$BUCKET`:
 
 In background-completion harnesses, each re-arm runs in the background without `--timeout`, then the agent ends its turn. Never wait in-turn. `lead` leaves no watcher after bounded completion. Add bucket `INSTRUCTIONS.md` and tag-body instructions before promotion; confirm workers read them and `claim --json` surfaces them. Submit reviews with a quoted `--stdin` here-doc containing raw evidence, observed/inferred/unverified sections and diff/verification output.
 
+## Wake-Quality Checks
+
+- Before answering/reviewing a delivered actionable task, re-arm `watch --owner-only --timeout 1`: it must time out rather than redeliver the same edge. `--all-actionable` must still show it. Post a new event while actionable and confirm the next normal watch delivers that new edge once.
+- Inspect `owner_task_seen` in `entities/lead.md`; confirm one `<task_id>/<event_file>` cursor per delivered task survives entity registration/heartbeat.
+- Confirm pool watches do not re-offer a pending task during a child's claim-settle window. With several pending tasks, repeat `--exclude-task <id>` for dispatched IDs and confirm only other work appears.
+- Submit a review body longer than 5 lines. Verify watch summary revision/round/executor/assignee and latest filename/type/body preview; `--event-lines 2` truncates to two lines, `--include-events` returns the full body. Task-specific watches retain `new_events` filenames and include matching `events` objects.
+
 ## Loose Pass Gates
 
 After both agents finish, run these checks against `$BUCKET`:

@@ -638,6 +638,46 @@ function isEventAfter(eventsDir, candidateName, afterName) {
   return compareEventFilenames(candidateName, afterName) > 0;
 }
 
+function readEventFile(eventsDir, filename, includeFullBody = true, eventLines = 5) {
+  const raw = fs.readFileSync(path.join(eventsDir, filename), "utf8");
+  let data = {};
+  let body;
+  try {
+    ({ data, body } = parseFrontmatter(raw));
+  } catch (err) {
+    if (!(err instanceof CliError)) throw err;
+    body = raw.replace(/\r/g, "");
+  }
+  const lines = body.trim().split("\n");
+  return {
+    filename,
+    type: String(data.type ?? "note"),
+    entity_id: String(data.entity_id ?? ""),
+    timestamp: String(data.timestamp ?? ""),
+    body: includeFullBody ? body.trim() : lines.slice(0, eventLines).join("\n"),
+    truncated: !includeFullBody && lines.length > eventLines,
+  };
+}
+
+function serializeTaskSummary(item, includeEvents = false, eventLines = 5) {
+  const events = listEventFiles(item.eventsDir);
+  return {
+    id: item.task.id,
+    title: item.task.title,
+    stage: item.stage,
+    status: item.task.status,
+    priority: item.task.priority,
+    tags: item.task.tags,
+    owner: item.task.owner,
+    assignee: item.task.assignee,
+    claimed_by: item.task.claimed_by,
+    revision: item.task.revision,
+    claim_round: item.task.claim_round,
+    path: item.dir,
+    latest_event: events.length ? readEventFile(item.eventsDir, events.at(-1), includeEvents, eventLines) : null,
+  };
+}
+
 function writeUniqueMarkdown(targetDir, prefix, content, label = "file") {
   fs.mkdirSync(targetDir, { recursive: true });
   for (let seq = 1; seq < 1000; seq += 1) {
@@ -976,6 +1016,7 @@ function readEntityFile(bucketDir, entityId) {
       mode: String(data.mode ?? ""),
       ttl_seconds: Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_ENTITY_TTL_SECONDS,
       last_msg_seen: String(data.last_msg_seen ?? ""),
+      owner_task_seen: coerceStringList(data.owner_task_seen),
       updated_at: String(data.updated_at ?? ""),
       body: body.trim(),
       path: entityPath,
@@ -1029,6 +1070,7 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
       updates.last_msg_seen !== undefined
         ? String(updates.last_msg_seen)
         : initialLastMsgSeen,
+    owner_task_seen: updates.owner_task_seen ?? existing?.owner_task_seen ?? [],
     updated_at: isoUtc,
   };
   const nextBody =
@@ -1203,12 +1245,16 @@ function matchesTags(task, entityId, workerTags, includeUntagged) {
   return taskTags.some((t) => workerTags.has(t));
 }
 
-function findOwnerActionableTasks(bucketDir, entityId) {
+function findOwnerActionableTasks(bucketDir, entityId, allActionable = false) {
+  const seen = new Map((readEntityFile(bucketDir, entityId)?.owner_task_seen ?? [])
+    .map((cursor) => cursor.split("/")));
   return listTasks(bucketDir)
     .filter(
       (item) =>
         item.task.owner === entityId &&
-        (item.task.status === "blocked" || item.task.status === "review")
+        (item.task.status === "blocked" || item.task.status === "review") &&
+        (allActionable || listEventFiles(item.eventsDir).some((filename) =>
+          !seen.has(item.task.id) || isEventAfter(item.eventsDir, filename, seen.get(item.task.id))))
     )
     .sort(sortByPriorityAndAge);
 }
@@ -1233,29 +1279,31 @@ function sortByPriorityAndAge(a, b) {
   return ida < idb ? -1 : 1;
 }
 
-function findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged) {
+function findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged, includeOwnClaim = false) {
   const { tasks, byId } = scanAllTasks(bucketDir);
+  const available = tasks.filter((item) => {
+    const { winner } = getRoundClaims(item.eventsDir, item.task.claim_round);
+    return !winner || (includeOwnClaim && winner.entityId === entityId);
+  });
 
-  const assignedToMe = tasks
+  const assignedToMe = available
     .filter(
       (item) =>
         item.task.status === "pending" &&
         item.task.claimed_by === "" &&
         item.task.assignee === entityId &&
-        dependenciesSatisfied(item.task, byId) &&
-        !hasCompetingRoundClaim(item, entityId)
+        dependenciesSatisfied(item.task, byId)
     )
     .sort(sortByPriorityAndAge);
 
-  const openPool = tasks
+  const openPool = available
     .filter(
       (item) =>
         item.task.status === "pending" &&
         item.task.claimed_by === "" &&
         item.task.assignee === "" &&
         matchesTags(item.task, entityId, workerTags, includeUntagged) &&
-        dependenciesSatisfied(item.task, byId) &&
-        !hasCompetingRoundClaim(item, entityId)
+        dependenciesSatisfied(item.task, byId)
     )
     .sort(sortByPriorityAndAge);
 
@@ -1554,7 +1602,7 @@ async function cmdClaim(argv) {
     }
     candidates = [found];
   } else {
-    candidates = findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged);
+    candidates = findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged, true);
     if (candidates.length === 0) {
       throw new CliError(`No eligible tasks available for "${entityId}".`, 2);
     }
@@ -2033,6 +2081,10 @@ async function cmdWatch(argv) {
       tags: { type: "string", multiple: true },
       "include-untagged": { type: "boolean", default: false },
       "owner-only": { type: "boolean", default: false },
+      "all-actionable": { type: "boolean", default: false },
+      "exclude-task": { type: "string", multiple: true },
+      "include-events": { type: "boolean", default: false },
+      "event-lines": { type: "string", default: "5" },
       "after-event": { type: "string" },
       "after-msg": { type: "string" },
       "since-status": { type: "string" },
@@ -2060,6 +2112,12 @@ async function cmdWatch(argv) {
   const watchTaskId = values.task ? validateTaskId(values.task) : null;
   const entityId = values.entity ? validateIdentifier(values.entity, "--entity") : null;
   const ownerOnly = Boolean(values["owner-only"]);
+  const excludedTasks = new Set(values["exclude-task"] ?? []);
+  for (const taskId of excludedTasks) validateTaskId(taskId);
+  const eventLines = Number(values["event-lines"]);
+  if (!Number.isInteger(eventLines) || eventLines < 0) {
+    throw new CliError("--event-lines must be a non-negative integer.");
+  }
 
   if (!watchTaskId && !entityId) {
     throw new CliError(
@@ -2112,20 +2170,6 @@ async function cmdWatch(argv) {
 
   let isInitialEval = true;
 
-  function serializeTaskSummary(item) {
-    return {
-      id: item.task.id,
-      title: item.task.title,
-      stage: item.stage,
-      status: item.task.status,
-      priority: item.task.priority,
-      tags: item.task.tags,
-      owner: item.task.owner,
-      assignee: item.task.assignee,
-      path: item.dir,
-    };
-  }
-
   function evaluateOnce() {
     if (watchTaskId) {
       const current = findTask(bucketDir, watchTaskId);
@@ -2175,6 +2219,7 @@ async function cmdWatch(argv) {
         return {
           mode: "task",
           task_id: watchTaskId,
+          reason: newEvents.length ? "new_events" : statusChanged ? "status_changed" : "appeared",
           stage: current.stage,
           path: current.dir,
           status: current.task.status,
@@ -2185,6 +2230,12 @@ async function cmdWatch(argv) {
           last_event_seen:
             currentEvents.length > 0 ? currentEvents[currentEvents.length - 1] : "",
           task: current.task,
+          revision: current.task.revision,
+          claim_round: current.task.claim_round,
+          claimed_by: current.task.claimed_by,
+          assignee: current.task.assignee,
+          latest_event: currentEvents.length ? readEventFile(current.eventsDir, currentEvents.at(-1), values["include-events"], eventLines) : null,
+          events: newEvents.map((filename) => readEventFile(current.eventsDir, filename, values["include-events"], eventLines)),
         };
       }
       return null;
@@ -2201,8 +2252,10 @@ async function cmdWatch(argv) {
 
     const eligible = ownerOnly
       ? []
-      : findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged);
-    const ownerTasks = findOwnerActionableTasks(bucketDir, entityId);
+      : findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged)
+        .filter((item) => !excludedTasks.has(item.task.id));
+    const ownerTasks = findOwnerActionableTasks(bucketDir, entityId, values["all-actionable"])
+      .filter((item) => !excludedTasks.has(item.task.id));
     const msgCursor =
       values["after-msg"] !== undefined
         ? values["after-msg"]
@@ -2219,8 +2272,8 @@ async function cmdWatch(argv) {
         mode: ownerOnly ? "owner" : "ready",
         entity_id: entityId,
         count: eligible.length,
-        tasks: eligible.map(serializeTaskSummary),
-        owner_tasks: ownerTasks.map(serializeTaskSummary),
+        tasks: eligible.map((item) => serializeTaskSummary(item, values["include-events"], eventLines)),
+        owner_tasks: ownerTasks.map((item) => serializeTaskSummary(item, values["include-events"], eventLines)),
         messages: unreadMessages,
         last_msg_seen: latestMsgFile || msgCursor,
       };
@@ -2229,6 +2282,16 @@ async function cmdWatch(argv) {
   }
 
   function advanceMessageCursorIfNeeded(result) {
+    if (!watchTaskId && entityId && result?.owner_tasks?.length) {
+      const seen = new Map((readEntityFile(bucketDir, entityId)?.owner_task_seen ?? [])
+        .map((cursor) => cursor.split("/")));
+      for (const task of result.owner_tasks) {
+        if (task.latest_event) seen.set(task.id, task.latest_event.filename);
+      }
+      upsertEntityFile(bucketDir, entityId, {
+        owner_task_seen: Array.from(seen, ([id, event]) => `${id}/${event}`),
+      });
+    }
     if (
       !watchTaskId &&
       entityId &&
@@ -2254,8 +2317,9 @@ async function cmdWatch(argv) {
         console.log(`Ready tasks for ${result.entity_id} (${result.count}):`);
         for (const t of result.tasks) {
           console.log(
-            `- ${t.id} [${t.priority}] (${t.stage}/${t.status}) tags=${JSON.stringify(t.tags)} :: ${t.title}`
+            `- ${t.id} [${t.priority}] (${t.stage}/${t.status}) revision=${t.revision} claim_round=${t.claim_round} claimed_by=${t.claimed_by || "-"} assignee=${t.assignee || "-"} tags=${JSON.stringify(t.tags)} :: ${t.title}`
           );
+          printEvent(t.latest_event);
         }
       }
       if (result.owner_tasks.length > 0) {
@@ -2264,8 +2328,9 @@ async function cmdWatch(argv) {
         );
         for (const t of result.owner_tasks) {
           console.log(
-            `- ${t.id} [${t.priority}] (${t.stage}/${t.status}) :: ${t.title}`
+            `- ${t.id} [${t.priority}] (${t.stage}/${t.status}) revision=${t.revision} claim_round=${t.claim_round} claimed_by=${t.claimed_by || "-"} assignee=${t.assignee || "-"} :: ${t.title}`
           );
+          printEvent(t.latest_event);
         }
       }
       if (result.messages.length > 0) {
@@ -2278,7 +2343,7 @@ async function cmdWatch(argv) {
       }
     } else {
       console.log(
-        `Task update for ${result.task_id}: stage=${result.stage} status=${result.status}`
+        `Task update for ${result.task_id}: stage=${result.stage} status=${result.status} revision=${result.revision ?? "-"} claim_round=${result.claim_round ?? "-"} claimed_by=${result.claimed_by || "-"} assignee=${result.assignee || "-"}`
       );
       if (result.status_changed) {
         console.log(`Status changed: ${result.previous_status} -> ${result.status}`);
@@ -2286,7 +2351,18 @@ async function cmdWatch(argv) {
       if (result.new_events.length > 0) {
         console.log(`New events: ${result.new_events.join(", ")}`);
       }
+      if (result.events?.length) {
+        for (const event of result.events) printEvent(event);
+      } else {
+        printEvent(result.latest_event);
+      }
     }
+  }
+
+  function printEvent(event) {
+    if (!event) return;
+    console.log(`  Event: ${event.filename} type=${event.type}${event.truncated ? " (truncated)" : ""}`);
+    if (event.body) console.log(event.body);
   }
 
   const immediate = evaluateOnce();
@@ -2893,6 +2969,10 @@ function printWatchHelp() {
   console.log(`Usage: wb.mjs watch --bucket <dir> [--entity <id>] [--task <id>] [options]
   --entity <id>                          Watch for tasks, owned blocked/review tasks, and unread messages
   --owner-only                           Do not wake for claimable tasks (owner updates + messages only)
+  --all-actionable                       Include all owned review/blocked tasks, even already delivered
+  --exclude-task <id>                    Exclude a task from pool/owner results (repeatable)
+  --event-lines <N>                      Event body preview lines (default: 5; 0 for metadata only)
+  --include-events                       Include full bodies instead of previews
   --task <task_id>                       Watch a specific task for new events or status change
   --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
   --include-untagged                     Also match untagged tasks when --tag is set
@@ -2903,7 +2983,12 @@ function printWatchHelp() {
   --msg-coalesce-ms <ms>                 Quiet window for message-only bursts (default: 500)
   --ttl <seconds>                        Entity presence TTL in seconds (default: 300)
   --timeout <seconds>                    Optional timeout (exits 124)
-  --json                                 Output JSON`);
+  --json                                 Output JSON
+  Pool watches skip pending tasks with any claimed event for the current claim_round.
+  Owner updates are edge-triggered; delivery stores per-task owner_task_seen cursors in entities/<id>.md.
+  Task summaries include revision, claim_round, claimed_by, assignee and latest_event
+  {filename,type,entity_id,timestamp,body,truncated}. --task also includes events for new_events filenames.
+  --include-events expands only the surfaced events, not the entire task history.`);
 }
 
 function printRenderHelp() {

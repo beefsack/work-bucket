@@ -7,6 +7,8 @@
 
 ## Implemented Foundations
 
+- **Quiet, evidence-rich watches:** Pool watches ignore current-round claims and support dispatched-task exclusions; owner delivery persists per-task event cursors with `--all-actionable` for level listings. Watch results include revision/round/executor and bounded latest/new event bodies, optionally expanded with `--include-events`.
+
 - **Resumable agent loops and evidence:** Harness-aware background waiting, bounded-owner exits, dispatcher-only pool watching, standing bucket/tag instructions surfaced in claims, and compact raw-evidence review guidance.
 - **Automatic rework revisions:** Feedback/answer returning actionable tasks to pending increment revision and claim round; legacy `--bump-revision` remains accepted without double increments. Amend warns on review/blocked without implicitly reopening.
 

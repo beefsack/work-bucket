@@ -1285,6 +1285,22 @@ function readBodyInput(values) {
   return "";
 }
 
+function readStandingInstructions(bucketDir, task) {
+  const instructions = [];
+  const bucketPath = path.join(bucketDir, "INSTRUCTIONS.md");
+  if (fs.existsSync(bucketPath)) {
+    instructions.push({ file: "INSTRUCTIONS.md", body: fs.readFileSync(bucketPath, "utf8").replace(/\r/g, "").trim() });
+  }
+  for (const tag of task.tags) {
+    if (tag.startsWith(".") || /[/\\]/.test(tag) || tag.includes("..")) continue;
+    const tagPath = path.join(bucketDir, "tags", `${tag}.md`);
+    if (fs.existsSync(tagPath)) {
+      instructions.push({ file: `tags/${tag}.md`, body: readTagDoc(tagPath, tag).description });
+    }
+  }
+  return instructions;
+}
+
 function cmdCreate(argv) {
   const { values } = parseArgs({
     args: argv,
@@ -1639,6 +1655,7 @@ async function cmdClaim(argv) {
           last_event_seen: lastEventSeen,
           events,
           task: finalTask,
+          instructions: readStandingInstructions(bucketDir, finalTask),
         },
         null,
         2
@@ -1786,6 +1803,9 @@ function cmdPost(argv) {
   const now = new Date();
   const isoUtc = formatIsoUtc(now);
   const message = readBodyInput(values);
+  if (eventType === "amend" && ["review", "blocked"].includes(found.task.status)) {
+    console.error(`Warning: task "${taskId}" is ${found.task.status}; amend does not reopen it. Use feedback/answer --status pending to resume execution.`);
+  }
 
   // 1. Payload-before-flag: write immutable event file first
   const eventResult = writeUniqueEvent(
@@ -1818,7 +1838,9 @@ function cmdPost(argv) {
     if (returningFromActive) {
       updatedTask.claim_round = (Number(updatedTask.claim_round) || 1) + 1;
     }
-    if (values["bump-revision"]) {
+    if (values["bump-revision"] ||
+        (["review", "blocked"].includes(found.task.status) &&
+         targetStatus === "pending" && ["feedback", "answer"].includes(eventType))) {
       updatedTask.revision = (Number(updatedTask.revision) || 1) + 1;
     }
     if (values["claimed-by"] !== undefined) {
@@ -1876,6 +1898,8 @@ function cmdPost(argv) {
           path: found.dir,
           event: eventResult.filename,
           task_updated: mutatesTaskMd,
+          previous_revision: found.task.revision,
+          previous_claim_round: found.task.claim_round,
           task: updatedTask,
         },
         null,
@@ -1886,7 +1910,7 @@ function cmdPost(argv) {
     console.log(`Posted ${eventResult.filename} to ${updatedTask.id}`);
     if (mutatesTaskMd) {
       console.log(
-        `State: status=${updatedTask.status} revision=${updatedTask.revision}`
+        `State: status=${updatedTask.status} revision=${found.task.revision}->${updatedTask.revision} claim_round=${found.task.claim_round}->${updatedTask.claim_round}`
       );
     }
   }
@@ -2844,7 +2868,8 @@ function printClaimHelp() {
   --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
   --include-untagged                     Also accept untagged tasks when --tag is set
   --claim-settle-ms <ms>                 Settle wait before electing round winner (default: ${DEFAULT_CLAIM_SETTLE_MS})
-  --json                                 Output JSON`);
+  --json                                 Output JSON, including instructions: [{file, body}]
+  Read optional INSTRUCTIONS.md and each task tag's tags/<tag>.md body before claiming/executing.`);
 }
 
 function printPostHelp() {
@@ -2852,14 +2877,16 @@ function printPostHelp() {
   --type <type>                          created|claimed|amend|question|answer|log|review|feedback|complete|cancelled|reset
   --message <text> | --body-file <path> | --stdin    Event body
   --status <status>                      draft|ready|pending|in-progress|blocked|review|complete|cancelled
-  --bump-revision                        Increment task.md revision
+  --bump-revision                        Increment revision (feedback/answer to pending already bump once)
   --assignee <id>                        Update assignee (pass "" to clear)
   --claimed-by <id>                      Update claimed_by (pass "" to clear)
   --add-depends-on <id1,id2>             Append task IDs to depends_on
   --remove-depends-on <id1,id2>          Remove task IDs from depends_on
   --check-ac                             Check all '- [ ]' acceptance criteria boxes to '- [x]'
   --reopen                               Reset status to pending, increment claim_round, clear claimed_by/assignee
-  --json                                 Output JSON`);
+  --json                                 Output JSON, including previous_revision/previous_claim_round
+  Feedback/answer returning review/blocked to pending automatically increment revision and claim_round.
+  Amend on review/blocked warns; it does not reopen the task.`);
 }
 
 function printWatchHelp() {

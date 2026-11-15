@@ -7,6 +7,9 @@
 
 ## Implemented Foundations
 
+- **Resumable agent loops and evidence:** Harness-aware background waiting, bounded-owner exits, dispatcher-only pool watching, standing bucket/tag instructions surfaced in claims, and compact raw-evidence review guidance.
+- **Automatic rework revisions:** Feedback/answer returning actionable tasks to pending increment revision and claim round; legacy `--bump-revision` remains accepted without double increments. Amend warns on review/blocked without implicitly reopening.
+
 - **Backlog & `draft` / `ready` task state:** `status: "draft"` and held-back `status: "ready"` tasks stay out of worker queues until promoted via `post --status pending`.
 - **Public broadcast & targeted messaging (`messages/`):** Append-only `messages/<UTC>-<entity>-<slug>.md` with `to` (`["*"]` or entity IDs) and `tags`, per-entity `last_msg_seen` cursor, relevance filtering, and burst coalescing in `watch`.
 - **Advisory entity & tag discovery (`entities/`, `tags/`):** TTL-based peer presence files (`entity register` / `entity list`), optional `tags/<tag>.md` descriptions (`tag set` / `tag list`), and non-worker `owner` mode (`watch --owner-only`).

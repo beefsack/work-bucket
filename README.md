@@ -40,13 +40,35 @@ You can manage the bucket directly in any text editor or with `node scripts/wb.m
 
 - **Create a task (ready or backlog):** Run `wb.mjs create --bucket <dir> --entity <you> --title "..."` (or pass `--backlog` for `status: "draft"`). Promote a refined draft/ready task with `wb.mjs post --bucket <dir> --entity <you> --task <id> --type log -m "Ready" --status pending`.
 - **Amend a running task:** Never edit `tasks/<id>/task.md` while `status` is `in-progress`. Instead, drop a new file in `tasks/<id>/events/<UTC>-<you>-amend.md` (or run `wb.mjs post --type amend -m "..."`). The executor checks for new amendments at checkpoints and merges them.
-- **Unblock a `blocked` task:** Read the latest `events/*-question.md`, post `events/<UTC>-<you>-answer.md`, increment `revision`, and set `status: "pending"` in `task.md` (or use `wb.mjs post --type answer -m "..." --status pending --bump-revision`).
+- **Unblock a `blocked` task:** Read the latest question; `wb.mjs post --type answer -m "..." --status pending` automatically increments `revision` and `claim_round` once, even with legacy `--bump-revision`.
 - **Review a `review` task:** Inspect `wb.mjs render --bucket <dir> --task <id>` (or read `task.md` and `events/`).
   - Approve: post `events/*-complete.md` and set `status: "complete"`, `claimed_by: ""` (or run `wb.mjs post --type complete`).
-  - Request changes: post `events/*-feedback.md`, bump `revision` and `claim_round`, and set `status: "pending"` (or run `wb.mjs post --type feedback -m "..." --status pending --bump-revision`).
+   - Request changes: `wb.mjs post --type feedback -m "..." --status pending` automatically bumps `revision` and `claim_round`, pinning the previous executor. Use `--reopen` if that assignee is gone.
   - Cancel: run `wb.mjs post --type cancelled`.
 - **Send or read public messages:** Run `wb.mjs msg send --bucket <dir> --entity <you> [--to <id|*,...>] [--tag <t>] -m "..."` and `wb.mjs msg list --bucket <dir> --all`. All messages in `messages/` are public to everyone in the bucket.
 - **Inspect active entities and tags:** Run `wb.mjs entity list --bucket <dir>` and `wb.mjs tag list --bucket <dir>` (document tags via `wb.mjs tag set --bucket <dir> --entity <you> --tag <name> -m "..."`).
+
+## Agent Loops and Evidence
+
+- Background-completion harness: arm `watch` without `--timeout` and **end your turn**; that is the wait. Never wait in-turn. Foreground/blocking harnesses instead block and re-arm on timeout. Keep one watcher per entity.
+- A bounded owner stops watching and reports through its parent harness once all assigned-unit tasks are `complete`/`cancelled`, or a decision requires escalation. Exit is not a bucket pause.
+- Only a multithreaded dispatcher watches tags/messages. Children use `once`, `claim --task <id>`, and return after `review`/`blocked`, without pool/message watches. The dispatcher checks pending pins to its `<entity_id>-N` IDs and spawns children under those IDs for rework; owners use `--reopen` when a pinned assignee cannot return.
+- Session modes are `once`, `continuous`, `owner`; non-owner pool watches record advisory `mode: "worker"`, also accepted by `entity register`.
+- Read optional `INSTRUCTIONS.md` and `tags/<tag>.md` bodies for every task tag before claiming/executing. `claim --json` includes `instructions: [{file, body}]`; task bodies need only task-specific content.
+- Correct `in-progress` tasks with `amend`; resume `review` with `feedback`, `blocked` with `answer`, using `--status pending`. Amend alone does not reopen actionable tasks and prints a warning.
+- Review bodies include claims, raw evidence with `file:line`, observed vs inferred conclusions, unverified items, files changed/diff status, and verification commands/output.
+- Task corrections use task events; cross-cutting notices use public messages; parent reports use the harness; pauses use bucket-level pause.
+- `create` and `post` accept `--body-file <path>` or `--stdin`. Avoid shell substitution in multiline bodies:
+
+```bash
+wb.mjs post --bucket "$BUCKET" --entity "$ENTITY" --task "$TASK" --type review --status review --stdin <<'REVIEW'
+- Claims: <claims>; raw evidence: <verbatim excerpt, file:line>.
+- Observed: <facts>; inferred: <interpretation>; unverified: <list>.
+- Files/diff status: <paths and status>; verification: <command and output>.
+REVIEW
+```
+
+- `render --after-event <filename>` limits history to newer events.
 
 ## License
 

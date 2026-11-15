@@ -36,12 +36,14 @@ Run these in one continuous flow in `$BUCKET`:
 4. **Review, Answer & Feedback Rework (`lead` <-> `worker-1`):**
    - `lead` wakes in `--owner-only` mode:
      - Approves **Task 1** (`post --type complete`).
-     - Answers **Task 2** (`post --type answer -m "Use alpha." --status pending --bump-revision`), keeping `assignee: "worker-1"` and incrementing `claim_round`.
+      - Answers **Task 2** (`post --type answer -m "Use alpha." --status pending`), keeping `assignee: "worker-1"` and automatically incrementing `revision` and `claim_round`.
      - Re-arms `watch --owner-only`.
    - `worker-1` reclaims **Task 2**, writes `alpha` to `$WORKDIR/t2.txt`, submits `review` (`--check-ac`).
-   - `lead` sends **1 feedback round** (`post --type feedback -m "Append a second line 'verified' to $WORKDIR/t2.txt" --status pending --bump-revision`) and re-arms `watch --owner-only`.
+    - `lead` sends **1 feedback round** (`post --type feedback -m "Append a second line 'verified' to $WORKDIR/t2.txt" --status pending`) and re-arms `watch --owner-only`.
    - `worker-1` reclaims **Task 2**, appends `verified`, re-submits `review` (`--check-ac`).
-   - `lead` approves **Task 2** (`post --type complete`) and exits/reports done.
+    - `lead` approves **Task 2** (`post --type complete`) and exits/reports done.
+
+In background-completion harnesses, each re-arm runs in the background without `--timeout`, then the agent ends its turn. Never wait in-turn. `lead` leaves no watcher after bounded completion. Add bucket `INSTRUCTIONS.md` and tag-body instructions before promotion; confirm workers read them and `claim --json` surfaces them. Submit reviews with a quoted `--stdin` here-doc containing raw evidence, observed/inferred/unverified sections and diff/verification output.
 
 ## Loose Pass Gates
 

@@ -59,6 +59,58 @@ function runWbAsync(args) {
   });
 }
 
+test("rework auto-bumps revision once, warns on actionable amends, and reports transitions", () => {
+  const bucket = makeTempBucket();
+  try {
+    const { task_id: id } = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Revisions"]);
+    for (const [index, status] of ["review", "blocked"].entries()) {
+      runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", id, "--claim-settle-ms", "0"]);
+      runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", id, "--type", status === "review" ? "review" : "question", "--status", status]);
+      const amend = runWb(["post", "--bucket", bucket, "--entity", "owner", "--task", id, "--type", "amend", "-m", "Correction", "--json"]);
+      assert.equal(amend.status, 0, amend.stderr);
+      assert.match(amend.stderr, /amend does not reopen/);
+      assert.equal(JSON.parse(amend.stdout).task.status, status);
+      const res = runWbJson(["post", "--bucket", bucket, "--entity", "owner", "--task", id, "--type", status === "review" ? "feedback" : "answer", "--status", "pending", ...(index ? ["--bump-revision"] : [])]);
+      assert.equal(res.task.revision, index + 2);
+      assert.equal(res.task.claim_round, index + 2);
+      assert.equal(res.previous_revision, index + 1);
+      assert.equal(res.previous_claim_round, index + 1);
+      assert.equal(res.task.assignee, "worker");
+    }
+    const text = runWb(["post", "--bucket", bucket, "--entity", "owner", "--task", id, "--type", "log", "--bump-revision"]);
+    assert.equal(text.status, 0, text.stderr);
+    assert.match(text.stdout, /revision=3->4 claim_round=3->3/);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("claim JSON includes bucket/tag instructions and multiline stdin/file bodies stay literal", () => {
+  const bucket = makeTempBucket();
+  try {
+    const body = "## Brief\n`literal $(no-substitution)`\n- [ ] #1 Test\n";
+    const created = runWb(["create", "--bucket", bucket, "--entity", "owner", "--title", "Instructions", "--tag", "linux", "--stdin", "--json"], { input: body });
+    assert.equal(created.status, 0, created.stderr);
+    const id = JSON.parse(created.stdout).task_id;
+    fs.writeFileSync(path.join(bucket, "INSTRUCTIONS.md"), "No git writes.\r\n");
+    runWbJson(["tag", "set", "--bucket", bucket, "--entity", "owner", "--tag", "linux", "-m", "Use the toolchain."]);
+    const claim = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", id, "--claim-settle-ms", "0"]);
+    assert.deepEqual(claim.instructions, [
+      { file: "INSTRUCTIONS.md", body: "No git writes." },
+      { file: "tags/linux.md", body: "Use the toolchain." },
+    ]);
+    const reviewPath = path.join(bucket, "review-body.md");
+    fs.writeFileSync(reviewPath, body);
+    runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", id, "--type", "review", "--status", "review", "--body-file", reviewPath]);
+    const rendered = runWbJson(["render", "--bucket", bucket, "--task", id, "--after-event", claim.claimed_event]);
+    assert.equal(rendered.body, body.trim());
+    assert.equal(rendered.events.length, 1);
+    assert.equal(rendered.events[0].body, body.trim());
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
 test("YAML frontmatter parsing handles CRLF, comments, quotes, and multiline arrays", () => {
   const raw = [
     "---",

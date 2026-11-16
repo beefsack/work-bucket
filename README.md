@@ -36,14 +36,18 @@ sync: local
 claim_settle_ms: 250
 default_ttl_seconds: 300
 msg_coalesce_ms: 500
+abandoned_ttl_multiplier: 3
+pinned_idle_seconds: 600
+unclaimed_seconds: 600
 ---
 ```
 
 - `sync`: `local`, `shared`, or `cloud`. Omitted config defaults to `shared`.
 - Omitted settle defaults to 250 ms locally, 2000 ms otherwise. It must be a
   positive integer, including for pinned reclaims.
-- TTL must be a positive integer; message coalescing must be a non-negative integer.
-- Local buckets containing sync-conflict copies are reported by `fsck`.
+- TTL and alert thresholds must be positive integers; the abandoned multiplier
+  must be at least 2. Message coalescing must be a non-negative integer.
+- Local buckets containing sync-conflict copies are reported by `fsck` and `status`.
 
 ### Migration to 2.0.0
 
@@ -62,6 +66,8 @@ msg_coalesce_ms: 500
 | `--body`, `--tags` | `-m`/`--message`, `--body-file`, `--stdin`; repeatable/comma-split `--tag` |
 | Nested `task` or `task_id` JSON fields | Top-level task-summary fields, with `id` |
 | Claim not-found/paused/conflict all exit 2 | Not-found 1, conflict/permission 3, paused 4 |
+| Rework pins the one-shot child | Pin the recorded dispatcher; retain the child as `affinity` |
+| Manual claimant registration/heartbeats | Claim auto-registers; `run -- <command>` heartbeats long legs |
 
 `fsck --bucket <dir>` is read-only. `fsck --repair` rebuilds drifting
 non-terminal task frontmatter from immutable state snapshots, preserving the
@@ -82,8 +88,10 @@ Run the tests with `npm test` or `node --test test/` (Node.js 20+).
 | `review` / `question` | In-progress to review / blocked | Elected claimant |
 | `feedback` / `answer` | Review / blocked to pending | Owner |
 | `reset` | In-progress to pending, clearing claim and pin | Owner |
+| `release` | In-progress to pending, pinned with a mandatory checkpoint | Elected claimant or recorded dispatcher |
 | `complete` / `cancel` | Any non-terminal state, clearing claim | Owner |
 | `log` / `post --type log\|note` | Append only, non-terminal | Owner, elected claimant or their recorded dispatcher |
+| `checkpoint` / `run` | Non-terminal; structured checkpoint / command execution | Owner, elected claimant or their recorded dispatcher |
 | `accept-amends` | In-progress | Elected claimant |
 
 An executor owns the tasks they create and can close, cancel or reset those tasks.
@@ -117,12 +125,15 @@ comma-split `--add-depends-on` / `--remove-depends-on`.
 | 124 | Watch timeout |
 | 130 | Watch interrupted by signal |
 
+`run` returns the command's exit code, including 126/127 for spawn failures and
+128 + signal number for termination (for example, 143 for SIGTERM).
+
 `TaskSummary` has these fixed fields:
 
 ```text
 id, title, stage, status, priority, tags, owner, assignee, affinity, claimed_by,
 parent, depends_on, revision, claim_round, outcome, last_amend_seen,
-instructions_seen, state_seq, updated_by, updated_at, path, task_path, latest_event
+instructions_seen, ttl_seconds, state_seq, updated_by, updated_at, path, task_path, latest_event
 ```
 
 `list` and pool/owner `watch` return arrays of this summary. `create`, `claim`,
@@ -130,7 +141,9 @@ intent commands and task `watch` return it at the top level with command-specifi
 evidence fields. `render` adds `body`, `events` and `claim_winner`; it never nests
 the state under `task`. `latest_event` is null or
 `{filename,type,entity_id,timestamp,body,truncated}`. Previews default to five lines;
-watch `--include-events` expands the surfaced events.
+watch `--include-events` expands the surfaced events. `ttl_seconds` is null without
+a task override. Checkpoint/release event summaries also expose their structured
+manifest and command lifecycle fields when present.
 
 A bucket uses plain Markdown directories:
 
@@ -151,7 +164,7 @@ You can manage the bucket directly in any text editor or with `node scripts/wb.m
 - **Unblock a `blocked` task:** Read the latest question; owner `answer` automatically increments `revision` and `claim_round` once.
 - **Review a `review` task:** Inspect `wb.mjs render --bucket <dir> --task <id>` (or read `task.md` and `events/`).
   - Approve: owner `complete` sets `status: "complete"` and clears `claimed_by`.
-  - Request changes: owner `feedback -m "..."` automatically bumps `revision` and `claim_round`, pinning the previous executor. Use `--reopen` to return it to the pool.
+  - Request changes: owner `feedback -m "..."` automatically bumps `revision` and `claim_round`, pinning the recorded dispatcher (or standalone executor). Use `--reopen` to return it to the pool.
   - Cancel: owner `cancel`, including while in-progress.
 - **Send or read public messages:** Run `wb.mjs msg send --bucket <dir> --entity <you> [--to <id|*,...>] [--tag <t>] -m "..."` and `wb.mjs msg list --bucket <dir> --all`. All messages in `messages/` are public to everyone in the bucket.
 - **Inspect active entities and tags:** Run `wb.mjs entity list --bucket <dir>` and `wb.mjs tag list --bucket <dir>` (document tags via `wb.mjs tag set --bucket <dir> --entity <you> --tag <name> -m "..."`).
@@ -160,7 +173,14 @@ You can manage the bucket directly in any text editor or with `node scripts/wb.m
 
 - Background-completion harness: arm `watch` without `--timeout` and **end your turn**; that is the wait. Never wait in-turn. Foreground/blocking harnesses instead block and re-arm on timeout. Keep one watcher per entity.
 - A bounded owner stops watching and reports through its parent harness once all assigned-unit tasks are `complete`/`cancelled`, or a decision requires escalation. Exit is not a bucket pause.
-- Only a multithreaded dispatcher watches tags/messages. Children use `once`, `claim --task <id>`, and return after `review`/`blocked`, without pool/message watches. The dispatcher checks pending pins to its `<entity_id>-N` IDs and spawns children under those IDs for rework; owners use `--reopen` when a pinned assignee cannot return.
+- Only a multithreaded dispatcher watches tags/messages. Children use fresh IDs,
+  `once`, and `claim --task <id> --dispatcher <id>` (or `WB_DISPATCHER`), then return
+  after `review`/`blocked`, without pool/message watches. Feedback/answer pin to
+  the recorded dispatcher, with the old child ID in `affinity`. The dispatcher
+  can resume that child or spawn a fresh one; either may claim its dispatcher pin.
+  ID prefixes grant no routing or authority. Create/amend refuse known child
+  assignees and suggest their dispatcher. Changing a live identity's dispatcher
+  is refused; use a fresh ID. Reset and `--reopen` clear both pin and affinity.
 - Session modes are `once`, `continuous`, `owner`; non-owner pool watches record advisory `mode: "worker"`, also accepted by `entity register`.
 - Read optional `INSTRUCTIONS.md` and `tags/<tag>.md` bodies for every task tag before claiming/executing. `claim --json` includes `instructions: [{file, body}]`; task bodies need only task-specific content.
 - Correct `in-progress` tasks with `amend`; resume `review` with `feedback`, `blocked` with `answer`. Amend alone does not reopen actionable tasks and prints a warning.
@@ -193,7 +213,50 @@ REVIEW
 - `list --bucket <dir>` emits one line per task: ID, status, assignee/claimed_by, revision, claim_round, latest event filename/type. Filter with repeatable/comma-separated `--status`, OR-matching `--tag`, `--owner`, `--assignee`, and `--claimed-by` (filters combine with AND). Empty assignee/claimant filter values select unassigned/unclaimed tasks. `--json` returns `{count,tasks:[summary]}`.
 - `claim --json` adds `unread_events` with full bodies: unaccepted amends, including those before the first claim, plus feedback since the previous round's claim. Amends remain visible across rounds until accepted, even if older than that previous claim.
 - The current executor uses `accept-amends` on an `in-progress` task. This preserves the original brief and appends unaccepted amendment bodies verbatim under chronological filename headings; apply their meaning during execution. It bumps revision once, stores `last_amend_seen`, and publishes a log of filenames before atomically updating `task.md`. A repeated call with no new amends fails without changes. Old manually merged amendments without a cursor are conservatively treated as unaccepted.
-- Register executors with `entity register` before execution, and refresh their entity heartbeat at checkpoints. Owner watch wakes with `reason: "stale"` and `stale_tasks` when an owned `in-progress` task's registered `claimed_by` heartbeat exceeds its TTL. Results include executor, timestamp, TTL and age. Each task/round/heartbeat alert is delivered once (`stale_task_seen`); a newer heartbeat or claim round can signal a later stall. Missing/unparseable heartbeats cannot signal TTL expiry. This is advisory, not an automatic reset or proof that execution stopped.
+- Claim automatically registers/refreshes mode, dispatcher, host, bucket TTL and
+  `claimed_task`. Wrap commands expected to exceed about TTL/2 with
+  `run --bucket <dir> --entity <id> --task <id> [--log <file>] -- <command> [args...]`.
+  The wrapper preserves argv, appends stdout/stderr to the optional log, heartbeats
+  every TTL/4, and records `running: {"pid":...,"host":...,"cmd":[...],"started_at":...}`
+  as a JSON flow mapping in entity frontmatter, including `child_pid` after spawn.
+  Its PID is the wrapper PID. The runtime also records the task ID. A start
+  checkpoint is published before spawning; exit checkpoints add the child PID
+  and exit code/signal. Both include command and log path. Signals received by the wrapper are forwarded
+  to the direct child. Runtime is cleared on normal exit, not on a forced crash.
+  A command ending does not end the claimant identity: review or another command
+  can follow. Use `entity end` when the whole task session exits. No detached
+  heartbeat daemon is started.
+- `create --ttl-seconds N` or an unclaimed metadata `amend --ttl-seconds N` overrides
+  the task's liveness TTL and wrapper heartbeat period. Pool/task watches with a
+  registered entity also heartbeat at entity TTL/4 and preserve runtime fields.
+- `checkpoint --notes <state>` records `files_touched`, `resources`, `pid`, `host`
+  and `notes`; add repeatable/comma-split `--files-touched` / `--resources` and
+  optional `--pid` / `--host`. Describe cleanup/resume needs even if there are no
+  resources. `release` requires the same manifest, returns in-progress work to
+  pending, advances its claim round and pins per the dispatcher/affinity rule.
+  The claimant or recorded dispatcher can release; the owner recovers with
+  reset/cancel unless also the claimant or dispatcher.
+- Owner watches expose `stale_tasks` after TTL and `abandoned_tasks` after
+  `abandoned_ttl_multiplier` TTLs, immediately for an ended claimant, or when a
+  recorded same-host wrapper PID is gone. Remote/unknown PID checks fall back to
+  heartbeat age. Missing entities use the task's last state timestamp. Alerts
+  are advisory: they never reassign or change a task. Inspect the tree and
+  checkpoint manifest before recovery.
+- `pinned_idle_tasks` alerts on a pending pin older than `pinned_idle_seconds`
+  whose assignee is missing, ended or stale for over 2 TTLs. `unclaimed_tasks`
+  alerts on unpinned, dependency-ready pending work older than `unclaimed_seconds`,
+  without an outstanding election; pause suppresses unclaimed alerts. Pending
+  age starts at the transition into pending, not a later log or metadata amend.
+  Each alert level/round/heartbeat is delivered once using bounded
+  `stale_task_seen` cursors; exclusions apply to all alert arrays. Terminal cursors
+  are pruned on entity writes.
+- `status --bucket <dir> [--owner <id>] [--json]` is read-only, including for absent
+  buckets. It returns active `TaskSummary` objects plus runtime/heartbeat/event
+  ages, `waiting_on: {role,entity_id}`, and all current `alerts` independent of watch
+  delivery cursors. Empty executor ID means the pool; known dispatcher pins are
+  distinguished from standalone executor pins. The JSON envelope also contains
+  `warnings` and `sync_conflicts`. Before ending a waiting turn, print a `waiting:`
+  line built from this status.
 - Owner `complete|cancel --outcome pass|partial|fail|abandoned` optionally records `outcome` in `task.md`; existing lifecycle states and dependency rules are unchanged. A completed bounded investigation with negative findings uses `complete --outcome fail`; partial verification can use `complete --outcome partial` when the investigation's own acceptance criteria are met. Unfinished work uses `cancel --outcome abandoned`. State the product verdict separately.
 - `bucket pause --bucket <dir> [-m <reason>]` atomically creates plain `PAUSED`; `bucket resume --bucket <dir>` removes it (idempotently). Humans can create/remove the file directly. Pause is bucket-wide, not task cancellation. `claim` refuses with exit 4, including a pause detected during settle; that election's immutable claim remains and can be resumed by its winner. The owner can demote/promote pending work to hold/release it; `reset` requires in-progress work.
 - Paused pool `watch` reports `reason: "paused"`, `paused: true` and no ready work. Executors stop at checkpoints and do not repeatedly re-arm pool watches until explicitly resumed. Owners may continue `--owner-only` watches/reviews/messages/stall handling; those watches include the pause flag but do not wake solely for pause. Task-specific watches retain lifecycle/event behavior and include `paused` on updates.

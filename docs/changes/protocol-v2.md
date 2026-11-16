@@ -61,6 +61,31 @@ Check the documented test entry and command references against the implementatio
   receipt/instruction gating remains in the delivery work.
 - Ownerless legacy records remain readable and claimable but confer no owner
   authority. Establish explicit ownership before owner transitions.
+- Rework and voluntary release pin the recorded dispatcher and retain the old
+  child as affinity; standalone executors pin themselves. Prefixes grant no
+  relationship. Known child assignees and live dispatcher changes are refused.
+- Release publishes its mandatory structured checkpoint in the same immutable
+  event as the pending state snapshot, advancing the claim round without changing
+  the brief revision. Notes are required even when files/resources are empty.
+- Claim records presence automatically. Runtime uses a JSON flow mapping with
+  wrapper PID, host, argv, start time, task ID and spawned child PID. A start
+  checkpoint precedes spawn; exit records status/signal and log path. Normal
+  command exit clears runtime but does not end the task identity. Identity exit
+  remains explicit, because review or another command can follow a long leg.
+- Wrappers and registered watches heartbeat at TTL/4. Task TTL overrides apply
+  to execution liveness and wrapper cadence; watch cadence uses entity TTL.
+  Same-host dead wrapper PIDs or ended identities immediately signal abandoned;
+  remote/unknown PIDs use heartbeat thresholds. Signals reach the direct child,
+  not an implicitly managed process tree.
+- Advisory thresholds are bucket settings: abandoned after 3 TTLs by default,
+  pinned idle after 600 seconds plus assignee missing/ended or over 2 TTLs stale,
+  and unclaimed eligible work after 600 seconds. Alerts never change task state.
+  Each task keeps one alert cursor; level, round, target and heartbeat changes
+  can wake again. Pending age follows state snapshots, not later metadata edits.
+- Status is read-only and reuses normalized summaries, adding runtime/heartbeat/
+  event ages, waiting role and current alerts independent of delivered cursors.
+  Task summaries expose a nullable TTL override; render/watch expose structured
+  checkpoint fields so recovery does not depend on reading raw frontmatter.
 
 ## Accepted evidence
 
@@ -90,3 +115,26 @@ Check the documented test entry and command references against the implementatio
 - Syntax checks for both script modules and `git diff --check` pass. Claim races,
   asynchronous and slow-sync replicas, cursor/message delivery, nonces and replay
   remain covered through public intent commands rather than compatibility shims.
+- Routing/liveness/status regression run: `npm test`, 72 passed, 0 failed, 0
+  skipped (60 retained tests and 12 new tests). The authority matrix now covers
+  512 intent/state/actor combinations; all 32 command examples execute, and all
+  20 body-writing commands retain uniform input/refusal coverage.
+- Dispatcher tests cover fresh-child rework, affinity, environment registration,
+  prefix-spoof and child-pin refusal, live relationship-change refusal and fresh
+  relationship validation after settle. Release requires a structured manifest,
+  refuses nonparticipants and unstructured input, supports dispatcher handback
+  and standalone reclaims, and remains replayable with no fsck drift.
+- Real short-lived process fixtures verify exact argv, log redirection, ordinary
+  exits, spawn failure, child and wrapper signals, overlapping-wrapper refusal,
+  runtime cleanup and continued identity use. A forced wrapper crash retains
+  the start checkpoint/runtime and immediately produces an abandoned advisory;
+  a subsequent explicit claim clears dead runtime after owner recovery.
+- Execution and registered pool/task watches remain live beyond TTL at TTL/4
+  cadence. Liveness coverage includes missing/ended claimants, same-host dead
+  and live PIDs, remote PID fallback, per-task TTL, stale-to-abandoned escalation
+  while armed without task events, bounded cursors and terminal pruning.
+- Pending alerts cover thresholds, healthy/stale/missing pins, dependency
+  eligibility, exclusions, pause, event-free wakeups and metadata edits that
+  do not reset pending age. Status preserves task summaries, exposes checkpoint
+  evidence, filters owners/terminal work, warns on local sync artifacts and makes
+  no filesystem changes, including for absent buckets.

@@ -3,6 +3,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import os from "node:os";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { CliError, parseCommand, printCommandHelp } from "./commands.mjs";
 
@@ -18,7 +20,6 @@ const VALID_STATUSES = new Set([
 ]);
 
 const DEFAULT_ENTITY_TTL_SECONDS = 300;
-const ENTITY_HEARTBEAT_MS = 60_000;
 const DEFAULT_MSG_COALESCE_MS = 500;
 const MAX_MSG_COALESCE_MS = 2000;
 const DEFAULT_CLAIM_SETTLE_MS = 2000;
@@ -68,6 +69,8 @@ const TRANSITIONS = {
   feedback: { from: ["review"], actor: "owner", to: "pending" },
   answer: { from: ["blocked"], actor: "owner", to: "pending" },
   reset: { from: ["in-progress"], actor: "owner", to: "pending" },
+  release: { from: ["in-progress"], actor: "executor", to: "pending" },
+  checkpoint: { from: NON_TERMINAL_STATUSES, actor: "participant", to: null },
   complete: { from: NON_TERMINAL_STATUSES, actor: "owner", to: "complete" },
   cancel: { from: NON_TERMINAL_STATUSES, actor: "owner", to: "cancelled", event: "cancelled" },
   log: { from: NON_TERMINAL_STATUSES, actor: "participant", to: null },
@@ -83,7 +86,7 @@ function assertTransition(intent, item, entityId, context = {}) {
   }
   if (intent === "create") return rule;
   if (rule.actor === "eligible") {
-    if (!canClaim(item, entityId, context.workerTags, context.includeUntagged, context.byId)) {
+    if (!canClaim(item, entityId, context.workerTags, context.includeUntagged, context.byId, context.bucketDir)) {
       throw new CliError(`Task "${task.id}" is not eligible for "${entityId}".`, 2);
     }
     return rule;
@@ -95,6 +98,7 @@ function assertTransition(intent, item, entityId, context = {}) {
   const dispatcher = claimant && readEntityFile(context.bucketDir, claimant)?.dispatcher === entityId;
   if ((rule.actor === "owner" && !owner) ||
       (rule.actor === "claimant" && claimant !== entityId) ||
+      (rule.actor === "executor" && claimant !== entityId && !dispatcher) ||
       (rule.actor === "participant" && !owner && claimant !== entityId && !dispatcher)) {
     throw new CliError(
       task.claimed_by === entityId && winner && winner.entityId !== entityId
@@ -113,11 +117,30 @@ function assertTransition(intent, item, entityId, context = {}) {
   return rule;
 }
 
-function canClaim(item, entityId, workerTags = new Set(), includeUntagged = false, byId = new Map()) {
+function canClaim(item, entityId, workerTags = new Set(), includeUntagged = false, byId = new Map(), bucketDir) {
   return item.task.status === "pending" && !item.task.claimed_by &&
-    (item.task.assignee === entityId || (!item.task.assignee &&
+    (assignedToEntity(item.task, entityId, bucketDir) || (!item.task.assignee &&
       matchesTags(item.task, entityId, workerTags, includeUntagged))) &&
     dependenciesSatisfied(item.task, byId) && !hasCompetingRoundClaim(item, entityId);
+}
+
+function assignedToEntity(task, entityId, bucketDir) {
+  return Boolean(task.assignee && (task.assignee === entityId ||
+    (bucketDir && readEntityFile(bucketDir, entityId)?.dispatcher === task.assignee)));
+}
+
+function validateAssignee(bucketDir, assignee) {
+  if (!assignee) return;
+  validateIdentifier(assignee, "--assignee");
+  const dispatcher = readEntityFile(bucketDir, assignee)?.dispatcher;
+  if (dispatcher) throw new CliError(`"${assignee}" is a recorded child; assign to dispatcher "${dispatcher}" instead.`);
+}
+
+function positiveSeconds(value, label) {
+  if (value === undefined) return undefined;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1) throw new CliError(`${label} must be a positive integer.`);
+  return number;
 }
 
 let tmpCounter = 0;
@@ -149,12 +172,16 @@ function readBucketConfig(bucketDir) {
     claim_settle_ms: data.claim_settle_ms ?? (sync === "local" ? 250 : DEFAULT_CLAIM_SETTLE_MS),
     default_ttl_seconds: data.default_ttl_seconds ?? DEFAULT_ENTITY_TTL_SECONDS,
     msg_coalesce_ms: data.msg_coalesce_ms ?? DEFAULT_MSG_COALESCE_MS,
+    abandoned_ttl_multiplier: data.abandoned_ttl_multiplier ?? 3,
+    pinned_idle_seconds: data.pinned_idle_seconds ?? 600,
+    unclaimed_seconds: data.unclaimed_seconds ?? 600,
   };
-  for (const key of ["claim_settle_ms", "default_ttl_seconds", "msg_coalesce_ms"]) {
+  for (const key of ["claim_settle_ms", "default_ttl_seconds", "msg_coalesce_ms", "abandoned_ttl_multiplier", "pinned_idle_seconds", "unclaimed_seconds"]) {
     if (!Number.isSafeInteger(config[key]) || config[key] < (key === "msg_coalesce_ms" ? 0 : 1)) {
       throw new CliError(`bucket.md: ${key} must be ${key === "msg_coalesce_ms" ? "a non-negative" : "a positive"} integer.`);
     }
   }
+  if (config.abandoned_ttl_multiplier < 2) throw new CliError("bucket.md: abandoned_ttl_multiplier must be at least 2.");
   return config;
 }
 
@@ -396,6 +423,9 @@ function parseFrontmatter(rawText) {
     } else if (stripped.startsWith("[")) {
       const parsedArr = parseInlineArray(stripped);
       data[key] = parsedArr ?? [];
+    } else if (stripped.startsWith("{")) {
+      try { data[key] = JSON.parse(stripped); }
+      catch { throw new CliError(`Invalid JSON flow mapping for "${key}".`); }
     } else {
       data[key] = parseScalar(rawVal);
     }
@@ -426,6 +456,8 @@ function serializeFrontmatter(data, canonicalKeys = null) {
     if (Array.isArray(val)) {
       const items = val.map((item) => JSON.stringify(String(item))).join(", ");
       lines.push(`${k}: [${items}]`);
+    } else if (val && typeof val === "object") {
+      lines.push(`${k}: ${JSON.stringify(val)}`);
     } else if (typeof val === "number") {
       lines.push(`${k}: ${Number.isFinite(val) ? Math.trunc(val) : 1}`);
     } else if (typeof val === "boolean") {
@@ -730,6 +762,7 @@ function readEventFile(eventsDir, filename, includeFullBody = true, eventLines =
     timestamp: String(data.timestamp ?? ""),
     body: includeFullBody ? body.trim() : lines.slice(0, eventLines).join("\n"),
     truncated: !includeFullBody && lines.length > eventLines,
+    ...checkpointFields(data),
   };
 }
 
@@ -753,6 +786,7 @@ function serializeTaskSummary(item, includeEvents = false, eventLines = 5) {
     outcome: item.task.outcome || "",
     last_amend_seen: item.task.last_amend_seen || "",
     instructions_seen: item.task.instructions_seen || "",
+    ttl_seconds: item.task.ttl_seconds ?? null,
     state_seq: Number(item.task.state_seq) || 0,
     updated_by: item.task.updated_by,
     updated_at: item.task.updated_at,
@@ -760,6 +794,12 @@ function serializeTaskSummary(item, includeEvents = false, eventLines = 5) {
     task_path: item.taskPath,
     latest_event: events.length ? readEventFile(item.eventsDir, events.at(-1), includeEvents, eventLines) : null,
   };
+}
+
+function checkpointFields(data) {
+  return Object.fromEntries(["files_touched", "resources", "pid", "child_pid", "host", "notes",
+    "phase", "cmd", "log", "exit_code", "signal", "error"]
+    .filter((key) => Object.hasOwn(data, key)).map((key) => [key, data[key]]));
 }
 
 function writeUniqueMarkdown(targetDir, prefix, content, label = "file") {
@@ -846,7 +886,7 @@ function getRoundClaims(eventsDir, claimRound = 1) {
   let lastBoundaryIdx = -1;
   for (let i = 0; i < eventNames.length; i += 1) {
     const parts = parseEventFilenameParts(eventNames[i]);
-    if (parts && ["created", "answer", "feedback", "reset"].includes(parts.type)) {
+    if (parts && ["created", "answer", "feedback", "reset", "release"].includes(parts.type)) {
       lastBoundaryIdx = i;
     }
   }
@@ -1123,6 +1163,9 @@ function readEntityFile(bucketDir, entityId) {
       owner_task_seen: coerceStringList(data.owner_task_seen),
       stale_task_seen: coerceStringList(data.stale_task_seen),
       dispatcher: String(data.dispatcher ?? ""),
+      host: String(data.host ?? ""),
+      claimed_task: String(data.claimed_task ?? ""),
+      running: data.running && typeof data.running === "object" && !Array.isArray(data.running) ? data.running : null,
       ended_at: String(data.ended_at ?? ""),
       updated_at: String(data.updated_at ?? ""),
       body: body.trim(),
@@ -1182,6 +1225,9 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
     owner_task_seen: updates.owner_task_seen ?? existing?.owner_task_seen ?? [],
     stale_task_seen: updates.stale_task_seen ?? existing?.stale_task_seen ?? [],
     dispatcher: updates.dispatcher ?? existing?.dispatcher ?? "",
+    host: updates.host ?? existing?.host ?? "",
+    claimed_task: updates.claimed_task ?? existing?.claimed_task ?? "",
+    running: updates.running !== undefined ? updates.running : existing?.running ?? "",
     ended_at: updates.ended_at ?? existing?.ended_at ?? "",
     updated_at: isoUtc,
   };
@@ -1397,22 +1443,81 @@ function findOwnerActionableTasks(bucketDir, entityId, allActionable = false) {
     .sort(sortByPriorityAndAge);
 }
 
-function findOwnerStaleTasks(bucketDir, entityId) {
+function ageSeconds(timestamp, fallback = 0) {
+  const parsed = Date.parse(timestamp);
+  return Number.isFinite(parsed) ? Math.max(0, (Date.now() - parsed) / 1000) : fallback;
+}
+
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid < 1) return null;
+  try { process.kill(pid, 0); return true; }
+  catch (err) { return err.code === "ESRCH" ? false : null; }
+}
+
+function pendingSince(item) {
+  const events = listEventFiles(item.eventsDir);
+  let timestamp = item.task.updated_at;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    try {
+      const { data } = parseFrontmatter(fs.readFileSync(path.join(item.eventsDir, events[i]), "utf8"));
+      if (data.snapshot_version !== 1) continue;
+      if (data.status !== "pending") break;
+      timestamp = data.timestamp;
+    } catch (err) {
+      if (err.code !== "ENOENT" && !(err instanceof CliError)) throw err;
+    }
+  }
+  return timestamp;
+}
+
+function taskAlerts(bucketDir, item, byId, config = readBucketConfig(bucketDir)) {
+  const task = item.task;
+  const alerts = [];
+  if (task.status === "in-progress" && task.claimed_by) {
+    const entity = readEntityFile(bucketDir, task.claimed_by);
+    const ttl = positiveSeconds(task.ttl_seconds, "task ttl_seconds") ?? entity?.ttl_seconds ?? config.default_ttl_seconds;
+    const timestamp = entity?.updated_at || task.updated_at;
+    const age = ageSeconds(timestamp, Infinity);
+    const running = entity?.running;
+    const dead = running?.host === os.hostname() && (!running.task || running.task === task.id) &&
+      pidAlive(running.pid) === false;
+    const level = dead || entity?.ended_at || age > ttl * config.abandoned_ttl_multiplier
+      ? "abandoned" : age > ttl ? "stale" : null;
+    if (level) alerts.push({
+      type: level,
+      heartbeat: { entity_id: task.claimed_by, updated_at: timestamp, ttl_seconds: ttl,
+        age_seconds: Number.isFinite(age) ? Math.floor(age) : null, missing: !entity },
+      reason: dead ? "wrapper_pid_gone" : entity?.ended_at ? "entity_ended" : "heartbeat",
+    });
+  }
+  if (task.status === "pending" && !task.claimed_by) {
+    const age = ageSeconds(pendingSince(item));
+    if (task.assignee) {
+      const entity = readEntityFile(bucketDir, task.assignee);
+      if (age > config.pinned_idle_seconds && (!entity || entity.ended_at ||
+          ageSeconds(entity.updated_at, Infinity) > entity.ttl_seconds * 2)) {
+        alerts.push({ type: "pinned_idle", assignee: task.assignee, age_seconds: Math.floor(age) });
+      }
+    } else if (!fs.existsSync(path.join(bucketDir, "PAUSED")) && age > config.unclaimed_seconds &&
+        dependenciesSatisfied(task, byId) && !getRoundClaims(item.eventsDir, task.claim_round).winner) {
+      alerts.push({ type: "unclaimed", age_seconds: Math.floor(age) });
+    }
+  }
+  return alerts;
+}
+
+function alertCursor(item, alert) {
+  return `${item.task.id}/${item.task.claim_round}/${item.task.claimed_by || item.task.assignee}/${alert.type}/${alert.heartbeat?.updated_at || pendingSince(item)}/${alert.reason || ""}`;
+}
+
+function findOwnerAlerts(bucketDir, entityId) {
   const seen = new Set(readEntityFile(bucketDir, entityId)?.stale_task_seen ?? []);
-  return listTasks(bucketDir).filter((item) => {
-    if (item.task.owner !== entityId || item.task.status !== "in-progress" || !item.task.claimed_by) return false;
-    const entity = readEntityFile(bucketDir, item.task.claimed_by);
-    if (!entity) return false;
-    const ageSeconds = (Date.now() - Date.parse(entity.updated_at)) / 1000;
-    if (!Number.isFinite(ageSeconds) || ageSeconds <= entity.ttl_seconds) return false;
-    item.heartbeat = {
-      entity_id: entity.entity_id,
-      updated_at: entity.updated_at,
-      ttl_seconds: entity.ttl_seconds,
-      age_seconds: Math.floor(ageSeconds),
-    };
-    return !seen.has(`${item.task.id}/${item.task.claim_round}/${item.task.claimed_by}/${entity.updated_at}`);
-  }).sort(sortByPriorityAndAge);
+  const { tasks, byId } = scanAllTasks(bucketDir);
+  const config = readBucketConfig(bucketDir);
+  return tasks.filter((item) => item.task.owner === entityId)
+    .sort(sortByPriorityAndAge).flatMap((item) => taskAlerts(bucketDir, item, byId, config)
+      .filter((alert) => !seen.has(alertCursor(item, alert)))
+      .map((alert) => ({ ...item, alert, alert_cursor: alertCursor(item, alert) })));
 }
 
 function unreadTaskInstructions(item) {
@@ -1462,7 +1567,7 @@ function findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged, inc
       (item) =>
         item.task.status === "pending" &&
         item.task.claimed_by === "" &&
-        item.task.assignee === entityId &&
+        assignedToEntity(item.task, entityId, bucketDir) &&
         dependenciesSatisfied(item.task, byId)
     )
     .sort(sortByPriorityAndAge);
@@ -1554,7 +1659,8 @@ function cmdCreate(argv) {
     throw new CliError("--backlog/--draft cannot be combined with --status pending.");
   }
 
-  if (values.assignee) validateIdentifier(values.assignee, "--assignee");
+  validateAssignee(bucketDir, values.assignee);
+  const taskTtl = positiveSeconds(values["ttl-seconds"], "--ttl-seconds");
   if (values.parent) validateTaskId(values.parent);
 
   const tags = normalizeTags(parseListFlags(values.tag));
@@ -1637,6 +1743,7 @@ function cmdCreate(argv) {
     outcome: "",
     last_amend_seen: "",
     instructions_seen: "",
+    ...(taskTtl !== undefined ? { ttl_seconds: taskTtl } : {}),
   };
 
   const taskPath = path.join(taskDir, "task.md");
@@ -1694,6 +1801,22 @@ async function cmdClaim(argv) {
     );
   }
 
+  const existing = readEntityFile(bucketDir, entityId);
+  const dispatcher = values.dispatcher ?? process.env.WB_DISPATCHER ?? existing?.dispatcher ?? "";
+  if (dispatcher) validateIdentifier(dispatcher, "--dispatcher");
+  if (dispatcher === entityId) throw new CliError("An entity cannot be its own dispatcher.");
+  if (existing && dispatcher !== existing.dispatcher && !existing.ended_at &&
+      ageSeconds(existing.updated_at, Infinity) <= existing.ttl_seconds) {
+    throw new CliError("Cannot change the recorded dispatcher of a live identity; use a fresh entity ID.", 3);
+  }
+  upsertEntityFile(bucketDir, entityId, {
+    mode: existing?.mode || "once", dispatcher, host: os.hostname(),
+    tags: Array.from(workerTags), include_untagged: includeUntagged,
+    ttl_seconds: readBucketConfig(bucketDir).default_ttl_seconds, ended_at: "",
+    ...(existing?.ended_at || (existing?.running?.host === os.hostname() && pidAlive(existing.running.pid) === false)
+      ? { running: "" } : {}),
+  });
+
   const { byId } = scanAllTasks(bucketDir);
   let candidates;
   if (values.task) {
@@ -1725,7 +1848,7 @@ async function cmdClaim(argv) {
     if (preTask.status !== "pending" || preTask.claimed_by !== "") {
       continue;
     }
-    if (!canClaim({ ...candidate, task: preTask }, entityId, workerTags, includeUntagged, byId)) continue;
+    if (!canClaim({ ...candidate, task: preTask }, entityId, workerTags, includeUntagged, byId, bucketDir)) continue;
     assertTransition("claim", { ...candidate, task: preTask }, entityId, { bucketDir, workerTags, includeUntagged, byId });
 
     const claimRound = Number(preTask.claim_round) || 1;
@@ -1798,7 +1921,7 @@ async function cmdClaim(argv) {
     throw new CliError("Lost claim race; no remaining eligible tasks.", 3);
   }
 
-  touchExistingEntity(bucketDir, entityId);
+  upsertEntityFile(bucketDir, entityId, { claimed_task: finalTask.id });
 
   const events = listEventFiles(claimedEntry.eventsDir);
   const lastEventSeen = events.length > 0 ? events[events.length - 1] : claimedEvent.filename;
@@ -1852,8 +1975,11 @@ function cmdTransition(command, argv) {
   }
   const addDeps = parseListFlags(values["add-depends-on"]);
   const removeDeps = new Set(parseListFlags(values["remove-depends-on"]));
-  const metadataChange = values.assignee !== undefined || addDeps.length > 0 || removeDeps.size > 0;
+  const taskTtl = positiveSeconds(values["ttl-seconds"], "--ttl-seconds");
+  const metadataChange = values.assignee !== undefined || taskTtl !== undefined || addDeps.length > 0 || removeDeps.size > 0;
   const rule = assertTransition(intent, found, entityId, { bucketDir, targetStatus: values.status, metadataChange });
+  const previousClaimant = (found.task.status === "in-progress"
+    ? getRoundClaims(found.eventsDir, found.task.claim_round).winner?.entityId : null) || found.task.claimed_by;
   const eventType = rule.event || intent;
   const targetStatus = values.status ?? rule.to;
   if (values.outcome !== undefined && !["pass", "partial", "fail", "abandoned"].includes(values.outcome)) {
@@ -1867,7 +1993,8 @@ function cmdTransition(command, argv) {
   }
 
   for (const dep of [...addDeps, ...removeDeps]) validateTaskId(dep);
-  if (values.assignee) validateIdentifier(values.assignee, "--assignee");
+  validateAssignee(bucketDir, values.assignee);
+  const checkpoint = ["checkpoint", "release"].includes(intent) ? checkpointManifest(values) : {};
   const mutatesTaskMd = Boolean(targetStatus || metadataChange || acceptedAmends.length);
 
   const now = new Date();
@@ -1885,12 +2012,13 @@ function cmdTransition(command, argv) {
 
   if (mutatesTaskMd) {
     if (targetStatus) updatedTask.status = targetStatus;
-    if (["feedback", "answer", "reset"].includes(intent)) {
+    if (["feedback", "answer", "reset", "release"].includes(intent)) {
       updatedTask.claim_round = (Number(updatedTask.claim_round) || 1) + 1;
       updatedTask.claimed_by = "";
+      const dispatcher = previousClaimant && readEntityFile(bucketDir, previousClaimant)?.dispatcher;
       updatedTask.assignee = intent === "reset" || values.reopen
-        ? "" : found.task.claimed_by || found.task.assignee;
-      if (intent === "reset" || values.reopen) updatedTask.affinity = "";
+        ? "" : dispatcher || previousClaimant || found.task.assignee;
+      updatedTask.affinity = intent === "reset" || values.reopen ? "" : dispatcher ? previousClaimant : "";
     }
     if (["feedback", "answer", "accept-amends"].includes(intent) || metadataChange) {
       updatedTask.revision = (Number(updatedTask.revision) || 1) + 1;
@@ -1901,6 +2029,7 @@ function cmdTransition(command, argv) {
       updatedTask.claimed_by = entityId;
     }
     if (values.assignee !== undefined) updatedTask.assignee = values.assignee;
+    if (taskTtl !== undefined) updatedTask.ttl_seconds = taskTtl;
     if (acceptedAmends.length) {
       updatedBody = `${updatedBody.trimEnd()}\n\n${acceptedAmends.map((event) =>
         `## Amendment: ${event.filename}\n\n${event.body}`).join("\n\n")}\n`;
@@ -1920,10 +2049,14 @@ function cmdTransition(command, argv) {
     updatedTask.updated_at = isoUtc;
   }
   const eventResult = mutatesTaskMd
-    ? publishTaskState(found, updatedTask, updatedBody, entityId, eventType, message, now)
-    : writeUniqueEvent(found.eventsDir, entityId, eventType, message, now);
+    ? publishTaskState(found, updatedTask, updatedBody, entityId, eventType, message, now, checkpoint)
+    : writeUniqueEvent(found.eventsDir, entityId, eventType, message, now, checkpoint);
 
   touchExistingEntity(bucketDir, entityId);
+  if (found.task.status === "in-progress" && updatedTask.status !== "in-progress" && previousClaimant) {
+    const claimant = readEntityFile(bucketDir, previousClaimant);
+    if (claimant?.claimed_task === taskId) upsertEntityFile(bucketDir, previousClaimant, { claimed_task: "" });
+  }
 
   if (values.json) {
     console.log(
@@ -1945,6 +2078,141 @@ function cmdTransition(command, argv) {
       console.log(
         `State: status=${updatedTask.status} revision=${found.task.revision}->${updatedTask.revision} claim_round=${found.task.claim_round}->${updatedTask.claim_round}`
       );
+    }
+  }
+  return 0;
+}
+
+function checkpointManifest(values) {
+  if (!values.notes?.trim()) throw new CliError("A checkpoint requires --notes describing state and cleanup/resume needs.");
+  const pid = positiveSeconds(values.pid, "--pid");
+  return {
+    files_touched: parseListFlags(values["files-touched"]),
+    resources: parseListFlags(values.resources),
+    pid: pid ?? process.pid, host: values.host || os.hostname(), notes: values.notes.trim(),
+  };
+}
+
+async function cmdRun(argv) {
+  const { values, command } = parseCommand("run", argv);
+  if (values.help) { printCommandHelp("run"); return 0; }
+  if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+  if (!command.length) throw new CliError('run requires -- <command> [args...].');
+  const bucketDir = path.resolve(values.bucket);
+  const entityId = validateIdentifier(values.entity, "--entity");
+  useEntitySession(bucketDir, entityId, values);
+  const taskId = validateTaskId(values.task);
+  const found = findTask(bucketDir, taskId);
+  if (!found) throw new CliError(`Task "${taskId}" not found.`);
+  assertTransition("checkpoint", found, entityId, { bucketDir });
+  const existing = readEntityFile(bucketDir, entityId);
+  if (existing?.running && (existing.running.host === os.hostname()
+    ? pidAlive(existing.running.pid) !== false : ageSeconds(existing.updated_at, Infinity) <= existing.ttl_seconds)) {
+    throw new CliError(`Entity "${entityId}" already has an active run wrapper.`, 3);
+  }
+  const config = readBucketConfig(bucketDir);
+  const ttl = positiveSeconds(found.task.ttl_seconds, "task ttl_seconds") ?? existing?.ttl_seconds ?? config.default_ttl_seconds;
+  const logPath = values.log ? path.resolve(values.log) : "";
+  const logFd = logPath ? fs.openSync(logPath, "a") : null;
+  const running = { pid: process.pid, host: os.hostname(), cmd: command, started_at: formatIsoUtc(), task: taskId };
+  let timer;
+  let child;
+  let heartbeatError;
+  let receivedSignal;
+  const onSignal = (signal) => { receivedSignal = signal; child?.kill(signal); };
+  try {
+    upsertEntityFile(bucketDir, entityId, {
+      mode: existing?.mode || "once", host: os.hostname(), running, ended_at: "",
+    });
+    writeUniqueEvent(found.eventsDir, entityId, "checkpoint", "Command starting.", new Date(), {
+      files_touched: [], resources: [], pid: process.pid, host: os.hostname(), notes: "Command starting",
+      phase: "start", cmd: command, log: logPath,
+    });
+    const result = await new Promise((resolve) => {
+      child = spawn(command[0], command.slice(1), { stdio: ["inherit", logFd ?? "inherit", logFd ?? "inherit"] });
+      process.on("SIGINT", onSignal);
+      process.on("SIGTERM", onSignal);
+      child.once("error", (error) => resolve({ code: error.code === "ENOENT" ? 127 : 126, error: error.message }));
+      child.once("close", (code, signal) => resolve({ code, signal }));
+      try {
+        running.child_pid = child.pid || "";
+        upsertEntityFile(bucketDir, entityId, { running });
+      } catch (err) {
+        heartbeatError = err;
+        child.kill("SIGTERM");
+      }
+      timer = setInterval(() => {
+        try { upsertEntityFile(bucketDir, entityId); }
+        catch (err) { heartbeatError = err; clearInterval(timer); child.kill("SIGTERM"); }
+      }, Math.max(1, ttl * 1000 / 4));
+    });
+    const signal = receivedSignal || result.signal || "";
+    const code = signal ? 128 + (os.constants.signals[signal] || 1) : result.code ?? 1;
+    writeUniqueEvent(found.eventsDir, entityId, "checkpoint", result.error || "Command exited.", new Date(), {
+      files_touched: [], resources: [], pid: process.pid, child_pid: child.pid || "", host: os.hostname(), notes: "Command exited",
+      phase: "exit", cmd: command, log: logPath, exit_code: code, signal, error: result.error || heartbeatError?.message || "",
+    });
+    if (heartbeatError) throw heartbeatError;
+    return code;
+  } finally {
+    clearInterval(timer);
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+    if (logFd !== null) fs.closeSync(logFd);
+    upsertEntityFile(bucketDir, entityId, { running: "" });
+  }
+}
+
+function cmdStatus(argv) {
+  const { values } = parseCommand("status", argv);
+  if (values.help) { printCommandHelp("status"); return 0; }
+  if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+  if (values.owner) validateIdentifier(values.owner, "--owner");
+  const bucketDir = path.resolve(values.bucket);
+  const config = readBucketConfig(bucketDir);
+  const { tasks, byId } = scanAllTasks(bucketDir);
+  const active = tasks.filter((item) => !TERMINAL_STATUSES.has(item.task.status) &&
+    (values.owner === undefined || item.task.owner === values.owner)).sort(sortByPriorityAndAge);
+  const dispatchers = new Set(listEntities(bucketDir).map((entity) => entity.dispatcher).filter(Boolean));
+  const summaries = active.map((item) => {
+    const summary = serializeTaskSummary(item);
+    const responsible = item.task.claimed_by || item.task.assignee;
+    const entity = responsible ? readEntityFile(bucketDir, responsible) : null;
+    const running = entity?.running && (!entity.running.task || entity.running.task === item.task.id) ? entity.running : null;
+    const heartbeatAge = ageSeconds(entity?.updated_at, null);
+    const eventAge = ageSeconds(summary.latest_event?.timestamp, null);
+    const waitingRole = ["blocked", "review", "draft", "ready"].includes(item.task.status) ? "owner"
+      : item.task.status === "pending" && item.task.assignee &&
+        (item.task.affinity || dispatchers.has(item.task.assignee)) ? "dispatcher" : "executor";
+    return { ...summary,
+      running: running ? { ...running, age_seconds: Math.floor(ageSeconds(running.started_at)) } : null,
+      heartbeat_age_seconds: heartbeatAge === null ? null : Math.floor(heartbeatAge),
+      latest_event_age_seconds: eventAge === null ? null : Math.floor(eventAge),
+      waiting_on: { role: waitingRole, entity_id: waitingRole === "owner" ? item.task.owner
+        : item.task.claimed_by || item.task.assignee || "" },
+      alerts: taskAlerts(bucketDir, item, byId, config),
+    };
+  });
+  const conflicts = [];
+  if (config.sync === "local" && fs.existsSync(bucketDir)) {
+    const visit = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith(".")) continue;
+        if (isSyncConflictFilename(entry.name)) conflicts.push(path.relative(bucketDir, path.join(dir, entry.name)));
+        else if (entry.isDirectory()) visit(path.join(dir, entry.name));
+      }
+    };
+    visit(bucketDir);
+  }
+  const warnings = conflicts.length ? ["Sync-conflict artifacts in a local bucket; check bucket.md sync setting."] : [];
+  const result = { count: summaries.length, tasks: summaries, warnings, sync_conflicts: conflicts };
+  if (values.json) console.log(JSON.stringify(result, null, 2));
+  else {
+    for (const warning of warnings) console.log(`Warning: ${warning}`);
+    for (const task of summaries) {
+      console.log(`${task.id}: ${task.status} claimant=${task.claimed_by || "-"} waiting_on=${task.waiting_on.role}:${task.waiting_on.entity_id || "pool"}`);
+      console.log(`  command=${task.running ? JSON.stringify(task.running.cmd) : "-"} age=${task.running?.age_seconds ?? "-"}s heartbeat_age=${task.heartbeat_age_seconds ?? "-"}s`);
+      console.log(`  event=${task.latest_event?.filename || "-"} age=${task.latest_event_age_seconds ?? "-"}s alerts=${task.alerts.map((alert) => alert.type).join(",") || "-"}`);
     }
   }
   return 0;
@@ -1994,6 +2262,7 @@ function cmdRender(argv) {
         entity_id: String(data.entity_id ?? ""),
         timestamp: String(data.timestamp ?? ""),
         body: body.trim(),
+        ...checkpointFields(data),
       };
     } catch (err) {
       if (err instanceof CliError) {
@@ -2040,6 +2309,7 @@ function cmdRender(argv) {
       out.push("");
       out.push(`### ${ev.filename}`);
       out.push(`- **Type:** \`${ev.type}\` | **Entity:** \`${ev.entity_id}\` | **Timestamp:** ${ev.timestamp}`);
+      if (Object.hasOwn(ev, "notes")) out.push(`- **Checkpoint:** ${JSON.stringify(checkpointFields(ev))}`);
       if (ev.body) {
         out.push("");
         out.push(ev.body);
@@ -2279,8 +2549,8 @@ async function cmdWatch(argv) {
       tags: Array.from(workerTags),
       include_untagged: includeUntagged,
       mode: ownerOnly ? "owner" : "worker",
-      ttl_seconds: config.default_ttl_seconds,
       ended_at: "",
+      host: os.hostname(),
     });
   }
 
@@ -2378,8 +2648,12 @@ async function cmdWatch(argv) {
         .filter((item) => !excludedTasks.has(item.task.id));
     const ownerTasks = findOwnerActionableTasks(bucketDir, entityId, values["all-actionable"])
       .filter((item) => !excludedTasks.has(item.task.id));
-    const staleTasks = findOwnerStaleTasks(bucketDir, entityId)
+    const alerts = findOwnerAlerts(bucketDir, entityId)
       .filter((item) => !excludedTasks.has(item.task.id));
+    const alertTasks = (type) => alerts.filter((item) => item.alert.type === type).map((item) => ({
+      ...serializeTaskSummary(item, values["include-events"], eventLines),
+      ...item.alert, alert_cursor: item.alert_cursor,
+    }));
     const msgCursor =
       values["after-msg"] !== undefined
         ? values["after-msg"]
@@ -2390,22 +2664,22 @@ async function cmdWatch(argv) {
     if (
       eligible.length > 0 ||
       ownerTasks.length > 0 ||
-      staleTasks.length > 0 ||
+      alerts.length > 0 ||
       (paused && !ownerOnly) ||
       unreadMessages.length > 0
     ) {
       return {
         mode: ownerOnly ? "owner" : "ready",
-        reason: paused && !ownerOnly ? "paused" : staleTasks.length ? "stale" : ownerTasks.length ? "owner_update" : eligible.length ? "work" : "messages",
+        reason: paused && !ownerOnly ? "paused" : alerts.length ? alerts[0].alert.type : ownerTasks.length ? "owner_update" : eligible.length ? "work" : "messages",
         paused,
         entity_id: entityId,
         count: eligible.length,
         tasks: eligible.map((item) => serializeTaskSummary(item, values["include-events"], eventLines)),
         owner_tasks: ownerTasks.map((item) => serializeTaskSummary(item, values["include-events"], eventLines)),
-        stale_tasks: staleTasks.map((item) => ({
-          ...serializeTaskSummary(item, values["include-events"], eventLines),
-          heartbeat: item.heartbeat,
-        })),
+        stale_tasks: alertTasks("stale"),
+        abandoned_tasks: alertTasks("abandoned"),
+        pinned_idle_tasks: alertTasks("pinned_idle"),
+        unclaimed_tasks: alertTasks("unclaimed"),
         messages: unreadMessages,
         last_msg_seen: latestMsgFile || msgCursor,
       };
@@ -2424,11 +2698,13 @@ async function cmdWatch(argv) {
         owner_task_seen: Array.from(seen, ([id, event]) => `${id}/${event}`),
       });
     }
-    if (!watchTaskId && entityId && result?.stale_tasks?.length) {
+    const alertTasks = result ? ["stale_tasks", "abandoned_tasks", "pinned_idle_tasks", "unclaimed_tasks"]
+      .flatMap((key) => result[key] || []) : [];
+    if (!watchTaskId && entityId && alertTasks.length) {
       const seen = new Map((readEntityFile(bucketDir, entityId)?.stale_task_seen ?? [])
         .map((cursor) => [cursor.split("/")[0], cursor]));
-      for (const task of result.stale_tasks) {
-        seen.set(task.id, `${task.id}/${task.claim_round}/${task.claimed_by}/${task.heartbeat.updated_at}`);
+      for (const task of alertTasks) {
+        seen.set(task.id, task.alert_cursor);
       }
       upsertEntityFile(bucketDir, entityId, { stale_task_seen: Array.from(seen.values()) });
     }
@@ -2486,6 +2762,9 @@ async function cmdWatch(argv) {
         console.log(`Stale: ${task.id} status=${task.status} revision=${task.revision} claim_round=${task.claim_round} claimed_by=${task.claimed_by} assignee=${task.assignee || "-"} heartbeat=${task.heartbeat.updated_at} age=${task.heartbeat.age_seconds}s ttl=${task.heartbeat.ttl_seconds}s`);
         printEvent(task.latest_event);
       }
+      for (const task of [...result.abandoned_tasks, ...result.pinned_idle_tasks, ...result.unclaimed_tasks]) {
+        console.log(`${task.type}: ${task.id} status=${task.status} claimant=${task.claimed_by || "-"} assignee=${task.assignee || "-"}`);
+      }
     } else {
       console.log(
         `Task update for ${result.id}: stage=${result.stage} status=${result.status} revision=${result.revision ?? "-"} claim_round=${result.claim_round ?? "-"} claimed_by=${result.claimed_by || "-"} assignee=${result.assignee || "-"}`
@@ -2507,6 +2786,7 @@ async function cmdWatch(argv) {
   function printEvent(event) {
     if (!event) return;
     console.log(`  Event: ${event.filename} type=${event.type}${event.truncated ? " (truncated)" : ""}`);
+    if (Object.hasOwn(event, "notes")) console.log(`  Checkpoint: ${JSON.stringify(checkpointFields(event))}`);
     if (event.body) console.log(event.body);
   }
 
@@ -2564,6 +2844,9 @@ async function cmdWatch(argv) {
         res.tasks.length === 0 &&
         res.owner_tasks.length === 0 &&
         res.stale_tasks.length === 0 &&
+        res.abandoned_tasks.length === 0 &&
+        res.pinned_idle_tasks.length === 0 &&
+        res.unclaimed_tasks.length === 0 &&
         !res.paused &&
         res.messages.length > 0
       );
@@ -2661,14 +2944,14 @@ async function cmdWatch(argv) {
 
     pollTimer = setInterval(checkAndFinish, pollMs);
 
-    if (!watchTaskId && entityId) {
+    if (entityId && readEntityFile(bucketDir, entityId)) {
       heartbeatTimer = setInterval(() => {
         try {
           upsertEntityFile(bucketDir, entityId);
         } catch {
           // ignore transient heartbeat failure
         }
-      }, ENTITY_HEARTBEAT_MS);
+      }, Math.max(1, (readEntityFile(bucketDir, entityId)?.ttl_seconds ?? config.default_ttl_seconds) * 1000 / 4));
     }
 
     if (timeoutSec > 0) {
@@ -3041,6 +3324,8 @@ async function main(argv = process.argv.slice(2)) {
     case "feedback":
     case "answer":
     case "reset":
+    case "release":
+    case "checkpoint":
     case "complete":
     case "cancel":
     case "log":
@@ -3048,6 +3333,10 @@ async function main(argv = process.argv.slice(2)) {
       return cmdTransition(sub, rest);
     case "watch":
       return await cmdWatch(rest);
+    case "run":
+      return await cmdRun(rest);
+    case "status":
+      return cmdStatus(rest);
     case "render":
       return cmdRender(rest);
     case "list":

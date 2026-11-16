@@ -75,6 +75,424 @@ function runWbAsync(args) {
   });
 }
 
+test("recorded dispatcher routing survives rework with fresh children and refuses prefix or child pins", () => {
+  const bucket = makeTempBucket();
+  try {
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Routed", "--assignee", "dispatcher"]);
+    const args = ["--bucket", bucket, "--task", task.id];
+    assert.equal(runWb(["claim", ...args, "--entity", "dispatcher-spoof"]).status, 2);
+    const child = runWbJson(["claim", ...args, "--entity", "child-1", "--dispatcher", "dispatcher"]);
+    const entityPath = path.join(bucket, "entities", "child-1.md");
+    const entity = parseFrontmatter(fs.readFileSync(entityPath, "utf8")).data;
+    assert.equal(entity.dispatcher, "dispatcher");
+    assert.equal(entity.mode, "once");
+    assert.equal(entity.host, os.hostname());
+    assert.equal(entity.claimed_task, task.id);
+    assert.equal(entity.ttl_seconds, 300);
+    runWbJson(["review", ...args, "--entity", "child-1"]);
+    const feedback = runWbJson(["feedback", ...args, "--entity", "owner"]);
+    assert.equal(feedback.assignee, "dispatcher");
+    assert.equal(feedback.affinity, "child-1");
+    const wake = runWbJson(["watch", "--bucket", bucket, "--entity", "dispatcher"]);
+    assert.equal(wake.tasks[0].affinity, "child-1");
+    assert.equal(runWb(["claim", ...args, "--entity", "dispatcher-prefix"]).status, 2);
+    const next = runWb(["claim", ...args, "--entity", "child-2", "--json"], {
+      env: { ...process.env, WB_DISPATCHER: "dispatcher" },
+    });
+    assert.equal(next.status, 0, next.stderr);
+    assert.equal(JSON.parse(next.stdout).claim_round, child.claim_round + 1);
+    runWbJson(["question", ...args, "--entity", "child-2"]);
+    const answer = runWbJson(["answer", ...args, "--entity", "owner"]);
+    assert.equal(answer.assignee, "dispatcher");
+    assert.equal(answer.affinity, "child-2");
+    for (const command of [
+      ["create", "--title", "Bad pin"], ["amend", "--task", task.id],
+    ]) {
+      const refusal = runWb([...command, "--bucket", bucket, "--entity", "owner", "--assignee", "child-1"]);
+      assert.equal(refusal.status, 1);
+      assert.match(refusal.stderr, /assign to dispatcher "dispatcher"/);
+    }
+    const before = fs.readFileSync(entityPath, "utf8");
+    assert.equal(runWb(["claim", ...args, "--entity", "child-1", "--dispatcher", "different"]).status, 3);
+    assert.equal(fs.readFileSync(entityPath, "utf8"), before);
+    runWbJson(["claim", ...args, "--entity", "child-3", "--dispatcher", "dispatcher"]);
+    runWbJson(["review", ...args, "--entity", "child-3"]);
+    const reopened = runWbJson(["feedback", ...args, "--entity", "owner", "--reopen"]);
+    assert.equal(reopened.assignee, "");
+    assert.equal(reopened.affinity, "");
+    assert.equal(runWbJson(["fsck", "--bucket", bucket]).unresolved, 0);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("release requires a structured checkpoint and only the elected claimant or recorded dispatcher", () => {
+  const bucket = makeTempBucket();
+  try {
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Release"]);
+    const args = ["--bucket", bucket, "--task", task.id];
+    runWbJson(["claim", ...args, "--entity", "child", "--dispatcher", "dispatcher"]);
+    const before = fs.readFileSync(task.task_path, "utf8");
+    const eventsDir = path.join(task.path, "events");
+    const events = fs.readdirSync(eventsDir);
+    for (const actor of ["owner", "stranger", "dispatcher-fake"]) {
+      assert.equal(runWb(["release", ...args, "--entity", actor, "--notes", "Done"]).status, 3);
+    }
+    for (const flags of [[], ["-m", "Unstructured"], ["--notes", " "], ["--notes", "State", "--pid", "0"]]) {
+      assert.equal(runWb(["release", ...args, "--entity", "child", ...flags]).status, 1);
+    }
+    assert.equal(fs.readFileSync(task.task_path, "utf8"), before);
+    assert.deepEqual(fs.readdirSync(eventsDir), events);
+    const checkpoint = runWbJson(["checkpoint", ...args, "--entity", "child",
+      "--files-touched", "a,b", "--files-touched", "c", "--resources", "helper,tempdir",
+      "--pid", String(process.pid), "--host", os.hostname(), "--notes", "Stop helper before resuming"]);
+    assert.equal(checkpoint.task_updated, false);
+    const manifest = parseFrontmatter(fs.readFileSync(path.join(eventsDir, checkpoint.event), "utf8")).data;
+    assert.deepEqual(manifest.files_touched, ["a", "b", "c"]);
+    assert.deepEqual(manifest.resources, ["helper", "tempdir"]);
+    assert.equal(manifest.pid, process.pid);
+    assert.equal(manifest.host, os.hostname());
+    assert.equal(manifest.notes, "Stop helper before resuming");
+    const rendered = runWbJson(["render", ...args, "--latest-event"]);
+    assert.deepEqual(rendered.events[0].resources, manifest.resources);
+    assert.equal(rendered.latest_event.notes, manifest.notes);
+    assert.match(runWb(["render", ...args, "--latest-event"]).stdout, /Stop helper before resuming/);
+    const released = runWbJson(["release", ...args, "--entity", "dispatcher", "--notes", "No live resources"]);
+    assert.equal(released.status, "pending");
+    assert.equal(released.assignee, "dispatcher");
+    assert.equal(released.affinity, "child");
+    assert.equal(released.claimed_by, "");
+    assert.equal(released.claim_round, 2);
+    const state = parseFrontmatter(fs.readFileSync(path.join(eventsDir, released.event), "utf8")).data;
+    assert.equal(state.snapshot_version, 1);
+    assert.equal(state.notes, "No live resources");
+    assert.equal(runWbJson(["entity", "register", "--bucket", bucket, "--entity", "child"]).claimed_task, "");
+    runWbJson(["claim", ...args, "--entity", "replacement", "--dispatcher", "dispatcher"]);
+    runWbJson(["reset", ...args, "--entity", "owner"]);
+    const standalone = runWbJson(["claim", ...args, "--entity", "standalone"]);
+    const selfRelease = runWbJson(["release", ...args, "--entity", "standalone", "--notes", "Clean"]);
+    assert.equal(selfRelease.assignee, "standalone");
+    assert.equal(selfRelease.affinity, "");
+    assert.equal(selfRelease.claim_round, standalone.claim_round + 1);
+    assert.equal(runWbJson(["fsck", "--bucket", bucket]).unresolved, 0);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("claim rechecks the recorded dispatcher relationship after settle", async () => {
+  const bucket = makeTempBucket();
+  let claiming;
+  try {
+    setBucketConfig(bucket, { claim_settle_ms: 1000 });
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Relationship settle", "--assignee", "dispatcher"]);
+    claiming = runWbAsync(["claim", "--bucket", bucket, "--entity", "child", "--dispatcher", "dispatcher", "--task", task.id]);
+    const eventsDir = path.join(task.path, "events");
+    const deadline = Date.now() + 2000;
+    while (!fs.readdirSync(eventsDir).some((name) => name.endsWith("-child-claimed.md"))) {
+      assert.ok(Date.now() < deadline, "claim intent did not appear");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const entityPath = path.join(bucket, "entities", "child.md");
+    const { data } = parseFrontmatter(fs.readFileSync(entityPath, "utf8"));
+    fs.writeFileSync(entityPath, `${serializeFrontmatter({ ...data, dispatcher: "different" })}\n`);
+    const result = await claiming;
+    assert.equal(result.status, 2, result.stderr);
+    assert.equal(runWbJson(["render", "--bucket", bucket, "--task", task.id]).status, "pending");
+    assert.equal(fs.readdirSync(eventsDir).some((name) => name.endsWith("-claim-committed.md")), false);
+  } finally {
+    if (claiming) await claiming;
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("run preserves argv, logs output, checkpoints success/failure and clears runtime without ending the identity", async () => {
+  const bucket = makeTempBucket();
+  try {
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Run"]);
+    const args = ["--bucket", bucket, "--task", task.id, "--entity", "executor"];
+    runWbJson(["claim", ...args]);
+    const logfile = path.join(bucket, "output.log");
+    const code = 'console.log(JSON.stringify(process.argv.slice(1))); console.error("stderr"); process.exit(7)';
+    const result = await runWbAsync(["run", ...args, "--log", logfile, "--", process.execPath, "-e", code, "--", "a b", "--json", "*"]);
+    assert.equal(result.status, 7, result.stderr);
+    assert.equal(result.stdout, "");
+    assert.equal(fs.readFileSync(logfile, "utf8"), '["a b","--json","*"]\nstderr\n');
+    const checkpoints = fs.readdirSync(path.join(task.path, "events")).filter((name) => name.includes("-checkpoint"))
+      .map((name) => parseFrontmatter(fs.readFileSync(path.join(task.path, "events", name), "utf8")).data);
+    assert.deepEqual(checkpoints.map((event) => event.phase), ["start", "exit"]);
+    assert.equal(checkpoints[1].exit_code, 7);
+    assert.equal(checkpoints[1].log, logfile);
+    assert.equal(checkpoints[1].cmd.at(-2), "--json");
+    assert.ok(checkpoints[1].child_pid > 0);
+    assert.deepEqual(checkpoints[0].resources, []);
+    const entity = runWbJson(["entity", "list", "--bucket", bucket, "--all"]).entities.find((entry) => entry.entity_id === "executor");
+    assert.equal(entity.running, null);
+    assert.equal(entity.ended_at, "");
+    assert.equal(entity.claimed_task, task.id);
+    assert.equal((await runWbAsync(["run", ...args, "--", "work-bucket-nonexistent-executable"])).status, 127);
+    assert.equal((await runWbAsync(["run", ...args, "--", process.execPath, "-e", "process.exit(0)"])).status, 0);
+    assert.equal(runWb(["run", ...args]).status, 1);
+    assert.equal(runWb(["run", "--bucket", bucket, "--task", task.id, "--entity", "stranger", "--", process.execPath]).status, 3);
+    runWbJson(["review", ...args]);
+    assert.equal(runWbJson(["fsck", "--bucket", bucket]).unresolved, 0);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("run heartbeats beyond TTL, exposes canonical status and propagates child signals", async () => {
+  const bucket = makeTempBucket();
+  try {
+    setBucketConfig(bucket, { default_ttl_seconds: 1 });
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Heartbeat"]);
+    const args = ["--bucket", bucket, "--task", task.id, "--entity", "executor"];
+    runWbJson(["claim", ...args]);
+    const running = runWbAsync(["run", ...args, "--", process.execPath, "-e", "setTimeout(() => process.exit(0), 2400)"]);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1400));
+      const status = runWbJson(["status", "--bucket", bucket, "--owner", "owner"]);
+      assert.equal(status.tasks[0].status, "in-progress");
+      assert.equal(status.tasks[0].running.host, os.hostname());
+      assert.ok(status.tasks[0].running.pid > 0);
+      assert.deepEqual(status.tasks[0].running.cmd.slice(0, 2), [process.execPath, "-e"]);
+      assert.ok(status.tasks[0].running.age_seconds >= 1);
+      assert.ok(status.tasks[0].heartbeat_age_seconds < 1);
+      assert.deepEqual(status.tasks[0].alerts, []);
+      assert.deepEqual(status.tasks[0].waiting_on, { role: "executor", entity_id: "executor" });
+      const refreshed = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "executor"]);
+      assert.equal(refreshed.running.pid, status.tasks[0].running.pid);
+      assert.equal(refreshed.claimed_task, task.id);
+      const watch = await runWbAsync(["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--timeout", "0.4", "--poll-ms", "20"]);
+      assert.equal(watch.status, 124, watch.stderr);
+    } finally { assert.equal((await running).status, 0); }
+    const signal = await runWbAsync(["run", ...args, "--", process.execPath, "-e", 'process.kill(process.pid, "SIGTERM")']);
+    assert.equal(signal.status, 143);
+    const checks = fs.readdirSync(path.join(task.path, "events")).filter((name) => name.includes("-checkpoint"));
+    const last = parseFrontmatter(fs.readFileSync(path.join(task.path, "events", checks.at(-1)), "utf8")).data;
+    assert.equal(last.signal, "SIGTERM");
+    assert.equal(last.exit_code, 143);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("run forwards wrapper termination, refuses overlapping wrappers and cleans up its child", async () => {
+  const bucket = makeTempBucket();
+  let wrapper;
+  let finished;
+  try {
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Signal"]);
+    const args = ["--bucket", bucket, "--task", task.id, "--entity", "executor"];
+    runWbJson(["claim", ...args]);
+    wrapper = spawn(process.execPath, [WB_PATH, "run", ...args, "--", process.execPath, "-e",
+      'console.log(process.pid); setInterval(() => {}, 1000)'], { stdio: ["ignore", "pipe", "pipe"] });
+    finished = new Promise((resolve) => wrapper.once("close", resolve));
+    const childPid = Number(await new Promise((resolve) => wrapper.stdout.once("data", (data) => resolve(String(data).trim()))));
+    assert.equal(runWb(["run", ...args, "--", process.execPath, "-e", "process.exit(99)"]).status, 3);
+    wrapper.kill("SIGTERM");
+    assert.equal(await finished, 143);
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
+    const entity = parseFrontmatter(fs.readFileSync(path.join(bucket, "entities", "executor.md"), "utf8")).data;
+    assert.equal(entity.running, "");
+  } finally {
+    wrapper?.kill("SIGTERM");
+    if (finished) await finished;
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("a crashed run wrapper becomes abandoned immediately and preserves its start checkpoint", async () => {
+  const bucket = makeTempBucket();
+  try {
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Crash"]);
+    const args = ["--bucket", bucket, "--task", task.id, "--entity", "executor"];
+    runWbJson(["claim", ...args]);
+    const result = await runWbAsync(["run", ...args, "--", process.execPath, "-e",
+      'process.kill(process.ppid, "SIGKILL"); process.exit(0)']);
+    assert.equal(result.status, null);
+    const status = runWbJson(["status", "--bucket", bucket]);
+    assert.equal(status.tasks[0].alerts[0].type, "abandoned");
+    assert.equal(status.tasks[0].alerts[0].reason, "wrapper_pid_gone");
+    assert.equal(status.tasks[0].status, "in-progress");
+    const checkpoint = runWbJson(["render", "--bucket", bucket, "--task", task.id, "--latest-event"]).events[0];
+    assert.equal(checkpoint.phase, "start");
+    assert.ok(status.tasks[0].running.child_pid > 0);
+    assert.deepEqual(checkpoint.resources, []);
+    const wake = runWbJson(["watch", "--bucket", bucket, "--entity", "owner", "--owner-only"]);
+    assert.equal(wake.reason, "abandoned");
+    runWbJson(["reset", "--bucket", bucket, "--task", task.id, "--entity", "owner"]);
+    runWbJson(["claim", ...args]);
+    assert.deepEqual(runWbJson(["status", "--bucket", bucket]).tasks[0].alerts, []);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("owner advisories escalate stale to abandoned once per level without task mutation", async () => {
+  const bucket = makeTempBucket();
+  try {
+    setBucketConfig(bucket, { default_ttl_seconds: 1 });
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Escalate"]);
+    runWbJson(["claim", "--bucket", bucket, "--task", task.id, "--entity", "executor"]);
+    const entityPath = path.join(bucket, "entities", "executor.md");
+    const { data } = parseFrontmatter(fs.readFileSync(entityPath, "utf8"));
+    data.updated_at = new Date(Date.now() - 1500).toISOString();
+    fs.writeFileSync(entityPath, `${serializeFrontmatter(data)}\n`);
+    const before = fs.readFileSync(task.task_path, "utf8");
+    const args = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--poll-ms", "20", "--json"];
+    const stale = JSON.parse(runWb(args).stdout);
+    assert.equal(stale.reason, "stale");
+    assert.equal(stale.stale_tasks.length, 1);
+    const escalation = await runWbAsync([...args, "--timeout", "3"]);
+    assert.equal(escalation.status, 0, escalation.stderr);
+    assert.equal(JSON.parse(escalation.stdout).reason, "abandoned");
+    assert.equal(runWb([...args, "--timeout", "0.1"]).status, 124);
+    assert.equal(fs.readFileSync(task.task_path, "utf8"), before);
+    const status = runWbJson(["status", "--bucket", bucket]);
+    assert.equal(status.tasks[0].alerts[0].type, "abandoned");
+    const ownerPath = path.join(bucket, "entities", "owner.md");
+    assert.equal(parseFrontmatter(fs.readFileSync(ownerPath, "utf8")).data.stale_task_seen.length, 1);
+    runWbJson(["cancel", "--bucket", bucket, "--task", task.id, "--entity", "owner"]);
+    assert.deepEqual(parseFrontmatter(fs.readFileSync(ownerPath, "utf8")).data.stale_task_seen, []);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("pool and registered task watches heartbeat at TTL/4 without dropping runtime or relationships", async () => {
+  const bucket = makeTempBucket();
+  let runningWatch;
+  try {
+    setBucketConfig(bucket, { default_ttl_seconds: 1 });
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Task watch"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "executor", "--dispatcher", "dispatcher", "--task", task.id]);
+    runningWatch = runWbAsync(["watch", "--bucket", bucket, "--entity", "executor", "--task", task.id, "--timeout", "2"]);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+      const status = runWbJson(["status", "--bucket", bucket]).tasks[0];
+      assert.deepEqual(status.alerts, []);
+      assert.ok(status.heartbeat_age_seconds < 1);
+      const entity = parseFrontmatter(fs.readFileSync(path.join(bucket, "entities", "executor.md"), "utf8")).data;
+      assert.equal(entity.dispatcher, "dispatcher");
+      assert.equal(entity.claimed_task, task.id);
+    } finally { assert.equal((await runningWatch).status, 124); }
+    const entityPath = path.join(bucket, "entities", "dispatcher.md");
+    const registered = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "dispatcher", "--ttl", "1"]);
+    fs.writeFileSync(entityPath, `${serializeFrontmatter({
+      ...registered, running: { pid: process.pid, host: os.hostname(), cmd: ["fixture"], started_at: new Date().toISOString() },
+    })}\n`);
+    runningWatch = runWbAsync(["watch", "--bucket", bucket, "--entity", "dispatcher", "--timeout", "2"]);
+    try {
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+      const entity = parseFrontmatter(fs.readFileSync(entityPath, "utf8")).data;
+      assert.ok(Date.now() - Date.parse(entity.updated_at) < 1000);
+      assert.equal(entity.running.pid, process.pid);
+      assert.equal(entity.ttl_seconds, 1);
+    } finally { assert.equal((await runningWatch).status, 124); }
+  } finally {
+    if (runningWatch) await runningWatch;
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("liveness covers missing, ended, same-host dead pid and remote pid fallback with per-task TTL", () => {
+  const bucket = makeTempBucket();
+  try {
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Liveness", "--ttl-seconds", "20"]);
+    const args = ["--bucket", bucket, "--task", task.id];
+    runWbJson(["claim", ...args, "--entity", "executor"]);
+    const entityPath = path.join(bucket, "entities", "executor.md");
+    const { data } = parseFrontmatter(fs.readFileSync(entityPath, "utf8"));
+    const alert = (updates) => {
+      fs.writeFileSync(entityPath, `${serializeFrontmatter({ ...data, ...updates })}\n`);
+      return runWbJson(["status", "--bucket", bucket]).tasks[0].alerts;
+    };
+    assert.deepEqual(alert({ updated_at: new Date(Date.now() - 10_000).toISOString(), ttl_seconds: 1 }), []);
+    assert.equal(alert({ updated_at: new Date(Date.now() - 21_000).toISOString() })[0].type, "stale");
+    assert.equal(alert({ updated_at: new Date(Date.now() - 61_000).toISOString() })[0].type, "abandoned");
+    assert.equal(alert({ ended_at: new Date().toISOString() })[0].reason, "entity_ended");
+    // A reaped local fixture PID is known dead without probing unrelated processes.
+    const fixture = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
+    assert.equal(alert({ running: { pid: fixture.pid, host: os.hostname() } })[0].reason, "wrapper_pid_gone");
+    assert.deepEqual(alert({ running: { pid: fixture.pid, host: "remote-fixture" } }), []);
+    assert.deepEqual(alert({ running: { pid: process.pid, host: os.hostname() } }), []);
+    const saved = fs.readFileSync(entityPath, "utf8");
+    fs.unlinkSync(entityPath);
+    const { data: taskData, body } = parseFrontmatter(fs.readFileSync(task.task_path, "utf8"));
+    taskData.updated_at = new Date(Date.now() - 21_000).toISOString();
+    fs.writeFileSync(task.task_path, `${serializeFrontmatter(taskData)}\n${body}`);
+    const missing = runWbJson(["status", "--bucket", bucket]).tasks[0].alerts[0];
+    assert.equal(missing.type, "stale");
+    assert.equal(missing.heartbeat.missing, true);
+    fs.writeFileSync(entityPath, saved);
+    runWbJson(["reset", ...args, "--entity", "owner"]);
+    const amended = runWbJson(["amend", ...args, "--entity", "owner", "--ttl-seconds", "40"]);
+    assert.equal(parseFrontmatter(fs.readFileSync(amended.task_path, "utf8")).data.ttl_seconds, 40);
+    for (const ttl of ["0", "-1", "1.5", "bad"]) {
+      assert.equal(runWb(["create", "--bucket", bucket, "--entity", "owner", "--title", "Bad TTL", "--ttl-seconds", ttl]).status, 1);
+      assert.equal(runWb(["amend", ...args, "--entity", "owner", "--ttl-seconds", ttl]).status, 1);
+    }
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("pending alerts use pending residence, dependency eligibility, pin health, exclusions and pause", async () => {
+  const bucket = makeTempBucket();
+  try {
+    setBucketConfig(bucket, { pinned_idle_seconds: 1, unclaimed_seconds: 1 });
+    const pin = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Missing pin", "--assignee", "dispatcher"]);
+    const open = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Unclaimed"]);
+    const dep = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Dependency", "--draft"]);
+    const blocked = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Dependency wait", "--depends-on", dep.id]);
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    runWbJson(["amend", "--bucket", bucket, "--task", open.id, "--entity", "owner", "--ttl-seconds", "60"]);
+    const status = runWbJson(["status", "--bucket", bucket]);
+    assert.equal(status.tasks.find((task) => task.id === open.id).alerts[0].type, "unclaimed");
+    assert.equal(status.tasks.find((task) => task.id === pin.id).alerts[0].type, "pinned_idle");
+    assert.deepEqual(status.tasks.find((task) => task.id === blocked.id).alerts, []);
+    const args = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--json"];
+    const wake = JSON.parse(runWb(args).stdout);
+    assert.equal(wake.unclaimed_tasks[0].id, open.id);
+    assert.equal(wake.pinned_idle_tasks[0].id, pin.id);
+    assert.equal(runWb([...args, "--timeout", "0.1"]).status, 124);
+    const late = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Later"]);
+    const timed = await runWbAsync([...args, "--timeout", "3", "--poll-ms", "20"]);
+    assert.equal(timed.status, 0, timed.stderr);
+    assert.equal(JSON.parse(timed.stdout).unclaimed_tasks[0].id, late.id);
+    runWbJson(["entity", "register", "--bucket", bucket, "--entity", "dispatcher"]);
+    assert.deepEqual(runWbJson(["status", "--bucket", bucket]).tasks.find((task) => task.id === pin.id).alerts, []);
+    const dispatcherPath = path.join(bucket, "entities", "dispatcher.md");
+    const { data } = parseFrontmatter(fs.readFileSync(dispatcherPath, "utf8"));
+    fs.writeFileSync(dispatcherPath, `${serializeFrontmatter({ ...data, updated_at: new Date(Date.now() - 601_000).toISOString() })}\n`);
+    assert.equal(runWbJson(["status", "--bucket", bucket]).tasks.find((task) => task.id === pin.id).alerts[0].type, "pinned_idle");
+    const fresh = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Paused"]);
+    runWbJson(["bucket", "pause", "--bucket", bucket]);
+    await new Promise((resolve) => setTimeout(resolve, 1100));
+    assert.deepEqual(runWbJson(["status", "--bucket", bucket]).tasks.find((task) => task.id === fresh.id).alerts, []);
+    assert.equal(runWb([...args, "--exclude-task", `${pin.id},${open.id},${late.id}`, "--timeout", "0.1"]).status, 124);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
+test("status is read-only, normalized, owner-filtered and warns about local sync artifacts", () => {
+  const bucket = makeTempBucket();
+  const absent = path.join(bucket, "absent");
+  try {
+    assert.deepEqual(runWbJson(["status", "--bucket", absent]).tasks, []);
+    assert.equal(fs.existsSync(absent), false);
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Visible"]);
+    runWbJson(["create", "--bucket", bucket, "--entity", "other", "--title", "Other"]);
+    const done = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Done"]);
+    runWbJson(["complete", "--bucket", bucket, "--entity", "owner", "--task", done.id]);
+    fs.writeFileSync(path.join(bucket, "messages", "notice.sync-conflict-fixture.md"), "conflict");
+    const files = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) =>
+      entry.isDirectory() ? files(path.join(dir, entry.name)) : [[path.join(dir, entry.name), fs.readFileSync(path.join(dir, entry.name), "utf8")]]);
+    const before = files(bucket);
+    const status = runWbJson(["status", "--bucket", bucket, "--owner", "owner"]);
+    assert.equal(status.count, 1);
+    for (const [key, value] of Object.entries(task)) {
+      if (key !== "created_event") assert.deepEqual(status.tasks[0][key], value, key);
+    }
+    assert.deepEqual(status.tasks[0].waiting_on, { role: "executor", entity_id: "" });
+    assert.equal(status.warnings.length, 1);
+    assert.equal(status.sync_conflicts.length, 1);
+    assert.match(runWb(["status", "--bucket", bucket]).stdout, /waiting_on=executor:pool/);
+    assert.deepEqual(files(bucket), before);
+    const args = ["--bucket", bucket, "--task", task.id, "--entity", "executor"];
+    runWbJson(["claim", ...args]);
+    runWbJson(["question", ...args]);
+    assert.deepEqual(runWbJson(["status", "--bucket", bucket, "--owner", "owner"]).tasks[0].waiting_on,
+      { role: "owner", entity_id: "owner" });
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
+
 test("transition authority covers every intent, lifecycle state and participant role", () => {
   const bucket = makeTempBucket();
   const states = ["draft", "ready", "pending", "in-progress", "blocked", "review", "complete", "cancelled"];
@@ -90,6 +508,8 @@ test("transition authority covers every intent, lifecycle state and participant 
     feedback: { from: ["review"], actor: "owner", to: "pending" },
     answer: { from: ["blocked"], actor: "owner", to: "pending" },
     reset: { from: ["in-progress"], actor: "owner", to: "pending" },
+    release: { from: ["in-progress"], actor: "execution", to: "pending", flags: ["--notes", "Safe to resume"] },
+    checkpoint: { from: nonterminal, actor: "participant", flags: ["--notes", "State inspected"] },
     complete: { from: nonterminal, actor: "owner", to: "complete" },
     cancel: { from: nonterminal, actor: "owner", to: "cancelled" },
     log: { from: nonterminal, actor: "participant" },
@@ -119,6 +539,7 @@ test("transition authority covers every intent, lifecycle state and participant 
           const result = runWb([...command, "--bucket", bucket, "--task", created.id,
             "--entity", actor, ...(rule.flags || []), "--json"]);
           const permitted = rule.actor === "eligible" || actor === rule.actor ||
+            (rule.actor === "execution" && claimed && ["executor", "dispatcher"].includes(actor)) ||
             (rule.actor === "participant" && (actor === "owner" || (claimed && ["executor", "dispatcher"].includes(actor))));
           const allowed = rule.from.includes(state) && permitted;
           const label = `${intent}/${state}/${actor}: ${result.stderr}`;
@@ -130,10 +551,10 @@ test("transition authority covers every intent, lifecycle state and participant 
             const output = JSON.parse(result.stdout);
             assert.equal(output.status, rule.to || state, label);
             assert.equal(output.owner, "owner", label);
-            if (["complete", "cancel", "reset", "feedback", "answer"].includes(intent)) {
+            if (["complete", "cancel", "reset", "feedback", "answer", "release"].includes(intent)) {
               assert.equal(output.claimed_by, "", label);
             }
-            if (["log", "note", "amend"].includes(intent)) {
+            if (["log", "note", "amend", "checkpoint"].includes(intent)) {
               assert.equal(output.task_updated, false, label);
               assert.equal(fs.readFileSync(created.task_path, "utf8"), before, label);
             }
@@ -274,7 +695,7 @@ test("help examples execute using their documented flags in appropriate task sta
       const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Example fixture",
         ...(name === "promote" ? ["--draft"] : [])]);
       const args = ["--bucket", bucket, "--task", task.id];
-      if (["review", "question", "feedback", "answer", "reset", "accept-amends"].includes(name)) {
+      if (["review", "question", "feedback", "answer", "reset", "release", "checkpoint", "run", "accept-amends"].includes(name)) {
         runWbJson(["claim", ...args, "--entity", "executor"]);
       }
       if (name === "feedback") runWbJson(["review", ...args, "--entity", "executor"]);
@@ -340,7 +761,7 @@ test("TaskSummary fields match exactly across create/list/watch/claim/transition
   const fields = [
     "id", "title", "stage", "status", "priority", "tags", "owner", "assignee", "affinity", "claimed_by",
     "parent", "depends_on", "revision", "claim_round", "outcome", "last_amend_seen", "instructions_seen",
-    "state_seq", "updated_by", "updated_at", "path", "task_path", "latest_event",
+    "ttl_seconds", "state_seq", "updated_by", "updated_at", "path", "task_path", "latest_event",
   ].sort();
   const pick = (summary) => {
     for (const field of fields) assert.ok(Object.hasOwn(summary, field), field);
@@ -543,6 +964,7 @@ test("bucket config chooses deployment defaults and rejects zero/invalid setting
     fs.unlinkSync(path.join(bucket, "bucket.md"));
     assert.deepEqual(readBucketConfig(bucket), {
       sync: "shared", claim_settle_ms: 2000, default_ttl_seconds: 300, msg_coalesce_ms: 500,
+      abandoned_ttl_multiplier: 3, pinned_idle_seconds: 600, unclaimed_seconds: 600,
     });
     for (const [sync, settle] of [["local", 250], ["shared", 2000], ["cloud", 2000]]) {
       fs.writeFileSync(path.join(bucket, "bucket.md"), `${serializeFrontmatter({ sync })}\n`);
@@ -551,6 +973,8 @@ test("bucket config chooses deployment defaults and rejects zero/invalid setting
     for (const data of [
       { sync: "invalid" }, { claim_settle_ms: 0 }, { claim_settle_ms: -1 },
       { claim_settle_ms: "1ms" }, { default_ttl_seconds: 0 }, { msg_coalesce_ms: -1 },
+      { abandoned_ttl_multiplier: 1 }, { abandoned_ttl_multiplier: "bad" },
+      { pinned_idle_seconds: 0 }, { unclaimed_seconds: -1 },
     ]) {
       setBucketConfig(bucket, data);
       const result = runWb(["create", "--bucket", bucket, "--entity", "owner", "--title", "Invalid config"]);
@@ -1165,24 +1589,26 @@ test("claim surfaces pre-claim/unaccepted amends and feedback; accept-amends mer
 test("owner watches signal stale registered executors once per round/heartbeat and preserve delivery cursors", () => {
   const bucket = makeTempBucket();
   try {
+    setBucketConfig(bucket, { default_ttl_seconds: 10 });
     runWbJson(["entity", "register", "--bucket", bucket, "--entity", "worker", "--ttl", "10"]);
     const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Stalled"]);
     runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.id]);
     const entityPath = path.join(bucket, "entities", "worker.md");
-    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, 'updated_at: "2000-01-01T00:00:00Z"'));
+    const firstStall = new Date(Date.now() - 20_000).toISOString();
+    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, `updated_at: "${firstStall}"`));
     const args = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--poll-ms", "50"];
     const stale = runWbJson(args);
     assert.equal(stale.reason, "stale");
     assert.equal(stale.stale_tasks.length, 1);
     assert.equal(stale.stale_tasks[0].id, created.id);
     assert.equal(stale.stale_tasks[0].heartbeat.ttl_seconds, 10);
-    assert.equal(stale.stale_tasks[0].heartbeat.updated_at, "2000-01-01T00:00:00Z");
+    assert.equal(stale.stale_tasks[0].heartbeat.updated_at, firstStall);
     assert.equal(runWb([...args, "--timeout", "0.1"]).status, 124);
     const entity = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "owner"]);
     assert.equal(entity.stale_task_seen.length, 1);
     runWbJson(["entity", "register", "--bucket", bucket, "--entity", "worker"]);
     assert.equal(runWb([...args, "--timeout", "0.1"]).status, 124);
-    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, 'updated_at: "2000-01-01T00:00:01Z"'));
+    fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, `updated_at: "${new Date(Date.now() - 20_000).toISOString()}"`));
     assert.equal(runWbJson(args).reason, "stale");
     assert.equal(runWb(["watch", "--bucket", bucket, "--entity", "other", "--owner-only", "--timeout", "0.1"]).status, 124);
   } finally {

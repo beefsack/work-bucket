@@ -35,6 +35,12 @@ const common = {
   help: boolean("Show command help", { short: "h" }),
 };
 const event = { ...taskWriter, ...body };
+const checkpoint = {
+  "files-touched": list("Files changed or inspected"),
+  resources: list("Processes, helpers, temporary directories or other resources"),
+  pid: string("Resource process ID"), host: string("Resource host"),
+  notes: string("Checkpoint state and cleanup/resume notes"),
+};
 
 export const COMMANDS = {
   create: { description: "Create a task owned by the acting entity",
@@ -45,13 +51,13 @@ export const COMMANDS = {
     tag: filters.tag, assignee: string("Optional target entity"), parent: string("Parent task ID"),
     "depends-on": list("Dependency task IDs"), workspace: string("Workspace for the default template"),
     files: list("Relevant files"), description: string("Default-template description"),
-    ac: list("Acceptance criteria"),
+    ac: list("Acceptance criteria"), "ttl-seconds": string("Task liveness TTL override (positive seconds)"),
     slug: string("Override task slug"), backlog: boolean("Create a draft"), draft: boolean("Create a draft"),
     status: string("Initial draft|ready|pending status"),
   } },
   claim: { description: "Claim eligible work through a settled election",
     example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>"], options: {
-    ...taskWriter, ...filters,
+    ...taskWriter, ...filters, dispatcher: string("Recorded dispatcher; defaults to WB_DISPATCHER"),
   } },
   promote: { description: "Promote draft/ready work toward pending",
     example: ["--bucket", "<bucket>", "--entity", "owner", "--task", "<task>", "--status", "ready"], options: {
@@ -64,7 +70,7 @@ export const COMMANDS = {
   amend: { description: "Append an owner correction; refine unclaimed metadata",
     example: ["--bucket", "<bucket>", "--entity", "owner", "--task", "<task>", "-m", "Additional requirement"], options: {
     ...event, assignee: string("Set assignee on unclaimed draft/ready/pending tasks; empty clears"),
-    ...dependencies,
+    ...dependencies, "ttl-seconds": string("Set task liveness TTL on unclaimed work"),
   } },
   review: { description: "Submit the claimant's work for owner review",
     example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "-m", "Evidence and unverified items"], options: { ...event } },
@@ -80,6 +86,18 @@ export const COMMANDS = {
   } },
   reset: { description: "Owner recovery: clear an in-progress claim and pin",
     example: ["--bucket", "<bucket>", "--entity", "owner", "--task", "<task>", "-m", "Recovery inspected"], options: { ...event } },
+  release: { description: "Claimant or recorded dispatcher returns work with a checkpoint",
+    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "--notes", "No resources remain; resume from current tree"],
+    options: { ...event, ...checkpoint } },
+  checkpoint: { description: "Record structured work and resource state",
+    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "--notes", "Tree inspected"],
+    options: { ...event, ...checkpoint } },
+  run: { description: "Run a command with process-backed heartbeats and checkpoints",
+    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "--", "node", "-e", "process.exit(0)"],
+    options: { ...taskWriter, log: string("Redirect command stdout/stderr to this file (append)") } },
+  status: { description: "Read active tasks, waiting parties, runtime and advisory alerts",
+    example: ["--bucket", "<bucket>", "--owner", "owner", "--json"],
+    options: { ...bucket, owner: string("Filter task owner") } },
   complete: { description: "Owner closure of non-terminal work",
     example: ["--bucket", "<bucket>", "--entity", "owner", "--task", "<task>", "--outcome", "pass"], options: {
     ...event, outcome: string("pass|partial|fail|abandoned"),
@@ -159,7 +177,9 @@ export function parseCommand(name, args) {
   const options = Object.fromEntries(Object.entries({ ...COMMANDS[name].options, ...common })
     .map(([key, { description, ...option }]) => [key, option]));
   try {
-    const parsed = parseArgs({ args, options, strict: true, allowPositionals: false });
+    const separator = name === "run" ? args.indexOf("--") : -1;
+    const parsed = parseArgs({ args: separator < 0 ? args : args.slice(0, separator), options, strict: true, allowPositionals: false });
+    if (name === "run") parsed.command = separator < 0 ? [] : args.slice(separator + 1);
     const values = parsed.values;
     if ([values.message !== undefined, values["body-file"] !== undefined, values.stdin].filter(Boolean).length > 1) {
       throw new CliError("Use only one of -m/--message, --body-file or --stdin.");
@@ -181,7 +201,7 @@ export function printCommandHelp(name = "") {
     }
   } else {
     const definition = COMMANDS[name];
-    console.log(`Usage: wb.mjs ${name} [options]\n${definition.description}`);
+    console.log(`Usage: wb.mjs ${name} [options]${name === "run" ? " -- <command> [args...]" : ""}\n${definition.description}`);
     for (const [flag, option] of Object.entries({ ...definition.options, ...common })) {
       const spelling = `${option.short ? `-${option.short}, ` : ""}--${flag}${option.type === "string" ? " <value>" : ""}`;
       console.log(`  ${spelling.padEnd(32)} ${option.description}${option.type === "string" && option.default !== undefined ? ` (default: ${option.default})` : ""}`);
@@ -190,4 +210,5 @@ export function printCommandHelp(name = "") {
       /[\s*]/.test(arg) ? JSON.stringify(arg) : arg).join(" ")}`);
   }
   console.log("\nExit codes: 0 ok; 1 usage/validation/not-found; 2 no work/not eligible; 3 conflict/race/permission; 4 paused; 124 timeout; 130 signal.");
+  if (name === "run") console.log("run propagates the command exit code; spawn failures: 126/127; termination: 128 + signal number.");
 }

@@ -55,10 +55,8 @@ Check the documented test entry and command references against the implementatio
 - Body input is message/file/stdin, with mutually exclusive sources. Tags use
   only repeatable/comma-split `--tag`; all list-valued flags share that parsing.
   Task summaries are normalized at the top level, without nested task aliases.
-- `--check-ac` was removed with generic brief mutation so it cannot bypass
-  transition authority. Structured verdicts and owner acceptance remain in the
-  review-verdict work. Amendment incorporation is now the `accept-amends` intent;
-  receipt/instruction gating remains in the delivery work.
+- `--check-ac` is removed. Reviews record verdicts; `complete --accept-ac` applies
+  them. Amendment incorporation uses `accept-amends`.
 - Ownerless legacy records remain readable and claimable but confer no owner
   authority. Establish explicit ownership before owner transitions.
 - Rework and voluntary release pin the recorded dispatcher and retain the old
@@ -86,6 +84,35 @@ Check the documented test entry and command references against the implementatio
   event ages, waiting role and current alerts independent of delivered cursors.
   Task summaries expose a nullable TTL override; render/watch expose structured
   checkpoint fields so recovery does not depend on reading raw frontmatter.
+- Review verdicts are immutable executor claims. Owner acceptance checks only
+  passing criteria and annotates fail/not-run. All-pass derives pass, all-fail
+  derives fail, otherwise partial; a differing proposal requires an explicit
+  outcome on close. Plain complete retains its existing behavior.
+- Direct notices require a known recipient's `delivery: watch`; `--force` records
+  a human override. Unknown recipients remain permitted. New one-shot claimants
+  use none, pool/owner watches use watch, and task-only watches preserve delivery.
+  Missing legacy declarations derive from mode; ending an identity sets none.
+- Claim and acknowledgement events retain sorted normalized instruction bodies
+  and their hash, excluding frontmatter. Only the in-progress claimant can
+  acknowledge; unchanged versions are read-only no-ops. Acknowledgement advances
+  state sequence without changing the brief revision.
+- Review/question require every amendment receipt and the current instruction
+  hash. Run checks the hash before opening a log or spawning; it never kills an
+  already-running command after a rule edit. An unclaimed non-executing task with
+  no selected rules needs no initial acknowledgement. Other non-executing tasks
+  return through the appropriate lifecycle intent and claim to refresh rules.
+- Amendment receipts incorporate every outstanding non-ignored body and log
+  accepted/ignored filenames plus the ignore reason in the same state event.
+  All-ignored receipts advance the cursor without changing the body or revision.
+- Bulk corrections target only the caller's matching in-progress tasks. Metadata
+  changes and other-owner targeting are refused before publication. Each task
+  receives its own amend event and receipt; a fanout failure identifies completed
+  IDs and the stopped task for inspection, without claiming atomic rollback.
+
+## Remaining work
+
+Role procedures, generated command reference, migration/roadmap documentation and
+stateful end-to-end scenarios.
 
 ## Accepted evidence
 
@@ -137,4 +164,24 @@ Check the documented test entry and command references against the implementatio
   eligibility, exclusions, pause, event-free wakeups and metadata edits that
   do not reset pending age. Status preserves task summaries, exposes checkpoint
   evidence, filters owners/terminal work, warns on local sync artifacts and makes
-  no filesystem changes, including for absent buckets.
+   no filesystem changes, including for absent buckets.
+- Delivery/review regression run: `npm test`, 84 passed, 0 failed, 0 skipped
+  (72 retained tests and 12 new tests). The authority matrix covers 544 cases;
+  all 33 command examples execute and all 20 body-writing contracts remain checked.
+- Verdict tests cover missing/unknown/duplicate/malformed coverage, invalid brief
+  numbering, immutable reviews, mixed/all-not-run results, proposal confirmation
+  and override, stale rounds, late-sync losing claimants, watch projections and
+  replay. Plain owner completion remains available without applying verdicts.
+- Delivery tests cover none/watch defaults and persistence, task-only watches,
+  legacy declarations, ending, mixed/broadcast explicit-recipient preflight,
+  no-publication refusals, unchanged initial cursors and recorded force overrides.
+- Instruction tests cover normalized bodies, frontmatter-only and tag-order
+  stability, unrelated tags, additions/deletions, immutable prior content and
+  compact diffs, claimant-only acknowledgement, legacy missing versions, no-op
+  acknowledgements, pre-spawn/log refusals in and outside in-progress work,
+  continued commands after mid-run edits and frontmatter replay/repair.
+- Receipt tests cover pre-claim and later amends, cross-round persistence, mixed
+  incorporation/ignore, unknown/old filenames, mandatory reasons, all-ignored
+  body/revision preservation, and independent instruction gating. Bulk tests
+  cover owner/tag/state filters, metadata refusals, literal stdin fanout, separate
+  receipts and a forced second-publication failure retaining the first event.

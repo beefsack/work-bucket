@@ -71,9 +71,14 @@ export const COMMANDS = {
     example: ["--bucket", "<bucket>", "--entity", "owner", "--task", "<task>", "-m", "Additional requirement"], options: {
     ...event, assignee: string("Set assignee on unclaimed draft/ready/pending tasks; empty clears"),
     ...dependencies, "ttl-seconds": string("Set task liveness TTL on unclaimed work"),
+    "all-in-progress": boolean("Amend matching in-progress tasks owned by the caller"),
+    owner: string("Bulk owner filter"), tag: filters.tag,
   } },
-  review: { description: "Submit the claimant's work for owner review",
-    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "-m", "Evidence and unverified items"], options: { ...event } },
+  review: { description: "Submit per-criterion verdicts for owner review",
+    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "--ac", "1=pass", "--proposed-outcome", "pass", "-m", "Evidence and unverified items"], options: {
+    ...event, ac: list("Criterion N=pass|fail|not-run, one verdict per criterion"),
+    "proposed-outcome": string("Proposed outcome pass|partial|fail|abandoned"),
+  } },
   question: { description: "Block execution on an owner decision",
     example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "-m", "Decision required"], options: { ...event } },
   feedback: { description: "Return reviewed work to pinned pending",
@@ -101,6 +106,7 @@ export const COMMANDS = {
   complete: { description: "Owner closure of non-terminal work",
     example: ["--bucket", "<bucket>", "--entity", "owner", "--task", "<task>", "--outcome", "pass"], options: {
     ...event, outcome: string("pass|partial|fail|abandoned"),
+    "accept-ac": boolean("Apply latest current-round review verdicts to the brief"),
   } },
   cancel: { description: "Owner cancellation of non-terminal work",
     example: ["--bucket", "<bucket>", "--entity", "owner", "--task", "<task>", "--outcome", "abandoned"], options: {
@@ -113,7 +119,12 @@ export const COMMANDS = {
     ...event, type: string("log|note (default log)"),
   } },
   "accept-amends": { description: "Claimant incorporation and receipt of pending amendments",
-    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "-m", "Corrections incorporated"], options: { ...event } },
+    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>", "-m", "Corrections incorporated"], options: {
+    ...event, "ignore-amend": list("Amendment event filenames to exclude from incorporation"),
+    reason: string("Reason for ignored amendments"),
+  } },
+  "ack-instructions": { description: "Print standing-rule changes and acknowledge the current version",
+    example: ["--bucket", "<bucket>", "--entity", "executor", "--task", "<task>"], options: { ...taskWriter } },
   render: { description: "Render a task summary, body and event history",
     example: ["--bucket", "<bucket>", "--task", "<task>", "--tail-events", "3", "--json"], options: {
     ...bucket, task: string("Task ID"), "after-event": string("Only events after this filename"),
@@ -146,6 +157,7 @@ export const COMMANDS = {
   "msg send": { description: "Publish a public notice",
     example: ["--bucket", "<bucket>", "--entity", "owner", "--to", "*", "-m", "Public notice"], options: {
     ...writer, ...body, to: list("Recipients (* broadcasts)"), tag: filters.tag, slug: string("Notice slug"),
+    force: boolean("Human override for direct notices to non-polling recipients"),
   } },
   "msg list": { description: "List public notices",
     example: ["--bucket", "<bucket>", "--all", "--json"], options: {
@@ -155,6 +167,7 @@ export const COMMANDS = {
   "entity register": { description: "Register or refresh an entity",
     example: ["--bucket", "<bucket>", "--entity", "executor", "--mode", "once", "--tag", "linux,gpu"], options: {
     ...writer, ...body, ...filters, mode: string("once|one-shot|continuous|owner|worker"),
+    delivery: string("Message delivery watch|none"),
     ttl: string("Override this entity's TTL seconds"),
   } },
   "entity end": { description: "End self or a recorded dispatcher child",

@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import os from "node:os";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { CliError, parseCommand, printCommandHelp } from "./commands.mjs";
 
@@ -76,6 +77,7 @@ const TRANSITIONS = {
   log: { from: NON_TERMINAL_STATUSES, actor: "participant", to: null },
   note: { from: NON_TERMINAL_STATUSES, actor: "participant", to: null },
   "accept-amends": { from: ["in-progress"], actor: "claimant", to: null, event: "log" },
+  "ack-instructions": { from: ["in-progress"], actor: "claimant", to: null },
 };
 
 function assertTransition(intent, item, entityId, context = {}) {
@@ -798,7 +800,7 @@ function serializeTaskSummary(item, includeEvents = false, eventLines = 5) {
 
 function checkpointFields(data) {
   return Object.fromEntries(["files_touched", "resources", "pid", "child_pid", "host", "notes",
-    "phase", "cmd", "log", "exit_code", "signal", "error"]
+    "phase", "cmd", "log", "exit_code", "signal", "error", "ac", "proposed_outcome"]
     .filter((key) => Object.hasOwn(data, key)).map((key) => [key, data[key]]));
 }
 
@@ -1042,7 +1044,7 @@ function formatMessageMarkdown(data, body) {
   return `${fm}\n\n${trimmedBody}\n`;
 }
 
-function writeUniqueMessage(messagesDir, fromEntity, toList, tags, slugText, body, now = new Date()) {
+function writeUniqueMessage(messagesDir, fromEntity, toList, tags, slugText, body, now = new Date(), extra = {}) {
   const compactUtc = formatCompactUtc(now);
   const isoUtc = formatIsoUtc(now);
   const slug = slugify(slugText || "msg");
@@ -1052,6 +1054,7 @@ function writeUniqueMessage(messagesDir, fromEntity, toList, tags, slugText, bod
       to: toList,
       tags,
       timestamp: isoUtc,
+      ...extra,
     },
     body
   );
@@ -1071,6 +1074,7 @@ function readMessageFile(msgPath) {
     const { data, body } = parseFrontmatter(raw);
     return {
       filename,
+      forced: Boolean(data.forced),
       from: String(data.from ?? ""),
       to: coerceStringList(data.to),
       tags: normalizeTags(coerceStringList(data.tags)),
@@ -1157,6 +1161,8 @@ function readEntityFile(bucketDir, entityId) {
       tags: normalizeTags(coerceStringList(data.tags)),
       include_untagged: Boolean(data.include_untagged),
       mode: String(data.mode ?? ""),
+      delivery: data.delivery === "none" || data.delivery === "watch"
+        ? data.delivery : data.ended_at || ["once", "one-shot"].includes(String(data.mode)) ? "none" : "watch",
       session_nonce: String(data.session_nonce ?? ""),
       ttl_seconds: Number.isFinite(ttl) && ttl > 0 ? ttl : DEFAULT_ENTITY_TTL_SECONDS,
       last_msg_seen: String(data.last_msg_seen ?? ""),
@@ -1212,6 +1218,8 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
         ? existing.mode
          : "",
     session_nonce: sessionNonce || existing?.session_nonce || "",
+    delivery: updates.delivery ?? existing?.delivery ??
+      (["once", "one-shot"].includes(updates.mode) ? "none" : "watch"),
     ttl_seconds:
       updates.ttl_seconds !== undefined
         ? updates.ttl_seconds
@@ -1610,7 +1618,8 @@ function readStandingInstructions(bucketDir, task) {
   const instructions = [];
   const bucketPath = path.join(bucketDir, "INSTRUCTIONS.md");
   if (fs.existsSync(bucketPath)) {
-    instructions.push({ file: "INSTRUCTIONS.md", body: fs.readFileSync(bucketPath, "utf8").replace(/\r/g, "").trim() });
+    const raw = fs.readFileSync(bucketPath, "utf8").replace(/\r/g, "");
+    instructions.push({ file: "INSTRUCTIONS.md", body: (raw.split("\n")[0].trim() === "---" ? parseFrontmatter(raw).body : raw).trim() });
   }
   for (const tag of task.tags) {
     if (tag.startsWith(".") || /[/\\]/.test(tag) || tag.includes("..")) continue;
@@ -1619,7 +1628,61 @@ function readStandingInstructions(bucketDir, task) {
       instructions.push({ file: `tags/${tag}.md`, body: readTagDoc(tagPath, tag).description });
     }
   }
-  return instructions;
+  return instructions.sort((a, b) => a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
+}
+
+function instructionVersion(bucketDir, task) {
+  const instructions = readStandingInstructions(bucketDir, task);
+  const content = Object.fromEntries(instructions.map(({ file, body }) => [file, body]));
+  const hash = createHash("sha256").update(JSON.stringify(instructions.map(({ body }) => body))).digest("hex");
+  return { instructions, content, hash };
+}
+
+function assertInstructionsAcknowledged(bucketDir, item) {
+  const current = instructionVersion(bucketDir, item.task);
+  if (item.task.instructions_seen === current.hash ||
+      (!item.task.instructions_seen && item.task.status !== "in-progress" && !current.instructions.length)) return;
+  const action = item.task.status === "in-progress"
+    ? `run ack-instructions --task ${item.task.id}, read the diff and apply it`
+    : ["draft", "ready"].includes(item.task.status) ? "promote to pending, then claim to read the current rules"
+    : item.task.status === "review" ? "use owner feedback, then claim to read the current rules"
+    : item.task.status === "blocked" ? "use owner answer, then claim to read the current rules"
+    : "claim to read the current rules";
+  throw new CliError(`Standing instructions need acknowledgement; ${action}.`);
+}
+
+function instructionDiff(item, current) {
+  let previous = {};
+  let known = !item.task.instructions_seen;
+  for (const filename of listEventFiles(item.eventsDir)) {
+    let data;
+    try { ({ data } = parseFrontmatter(fs.readFileSync(path.join(item.eventsDir, filename), "utf8"))); }
+    catch (err) { if (err instanceof CliError) continue; throw err; }
+    if (data.instructions_hash === item.task.instructions_seen && data.instruction_content &&
+        typeof data.instruction_content === "object" && !Array.isArray(data.instruction_content)) {
+      previous = data.instruction_content;
+      known = true;
+      break;
+    }
+  }
+  const lines = known ? [] : ["Previous instruction content unavailable; current bodies follow."];
+  for (const file of [...new Set([...Object.keys(previous), ...Object.keys(current)])].sort()) {
+    if (previous[file] === current[file]) continue;
+    const before = previous[file] ? String(previous[file]).split("\n") : [];
+    const after = current[file] ? current[file].split("\n") : [];
+    let start = 0;
+    while (start < before.length && start < after.length && before[start] === after[start]) start += 1;
+    let oldEnd = before.length;
+    let newEnd = after.length;
+    while (oldEnd > start && newEnd > start && before[oldEnd - 1] === after[newEnd - 1]) {
+      oldEnd -= 1;
+      newEnd -= 1;
+    }
+    lines.push(`--- ${file}`, `+++ ${file}`, `@@ line ${start + 1} @@`,
+      ...before.slice(start, oldEnd).map((line) => `-${line}`),
+      ...after.slice(start, newEnd).map((line) => `+${line}`));
+  }
+  return lines.join("\n");
 }
 
 function cmdCreate(argv) {
@@ -1811,6 +1874,7 @@ async function cmdClaim(argv) {
   }
   upsertEntityFile(bucketDir, entityId, {
     mode: existing?.mode || "once", dispatcher, host: os.hostname(),
+    delivery: existing?.delivery || "none",
     tags: Array.from(workerTags), include_untagged: includeUntagged,
     ttl_seconds: readBucketConfig(bucketDir).default_ttl_seconds, ended_at: "",
     ...(existing?.ended_at || (existing?.running?.host === os.hostname() && pidAlive(existing.running.pid) === false)
@@ -1837,6 +1901,7 @@ async function cmdClaim(argv) {
   let claimedEntry = null;
   let claimedEvent = null;
   let finalTask = null;
+  let finalInstructions = [];
 
   for (const candidate of candidates) {
     let preTask;
@@ -1907,13 +1972,17 @@ async function cmdClaim(argv) {
     postTask.claim_round = claimRound;
     postTask.updated_by = entityId;
     postTask.updated_at = formatIsoUtc(new Date());
+    const version = instructionVersion(bucketDir, postTask);
+    postTask.instructions_seen = version.hash;
     publishTaskState(candidate, postTask, postBody, entityId, "claim-committed",
       `Claim election won by ${entityId} (round ${claimRound}).`, new Date(),
-      { claim_event: myClaimEvent.filename, round: claimRound });
+      { claim_event: myClaimEvent.filename, round: claimRound,
+        instructions_hash: version.hash, instruction_content: version.content });
 
     claimedEntry = candidate;
     claimedEvent = myClaimEvent;
     finalTask = postTask;
+    finalInstructions = version.instructions;
     break;
   }
 
@@ -1934,7 +2003,7 @@ async function cmdClaim(argv) {
           claimed_event: claimedEvent.filename,
           last_event_seen: lastEventSeen,
           events,
-          instructions: readStandingInstructions(bucketDir, finalTask),
+          instructions: finalInstructions,
           unread_events: unreadTaskInstructions({ ...claimedEntry, task: finalTask }),
         },
         null,
@@ -1962,6 +2031,52 @@ function cmdTransition(command, argv) {
   const bucketDir = path.resolve(values.bucket);
   const entityId = validateIdentifier(values.entity, "--entity");
   useEntitySession(bucketDir, entityId, values);
+  let payload;
+  if (command === "amend" && values["all-in-progress"]) {
+    if (values.task) throw new CliError("Use --task or --all-in-progress, not both.");
+    if (values.assignee !== undefined || values["ttl-seconds"] !== undefined ||
+        values["add-depends-on"] || values["remove-depends-on"]) {
+      throw new CliError("Bulk amendments accept body corrections, not metadata changes.");
+    }
+    if (values.owner !== undefined && values.owner !== entityId) {
+      throw new CliError("Bulk amendments require the caller's ownership.", 3);
+    }
+    const tags = normalizeTags(parseListFlags(values.tag));
+    const tasks = listTasks(bucketDir).filter((item) => item.task.status === "in-progress" &&
+      item.task.owner === entityId && (!tags.length || item.task.tags.some((tag) => tags.includes(tag))));
+    for (const item of tasks) assertTransition("amend", item, entityId, { bucketDir });
+    const message = readBodyInput(values);
+    const results = [];
+    for (const item of tasks) {
+      try {
+        results.push(transitionTask(command, { ...values, task: item.task.id, message, stdin: false, "body-file": undefined }, bucketDir, entityId));
+      } catch (err) {
+        throw new CliError(`Bulk amend stopped at task "${item.task.id}"; completed task IDs: ${results.map((result) => result.id).join(", ") || "none"}. Inspect the stopped task's events before retrying. ${err.message}`,
+          err instanceof CliError ? err.exitCode : 1);
+      }
+    }
+    payload = { count: results.length, tasks: results };
+  } else {
+    if (command === "amend" && (values.owner !== undefined || values.tag)) {
+      throw new CliError("--owner/--tag require --all-in-progress.");
+    }
+    payload = transitionTask(command, values, bucketDir, entityId);
+  }
+  if (values.json) console.log(JSON.stringify(payload, null, 2));
+  else if (payload.tasks) {
+    for (const item of payload.tasks) console.log(`Posted ${item.event} to ${item.id}`);
+    console.log(`Amended ${payload.count} tasks.`);
+  } else {
+    if (payload.instruction_diff) console.log(payload.instruction_diff);
+    console.log(payload.event ? `Posted ${payload.event} to ${payload.id}` : `Instructions unchanged for ${payload.id}.`);
+    if (payload.task_updated) {
+      console.log(`State: status=${payload.status} revision=${payload.previous_revision}->${payload.revision} claim_round=${payload.previous_claim_round}->${payload.claim_round}`);
+    }
+  }
+  return 0;
+}
+
+function transitionTask(command, values, bucketDir, entityId) {
   const taskId = validateTaskId(values.task);
   const intent = command === "post" ? values.type || "log" : command;
   if (command === "post" && !["log", "note"].includes(intent)) {
@@ -1985,23 +2100,72 @@ function cmdTransition(command, argv) {
   if (values.outcome !== undefined && !["pass", "partial", "fail", "abandoned"].includes(values.outcome)) {
     throw new CliError("--outcome must be pass|partial|fail|abandoned.");
   }
+  if (["review", "question"].includes(intent)) {
+    const pending = unreadTaskInstructions(found).filter((event) => event.type === "amend");
+    if (pending.length) throw new CliError(`Unaccepted amendments: ${pending.map((event) => event.filename).join(", ")}; run accept-amends --task ${taskId}.`);
+    assertInstructionsAcknowledged(bucketDir, found);
+  }
   const acceptedAmends = intent === "accept-amends"
     ? unreadTaskInstructions(found).filter((event) => event.type === "amend")
     : [];
   if (intent === "accept-amends" && acceptedAmends.length === 0) {
     throw new CliError("No unaccepted amend events.");
   }
+  const ignoredFiles = new Set(parseListFlags(values["ignore-amend"]));
+  if (ignoredFiles.size && !values.reason?.trim()) throw new CliError("--ignore-amend requires --reason.");
+  if (values.reason !== undefined && !ignoredFiles.size) throw new CliError("--reason requires --ignore-amend.");
+  for (const filename of ignoredFiles) {
+    if (!acceptedAmends.some((event) => event.filename === filename)) throw new CliError(`Not an outstanding amend: ${filename}.`);
+  }
+  let instructionExtra = {};
+  let instructionOutput = {};
+  if (intent === "ack-instructions") {
+    const version = instructionVersion(bucketDir, found.task);
+    const diff = instructionDiff(found, version.content);
+    instructionOutput = { instruction_diff: diff, instructions: version.instructions };
+    if (found.task.instructions_seen === version.hash) {
+      return { ...serializeTaskSummary(found), event: null, task_updated: false,
+        previous_revision: found.task.revision, previous_claim_round: found.task.claim_round, ...instructionOutput };
+    }
+    instructionExtra = { instructions_hash: version.hash, instruction_content: version.content };
+  }
 
   for (const dep of [...addDeps, ...removeDeps]) validateTaskId(dep);
   validateAssignee(bucketDir, values.assignee);
+  let reviewExtra = {};
+  if (intent === "review") {
+    const verdicts = parseAcVerdicts(values);
+    validateReviewVerdicts(found.body, verdicts, values["proposed-outcome"]);
+    const sorted = [...verdicts.entries()].sort((a, b) => a[0] - b[0]);
+    reviewExtra = {
+      ac: sorted.map(([n, v]) => `${n}:${v}`),
+      proposed_outcome: values["proposed-outcome"],
+    };
+  }
+  let acceptVerdicts = null;
+  let acceptProposed = null;
+  let acceptDerived = null;
+  if (intent === "complete" && values["accept-ac"]) {
+    const latest = latestReviewVerdicts(found.eventsDir, found.task.claim_round);
+    if (!latest) throw new CliError("complete --accept-ac requires a valid current-round review.");
+    validateReviewVerdicts(found.body, latest.verdicts, latest.proposed);
+    acceptVerdicts = latest.verdicts;
+    acceptProposed = latest.proposed;
+    const derived = derivedOutcome(acceptVerdicts);
+    if (values.outcome === undefined && acceptProposed !== derived) {
+      throw new CliError(`Proposed outcome "${acceptProposed}" differs from derived outcome "${derived}"; confirm or override with --outcome.`);
+    }
+    if (values.outcome === undefined) acceptDerived = derived;
+  }
   const checkpoint = ["checkpoint", "release"].includes(intent) ? checkpointManifest(values) : {};
-  const mutatesTaskMd = Boolean(targetStatus || metadataChange || acceptedAmends.length);
+  const mutatesTaskMd = Boolean(targetStatus || metadataChange || acceptedAmends.length || acceptVerdicts || intent === "ack-instructions");
 
   const now = new Date();
   const isoUtc = formatIsoUtc(now);
   const message = [
     readBodyInput(values),
-    ...(acceptedAmends.length ? [`Accepted amendments:\n${acceptedAmends.map((event) => `- ${event.filename}`).join("\n")}`] : []),
+    ...(acceptedAmends.length ? [`Amendment receipts:\n${acceptedAmends.map((event) =>
+      `- ${event.filename}: ${ignoredFiles.has(event.filename) ? `ignored (${values.reason.trim()})` : "accepted"}`).join("\n")}`] : []),
   ].filter(Boolean).join("\n\n");
   if (eventType === "amend" && ["review", "blocked"].includes(found.task.status)) {
     console.error(`Warning: task "${taskId}" is ${found.task.status}; amend does not reopen it. Use feedback/answer to resume execution.`);
@@ -2020,7 +2184,8 @@ function cmdTransition(command, argv) {
         ? "" : dispatcher || previousClaimant || found.task.assignee;
       updatedTask.affinity = intent === "reset" || values.reopen ? "" : dispatcher ? previousClaimant : "";
     }
-    if (["feedback", "answer", "accept-amends"].includes(intent) || metadataChange) {
+    if (["feedback", "answer"].includes(intent) || metadataChange ||
+        (intent === "accept-amends" && acceptedAmends.some((event) => !ignoredFiles.has(event.filename)))) {
       updatedTask.revision = (Number(updatedTask.revision) || 1) + 1;
     }
     if (TERMINAL_STATUSES.has(targetStatus)) {
@@ -2031,11 +2196,17 @@ function cmdTransition(command, argv) {
     if (values.assignee !== undefined) updatedTask.assignee = values.assignee;
     if (taskTtl !== undefined) updatedTask.ttl_seconds = taskTtl;
     if (acceptedAmends.length) {
-      updatedBody = `${updatedBody.trimEnd()}\n\n${acceptedAmends.map((event) =>
+      const incorporated = acceptedAmends.filter((event) => !ignoredFiles.has(event.filename));
+      if (incorporated.length) updatedBody = `${updatedBody.trimEnd()}\n\n${incorporated.map((event) =>
         `## Amendment: ${event.filename}\n\n${event.body}`).join("\n\n")}\n`;
       updatedTask.last_amend_seen = acceptedAmends.at(-1).filename;
     }
-    if (values.outcome !== undefined) updatedTask.outcome = values.outcome;
+    if (intent === "ack-instructions") updatedTask.instructions_seen = instructionExtra.instructions_hash;
+    if (acceptVerdicts) {
+      updatedBody = applyAcVerdicts(updatedBody, acceptVerdicts);
+      if (values.outcome !== undefined) updatedTask.outcome = values.outcome;
+      else if (acceptDerived) updatedTask.outcome = acceptDerived;
+    } else if (values.outcome !== undefined) updatedTask.outcome = values.outcome;
 
     if (addDeps.length > 0 || removeDeps.size > 0) {
       const nextDeps = updatedTask.depends_on.filter((d) => !removeDeps.has(d));
@@ -2049,8 +2220,12 @@ function cmdTransition(command, argv) {
     updatedTask.updated_at = isoUtc;
   }
   const eventResult = mutatesTaskMd
-    ? publishTaskState(found, updatedTask, updatedBody, entityId, eventType, message, now, checkpoint)
-    : writeUniqueEvent(found.eventsDir, entityId, eventType, message, now, checkpoint);
+    ? publishTaskState(found, updatedTask, updatedBody, entityId, eventType, message, now, {
+      ...checkpoint, ...reviewExtra, ...instructionExtra,
+      ...(acceptedAmends.length ? { accepted_amends: acceptedAmends.filter((event) => !ignoredFiles.has(event.filename)).map((event) => event.filename),
+        ignored_amends: [...ignoredFiles], ignore_reason: values.reason?.trim() || "" } : {}),
+    })
+    : writeUniqueEvent(found.eventsDir, entityId, eventType, message, now, { ...checkpoint, ...reviewExtra });
 
   touchExistingEntity(bucketDir, entityId);
   if (found.task.status === "in-progress" && updatedTask.status !== "in-progress" && previousClaimant) {
@@ -2058,29 +2233,107 @@ function cmdTransition(command, argv) {
     if (claimant?.claimed_task === taskId) upsertEntityFile(bucketDir, previousClaimant, { claimed_task: "" });
   }
 
-  if (values.json) {
-    console.log(
-      JSON.stringify(
-        {
-          ...serializeTaskSummary({ ...found, task: updatedTask }),
-          event: eventResult.filename,
-          task_updated: mutatesTaskMd,
-          previous_revision: found.task.revision,
-          previous_claim_round: found.task.claim_round,
-        },
-        null,
-        2
-      )
-    );
-  } else {
-    console.log(`Posted ${eventResult.filename} to ${updatedTask.id}`);
-    if (mutatesTaskMd) {
-      console.log(
-        `State: status=${updatedTask.status} revision=${found.task.revision}->${updatedTask.revision} claim_round=${found.task.claim_round}->${updatedTask.claim_round}`
-      );
-    }
+  return {
+    ...serializeTaskSummary({ ...found, task: updatedTask }),
+    event: eventResult.filename,
+    task_updated: mutatesTaskMd,
+    previous_revision: found.task.revision,
+    previous_claim_round: found.task.claim_round,
+    ...instructionOutput,
+  };
+}
+
+const AC_VERDICT_RE = /^- \[( |x|X)\] #(\d+)\s*(.*)$/;
+const VALID_OUTCOMES = ["pass", "partial", "fail", "abandoned"];
+
+function numberedCriteria(body) {
+  const found = [];
+  for (const line of String(body || "").split("\n")) {
+    const m = AC_VERDICT_RE.exec(line.replace(/\r/g, ""));
+    if (m) found.push({ n: Number(m[2]), checked: m[1] !== " ", line });
   }
-  return 0;
+  return found;
+}
+
+function parseAcVerdicts(values) {
+  const raw = parseListFlags(values.ac);
+  const byN = new Map();
+  for (const entry of raw) {
+    const m = /^(\d+)=(pass|fail|not-run)$/.exec(entry.trim());
+    if (!m) throw new CliError(`Malformed --ac verdict "${entry}". Use N=pass|fail|not-run.`);
+    const n = Number(m[1]);
+    if (!Number.isSafeInteger(n) || n < 1) throw new CliError("Criterion numbers must be positive safe integers.");
+    if (byN.has(n)) throw new CliError(`Duplicate --ac verdict for criterion ${n}.`);
+    byN.set(n, m[2]);
+  }
+  return byN;
+}
+
+function validateReviewVerdicts(body, verdicts, proposedOutcome) {
+  if (proposedOutcome === undefined || !VALID_OUTCOMES.includes(proposedOutcome)) {
+    throw new CliError("--proposed-outcome must be pass|partial|fail|abandoned.");
+  }
+  const criteria = numberedCriteria(body);
+  if (!criteria.length) throw new CliError("Review requires a brief with numbered acceptance criteria (- [ ] #N).");
+  const seen = new Set();
+  for (const c of criteria) {
+    if (!Number.isSafeInteger(c.n) || c.n < 1) throw new CliError("Criterion numbers must be positive safe integers.");
+    if (seen.has(c.n)) throw new CliError(`Duplicate numbered acceptance criterion #${c.n} in brief.`);
+    seen.add(c.n);
+  }
+  for (const n of verdicts.keys()) {
+    if (!seen.has(n)) throw new CliError(`--ac verdict for unknown criterion #${n}.`);
+  }
+  for (const n of seen) {
+    if (!verdicts.has(n)) throw new CliError(`Missing --ac verdict for criterion #${n}.`);
+  }
+}
+
+function latestReviewVerdicts(eventsDir, claimRound) {
+  const reviews = [];
+  for (const filename of listEventFiles(eventsDir)) {
+    if (parseEventFilenameParts(filename)?.type !== "review") continue;
+    let data = {};
+    try {
+      ({ data } = parseFrontmatter(fs.readFileSync(path.join(eventsDir, filename), "utf8")));
+    } catch { continue; }
+    if (data.snapshot_version === 1 && data.claim_round === Number(claimRound) &&
+        data.status === "review" && Number.isSafeInteger(data.state_seq)) reviews.push({ data, filename });
+  }
+  reviews.sort((a, b) => b.data.state_seq - a.data.state_seq);
+  if (!reviews.length) return null;
+  const { data, filename } = reviews[0];
+  const winner = getRoundClaims(eventsDir, claimRound).winner;
+  if (!winner || data.claimed_by !== winner.entityId || data.entity_id !== winner.entityId ||
+      !Array.isArray(data.ac) || !VALID_OUTCOMES.includes(data.proposed_outcome)) return null;
+  const verdicts = new Map();
+  for (const entry of data.ac) {
+    const m = /^(\d+):(pass|fail|not-run)$/.exec(String(entry));
+    if (!m || verdicts.has(Number(m[1]))) return null;
+    verdicts.set(Number(m[1]), m[2]);
+  }
+  return verdicts.size ? { verdicts, proposed: data.proposed_outcome, filename } : null;
+}
+
+function derivedOutcome(verdicts) {
+  const vals = [...verdicts.values()];
+  if (vals.every((v) => v === "pass")) return "pass";
+  if (vals.every((v) => v === "fail")) return "fail";
+  return "partial";
+}
+
+function applyAcVerdicts(body, verdicts) {
+  return String(body || "").split("\n").map((line) => {
+    const m = AC_VERDICT_RE.exec(line.replace(/\r/g, ""));
+    if (!m) return line;
+    const n = Number(m[2]);
+    const rest = m[3].replace(/\s+\((?:fail|not-run)\)$/, "");
+    const verdict = verdicts.get(n);
+    if (verdict === "pass") return `- [x] #${n}${rest ? ` ${rest}` : ""}`;
+    if (verdict === "fail") return `- [ ] #${n}${rest ? ` ${rest}` : ""} (fail)`;
+    if (verdict === "not-run") return `- [ ] #${n}${rest ? ` ${rest}` : ""} (not-run)`;
+    return line;
+  }).join("\n");
 }
 
 function checkpointManifest(values) {
@@ -2105,6 +2358,7 @@ async function cmdRun(argv) {
   const found = findTask(bucketDir, taskId);
   if (!found) throw new CliError(`Task "${taskId}" not found.`);
   assertTransition("checkpoint", found, entityId, { bucketDir });
+  assertInstructionsAcknowledged(bucketDir, found);
   const existing = readEntityFile(bucketDir, entityId);
   if (existing?.running && (existing.running.host === os.hostname()
     ? pidAlive(existing.running.pid) !== false : ageSeconds(existing.updated_at, Infinity) <= existing.ttl_seconds)) {
@@ -2549,6 +2803,7 @@ async function cmdWatch(argv) {
       tags: Array.from(workerTags),
       include_untagged: includeUntagged,
       mode: ownerOnly ? "owner" : "worker",
+      delivery: "watch",
       ended_at: "",
       host: os.hostname(),
     });
@@ -2991,6 +3246,15 @@ function cmdMsg(argv) {
     }
     const tags = normalizeTags(parseListFlags(values.tag));
     const toList = rawTo.length > 0 ? rawTo : tags.length > 0 ? [] : ["*"];
+    if (!values.force) {
+      for (const recipient of toList.filter((id) => id !== "*")) {
+        if (readEntityFile(bucketDir, recipient)?.delivery !== "none") continue;
+        const active = getActiveWipTasks(bucketDir, recipient)[0];
+        throw new CliError(`"${recipient}" does not poll messages; ${active
+          ? `use amend --task ${active.task.id}`
+          : "use a task amendment for corrections"}.`, 2);
+      }
+    }
 
     ensureBucketDirs(bucketDir);
     const now = new Date();
@@ -3001,7 +3265,8 @@ function cmdMsg(argv) {
       tags,
       values.slug || "msg",
       body,
-      now
+      now,
+      { forced: Boolean(values.force) }
     );
     touchExistingEntity(bucketDir, entityId);
 
@@ -3012,6 +3277,7 @@ function cmdMsg(argv) {
       to: toList,
       tags,
       timestamp: res.timestamp,
+      forced: Boolean(values.force),
     };
     if (values.json) {
       console.log(JSON.stringify(payload, null, 2));
@@ -3115,7 +3381,7 @@ function cmdEntity(argv) {
     if (targetId !== entityId && target.dispatcher !== entityId) {
       throw new CliError(`Only "${targetId}" or its recorded dispatcher may end it.`, 3);
     }
-    const saved = upsertEntityFile(bucketDir, targetId, { ended_at: target.ended_at || formatIsoUtc() });
+    const saved = upsertEntityFile(bucketDir, targetId, { ended_at: target.ended_at || formatIsoUtc(), delivery: "none" });
     if (values.json) console.log(JSON.stringify(saved, null, 2));
     else console.log(`Ended entity ${targetId}.`);
     return 0;
@@ -3134,6 +3400,9 @@ function cmdEntity(argv) {
     if (values.mode && !["once", "one-shot", "continuous", "owner", "worker"].includes(values.mode)) {
       throw new CliError(`Invalid --mode "${values.mode}".`);
     }
+    if (values.delivery !== undefined && !["watch", "none"].includes(values.delivery)) {
+      throw new CliError("--delivery must be watch|none.");
+    }
     ensureBucketDirs(bucketDir);
     const tags = normalizeTags(parseListFlags(values.tag));
     const ttlSec = values.ttl !== undefined ? Number(values.ttl) : undefined;
@@ -3145,6 +3414,8 @@ function cmdEntity(argv) {
       ...(values.tag ? { tags } : {}),
       ...(values["include-untagged"] ? { include_untagged: true } : {}),
       ...(values.mode ? { mode: values.mode } : {}),
+      ...(values.delivery !== undefined ? { delivery: values.delivery } : values.mode
+        ? { delivery: ["once", "one-shot"].includes(values.mode) ? "none" : "watch" } : {}),
       ...(ttlSec !== undefined ? { ttl_seconds: ttlSec } : {}),
       ...(note ? { body: note } : {}),
       ended_at: "",
@@ -3330,6 +3601,7 @@ async function main(argv = process.argv.slice(2)) {
     case "cancel":
     case "log":
     case "accept-amends":
+    case "ack-instructions":
       return cmdTransition(sub, rest);
     case "watch":
       return await cmdWatch(rest);

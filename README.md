@@ -62,12 +62,15 @@ unclaimed_seconds: 600
 | Generic `post` changes state or metadata | `post` only appends `log`/`note`; owner metadata changes use `amend` on unclaimed draft/ready/pending tasks |
 | `post --type log --accept-amends` | `accept-amends` |
 | `--bump-revision` | Intent commands advance revision/round when required |
-| `--check-ac` mutates all boxes | Removed; reviews do not change the owner's brief |
+| `--check-ac` mutates all boxes | `review --ac N=pass\|fail\|not-run --proposed-outcome <outcome>`; owner `complete --accept-ac` applies verdicts |
 | `--body`, `--tags` | `-m`/`--message`, `--body-file`, `--stdin`; repeatable/comma-split `--tag` |
 | Nested `task` or `task_id` JSON fields | Top-level task-summary fields, with `id` |
 | Claim not-found/paused/conflict all exit 2 | Not-found 1, conflict/permission 3, paused 4 |
 | Rework pins the one-shot child | Pin the recorded dispatcher; retain the child as `affinity` |
 | Manual claimant registration/heartbeats | Claim auto-registers; `run -- <command>` heartbeats long legs |
+| Direct messages to non-polling children | Use `amend --task <id>`; reserve messages for notices |
+| Unversioned standing instructions | Claim records `instructions_seen`; use `ack-instructions` after rule changes |
+| Optional amendment receipts | Use `accept-amends` before `review`/`question` |
 
 `fsck --bucket <dir>` is read-only. `fsck --repair` rebuilds drifting
 non-terminal task frontmatter from immutable state snapshots, preserving the
@@ -93,6 +96,7 @@ Run the tests with `npm test` or `node --test test/` (Node.js 20+).
 | `log` / `post --type log\|note` | Append only, non-terminal | Owner, elected claimant or their recorded dispatcher |
 | `checkpoint` / `run` | Non-terminal; structured checkpoint / command execution | Owner, elected claimant or their recorded dispatcher |
 | `accept-amends` | In-progress | Elected claimant |
+| `ack-instructions` | In-progress | Elected claimant |
 
 An executor owns the tasks they create and can close, cancel or reset those tasks.
 They cannot close another owner's task. Hand-written legacy tasks without `owner`
@@ -104,6 +108,49 @@ receive further events or state changes.
 it. `demote` defaults to ready; `--status draft` holds ready/pending work.
 `amend --assignee ""` clears an unclaimed pin; dependency edits use repeatable,
 comma-split `--add-depends-on` / `--remove-depends-on`.
+
+### Acceptance
+
+| Actor | Action |
+| --- | --- |
+| Brief owner | Number criteria `- [ ] #N <criterion>` or use `create --ac` |
+| Claimant | Submit `review --ac N=pass\|fail\|not-run` for each criterion and `--proposed-outcome pass\|partial\|fail\|abandoned`; cite evidence and list unverified items |
+| Reviewing owner | Inspect evidence, then apply verdicts with `complete --accept-ac`; use `--outcome` to confirm or override a proposal that differs from the derived result |
+
+| Verdicts | Applied boxes | Derived outcome |
+| --- | --- | --- |
+| All pass | Checked | pass |
+| All fail | Unchecked, `(fail)` | fail |
+| Mixed or all not-run | Only pass checked; others annotated `(fail)`/`(not-run)` | partial |
+
+### Corrections and receipts
+
+| Content | Channel |
+| --- | --- |
+| Standing rules | `INSTRUCTIONS.md` and `tags/<tag>.md` bodies |
+| Task correction | `amend --task <id>` |
+| Urgent correction across active tasks | `amend --all-in-progress [--owner <id>] [--tag <tag>]` |
+| Public notice to pollers | `msg send` |
+
+- Keep briefs task-specific; put shared rules in instruction files.
+- After a failed bulk amend, inspect the reported task IDs before retrying:
+  publication is per task, not transactional.
+- As claimant, read outstanding amendments and run `accept-amends`. To exclude
+  a correction, use `--ignore-amend <event-file> --reason <text>`.
+- After rules change, run `ack-instructions`, read its diff and apply the changes
+  before another `run` or `review`/`question`. Outside in-progress work, claim a
+  new execution round to read the current rules.
+
+Claims and acknowledgements snapshot sorted, normalized instruction bodies,
+excluding frontmatter. `ack-instructions --json` returns `instruction_diff`;
+text output prints it. Acknowledgement changes state sequence, not brief revision.
+Commands already running are not stopped by later instruction edits.
+
+Pool/owner watches set `delivery: watch`; new claimants and one-shot registrations
+use `none`. Set an explicit capability with `entity register --delivery watch|none`.
+Use the suggested task amendment for a non-polling recipient; human senders can
+override with `msg send --force`, recorded as `forced: true`. Treat broadcast/tag
+messages as notices, not corrections.
 
 ### CLI contracts
 
@@ -119,7 +166,7 @@ comma-split `--add-depends-on` / `--remove-depends-on`.
 | --- | --- |
 | 0 | Success |
 | 1 | Usage, validation or not-found |
-| 2 | No work or not eligible (including WIP limit) |
+| 2 | No work, not eligible, or direct recipient does not poll |
 | 3 | Conflict, lost race, split-brain or permission denied |
 | 4 | Claims paused |
 | 124 | Watch timeout |
@@ -143,7 +190,8 @@ the state under `task`. `latest_event` is null or
 `{filename,type,entity_id,timestamp,body,truncated}`. Previews default to five lines;
 watch `--include-events` expands the surfaced events. `ttl_seconds` is null without
 a task override. Checkpoint/release event summaries also expose their structured
-manifest and command lifecycle fields when present.
+manifest and command lifecycle fields when present. Review event summaries add
+`ac: ["N:pass|fail|not-run"]` and `proposed_outcome`.
 
 A bucket uses plain Markdown directories:
 
@@ -184,15 +232,21 @@ You can manage the bucket directly in any text editor or with `node scripts/wb.m
 - Session modes are `once`, `continuous`, `owner`; non-owner pool watches record advisory `mode: "worker"`, also accepted by `entity register`.
 - Read optional `INSTRUCTIONS.md` and `tags/<tag>.md` bodies for every task tag before claiming/executing. `claim --json` includes `instructions: [{file, body}]`; task bodies need only task-specific content.
 - Correct `in-progress` tasks with `amend`; resume `review` with `feedback`, `blocked` with `answer`. Amend alone does not reopen actionable tasks and prints a warning.
-- Review bodies include claims, raw evidence with `file:line`, observed vs inferred conclusions, unverified items, files changed/diff status, and verification commands/output.
+- Keep review evidence in referenced files; distinguish verified claims from
+  inference and list unverified criteria.
 - Task corrections use task events; cross-cutting notices use public messages; parent reports use the harness; pauses use bucket-level pause.
 - Body-writing commands accept `--body-file <path>` or `--stdin`. Avoid shell substitution in multiline bodies:
 
 ```bash
-wb.mjs review --bucket "$BUCKET" --entity "$ENTITY" --task "$TASK" --stdin <<'REVIEW'
-- Claims: <claims>; raw evidence: <verbatim excerpt, file:line>.
-- Observed: <facts>; inferred: <interpretation>; unverified: <list>.
-- Files/diff status: <paths and status>; verification: <command and output>.
+wb.mjs review --bucket "$BUCKET" --entity "$ENTITY" --task "$TASK" \
+  --ac 1=pass --proposed-outcome pass --stdin <<'REVIEW'
+| Claim | Evidence |
+| --- | --- |
+| <verified result> | <path:line; verification command> |
+
+- Inferred: <conclusions not directly observed>.
+- Unverified: <criteria or none>.
+- Files/diff: <changed paths and remaining changes>.
 REVIEW
 ```
 
@@ -212,7 +266,11 @@ REVIEW
 - `render --tail-events N` limits history after any `--after-event` filter; `--latest-event` means one event, `--tail-events 0` means none. JSON is a top-level summary plus body/events. Events contain `{filename,type,entity_id,timestamp,body}`.
 - `list --bucket <dir>` emits one line per task: ID, status, assignee/claimed_by, revision, claim_round, latest event filename/type. Filter with repeatable/comma-separated `--status`, OR-matching `--tag`, `--owner`, `--assignee`, and `--claimed-by` (filters combine with AND). Empty assignee/claimant filter values select unassigned/unclaimed tasks. `--json` returns `{count,tasks:[summary]}`.
 - `claim --json` adds `unread_events` with full bodies: unaccepted amends, including those before the first claim, plus feedback since the previous round's claim. Amends remain visible across rounds until accepted, even if older than that previous claim.
-- The current executor uses `accept-amends` on an `in-progress` task. This preserves the original brief and appends unaccepted amendment bodies verbatim under chronological filename headings; apply their meaning during execution. It bumps revision once, stores `last_amend_seen`, and publishes a log of filenames before atomically updating `task.md`. A repeated call with no new amends fails without changes. Old manually merged amendments without a cursor are conservatively treated as unaccepted.
+- Use `accept-amends` to append outstanding corrections under filename headings
+  and advance `last_amend_seen`. Mixed receipts append only non-ignored bodies and
+  bump revision once; all-ignored receipts preserve the body and revision.
+  Receipt frontmatter records `accepted_amends`, `ignored_amends` and `ignore_reason`.
+  Read and receipt old manually merged amendments if they have no cursor.
 - Claim automatically registers/refreshes mode, dispatcher, host, bucket TTL and
   `claimed_task`. Wrap commands expected to exceed about TTL/2 with
   `run --bucket <dir> --entity <id> --task <id> [--log <file>] -- <command> [args...]`.

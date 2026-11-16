@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { parseArgs } from "node:util";
+import { CliError, parseCommand, printCommandHelp } from "./commands.mjs";
 
 const VALID_STATUSES = new Set([
   "draft",
@@ -39,20 +39,6 @@ const PRIORITY_RANK = {
   low: 3,
 };
 
-const VALID_EVENT_TYPES = new Set([
-  "created",
-  "claimed",
-  "amend",
-  "question",
-  "answer",
-  "log",
-  "review",
-  "feedback",
-  "complete",
-  "cancelled",
-  "reset",
-]);
-
 const CANONICAL_TASK_KEYS = [
   "id",
   "title",
@@ -70,16 +56,73 @@ const CANONICAL_TASK_KEYS = [
   "updated_at",
 ];
 
+const NON_TERMINAL_STATUSES = [...VALID_STATUSES].filter((status) => !TERMINAL_STATUSES.has(status));
+const TRANSITIONS = {
+  create: { from: [null], actor: "owner", to: null, event: "created" },
+  promote: { from: ["draft", "ready"], actor: "owner", to: "pending", targets: ["ready", "pending"] },
+  demote: { from: ["ready", "pending"], actor: "owner", to: "ready", targets: ["draft", "ready"] },
+  claim: { from: ["pending"], actor: "eligible", to: "in-progress", event: "claim-committed" },
+  amend: { from: NON_TERMINAL_STATUSES, actor: "owner", to: null },
+  review: { from: ["in-progress"], actor: "claimant", to: "review" },
+  question: { from: ["in-progress"], actor: "claimant", to: "blocked" },
+  feedback: { from: ["review"], actor: "owner", to: "pending" },
+  answer: { from: ["blocked"], actor: "owner", to: "pending" },
+  reset: { from: ["in-progress"], actor: "owner", to: "pending" },
+  complete: { from: NON_TERMINAL_STATUSES, actor: "owner", to: "complete" },
+  cancel: { from: NON_TERMINAL_STATUSES, actor: "owner", to: "cancelled", event: "cancelled" },
+  log: { from: NON_TERMINAL_STATUSES, actor: "participant", to: null },
+  note: { from: NON_TERMINAL_STATUSES, actor: "participant", to: null },
+  "accept-amends": { from: ["in-progress"], actor: "claimant", to: null, event: "log" },
+};
+
+function assertTransition(intent, item, entityId, context = {}) {
+  const rule = TRANSITIONS[intent];
+  const task = item?.task;
+  if (!rule || !rule.from.includes(task?.status ?? null)) {
+    throw new CliError(`Cannot ${intent} task in status "${task?.status ?? "missing"}".`, intent === "claim" ? 2 : 1);
+  }
+  if (intent === "create") return rule;
+  if (rule.actor === "eligible") {
+    if (!canClaim(item, entityId, context.workerTags, context.includeUntagged, context.byId)) {
+      throw new CliError(`Task "${task.id}" is not eligible for "${entityId}".`, 2);
+    }
+    return rule;
+  }
+  const winner = task.status === "in-progress"
+    ? getRoundClaims(item.eventsDir, task.claim_round).winner : null;
+  const claimant = winner?.entityId || task.claimed_by;
+  const owner = task.owner === entityId;
+  const dispatcher = claimant && readEntityFile(context.bucketDir, claimant)?.dispatcher === entityId;
+  if ((rule.actor === "owner" && !owner) ||
+      (rule.actor === "claimant" && claimant !== entityId) ||
+      (rule.actor === "participant" && !owner && claimant !== entityId && !dispatcher)) {
+    throw new CliError(
+      task.claimed_by === entityId && winner && winner.entityId !== entityId
+        ? `Split-brain claim conflict: round ${task.claim_round} winner is "${winner.entityId}", not "${entityId}".`
+        : `Permission denied: ${intent} requires ${rule.actor} authority on task "${task.id}".`,
+      3
+    );
+  }
+  const target = context.targetStatus ?? rule.to;
+  if (rule.targets && (!rule.targets.includes(target) || task.status === target)) {
+    throw new CliError(`Invalid ${intent} target "${target}".`);
+  }
+  if (context.metadataChange && (!["draft", "ready", "pending"].includes(task.status) || task.claimed_by)) {
+    throw new CliError("Metadata amendments require an unclaimed draft, ready or pending task.");
+  }
+  return rule;
+}
+
+function canClaim(item, entityId, workerTags = new Set(), includeUntagged = false, byId = new Map()) {
+  return item.task.status === "pending" && !item.task.claimed_by &&
+    (item.task.assignee === entityId || (!item.task.assignee &&
+      matchesTags(item.task, entityId, workerTags, includeUntagged))) &&
+    dependenciesSatisfied(item.task, byId) && !hasCompetingRoundClaim(item, entityId);
+}
+
 let tmpCounter = 0;
 let sessionNonce = process.env.WB_SESSION_NONCE || "";
 const warnedEntitySessions = new Set();
-
-class CliError extends Error {
-  constructor(message, exitCode = 1) {
-    super(message);
-    this.exitCode = exitCode;
-  }
-}
 
 function formatIsoUtc(date = new Date()) {
   return date.toISOString();
@@ -562,7 +605,7 @@ function findTask(bucketDir, taskId) {
 
 function parseEventFilenameParts(filename) {
   const m = filename.match(
-    /^(\d{8}T\d{6}(?:\d{3})?Z)-(.+)-(claim-committed|created|claimed|amend|question|answer|log|review|feedback|complete|cancelled|reset)(?:-(\d+))?\.md$/
+    /^(\d{8}T\d{6}(?:\d{3})?Z)-(.+)-(claim-committed|created|claimed|promote|demote|amend|question|answer|note|log|review|feedback|complete|cancelled|reset)(?:-(\d+))?\.md$/
   );
   if (!m) return null;
   return {
@@ -701,10 +744,20 @@ function serializeTaskSummary(item, includeEvents = false, eventLines = 5) {
     tags: item.task.tags,
     owner: item.task.owner,
     assignee: item.task.assignee,
+    affinity: item.task.affinity || "",
     claimed_by: item.task.claimed_by,
+    parent: item.task.parent,
+    depends_on: item.task.depends_on,
     revision: item.task.revision,
     claim_round: item.task.claim_round,
+    outcome: item.task.outcome || "",
+    last_amend_seen: item.task.last_amend_seen || "",
+    instructions_seen: item.task.instructions_seen || "",
+    state_seq: Number(item.task.state_seq) || 0,
+    updated_by: item.task.updated_by,
+    updated_at: item.task.updated_at,
     path: item.dir,
+    task_path: item.taskPath,
     latest_event: events.length ? readEventFile(item.eventsDir, events.at(-1), includeEvents, eventLines) : null,
   };
 }
@@ -1442,9 +1495,6 @@ function readBodyInput(values) {
   if (values.stdin) {
     return fs.readFileSync(0, "utf8");
   }
-  if (typeof values.body === "string") {
-    return values.body;
-  }
   if (typeof values.message === "string") {
     return values.message;
   }
@@ -1468,36 +1518,7 @@ function readStandingInstructions(bucketDir, task) {
 }
 
 function cmdCreate(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      bucket: { type: "string", short: "b" },
-      entity: { type: "string", short: "e" },
-      "session-nonce": { type: "string" },
-      title: { type: "string", short: "t" },
-      priority: { type: "string", short: "p", default: "medium" },
-      tag: { type: "string", multiple: true },
-      tags: { type: "string", multiple: true },
-      assignee: { type: "string", default: "" },
-      parent: { type: "string", default: "" },
-      "depends-on": { type: "string", multiple: true },
-      workspace: { type: "string", default: "" },
-      files: { type: "string", multiple: true },
-      description: { type: "string", default: "" },
-      ac: { type: "string", multiple: true },
-      body: { type: "string" },
-      "body-file": { type: "string" },
-      stdin: { type: "boolean", default: false },
-      slug: { type: "string" },
-      backlog: { type: "boolean", default: false },
-      draft: { type: "boolean", default: false },
-      status: { type: "string" },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
+  const { values } = parseCommand("create", argv);
 
   if (values.help) {
     printCreateHelp();
@@ -1511,6 +1532,7 @@ function cmdCreate(argv) {
   if (!values.title || !values.title.trim()) {
     throw new CliError("Missing required --title <text>.");
   }
+  assertTransition("create", null, entityId);
   const priority = String(values.priority || "medium").toLowerCase();
   if (!VALID_PRIORITIES.has(priority)) {
     throw new CliError(
@@ -1535,10 +1557,7 @@ function cmdCreate(argv) {
   if (values.assignee) validateIdentifier(values.assignee, "--assignee");
   if (values.parent) validateTaskId(values.parent);
 
-  const tags = normalizeTags([
-    ...parseListFlags(values.tag),
-    ...parseListFlags(values.tags),
-  ]);
+  const tags = normalizeTags(parseListFlags(values.tag));
   const dependsOn = parseListFlags(values["depends-on"]);
   for (const dep of dependsOn) validateTaskId(dep);
 
@@ -1582,7 +1601,7 @@ function cmdCreate(argv) {
       .join(", ");
     const acLines =
       values.ac && values.ac.length > 0
-        ? values.ac.map((c, idx) => `- [ ] #${idx + 1} ${c}`).join("\n")
+        ? parseListFlags(values.ac).map((c, idx) => `- [ ] #${idx + 1} ${c}`).join("\n")
         : "- [ ] #1 Verification command passes.";
     body = [
       "",
@@ -1631,12 +1650,8 @@ function cmdCreate(argv) {
     console.log(
       JSON.stringify(
         {
-          task_id: taskId,
-          stage: "tasks",
-          path: taskDir,
-          task_path: taskPath,
+          ...serializeTaskSummary({ stage: "tasks", task: taskData, dir: taskDir, taskPath, eventsDir }),
           created_event: createdEvent.filename,
-          task: taskData,
         },
         null,
         2
@@ -1650,22 +1665,7 @@ function cmdCreate(argv) {
 }
 
 async function cmdClaim(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      bucket: { type: "string", short: "b" },
-      entity: { type: "string", short: "e" },
-      "session-nonce": { type: "string" },
-      task: { type: "string" },
-      tag: { type: "string", multiple: true },
-      tags: { type: "string", multiple: true },
-      "include-untagged": { type: "boolean", default: false },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
+  const { values } = parseCommand("claim", argv);
 
   if (values.help) {
     printClaimHelp();
@@ -1677,18 +1677,13 @@ async function cmdClaim(argv) {
   const entityId = validateIdentifier(values.entity, "--entity");
   useEntitySession(bucketDir, entityId, values);
   const settleMs = readBucketConfig(bucketDir).claim_settle_ms;
-  const workerTags = new Set(
-    normalizeTags([
-      ...parseListFlags(values.tag),
-      ...parseListFlags(values.tags),
-    ])
-  );
+  const workerTags = new Set(normalizeTags(parseListFlags(values.tag)));
   const includeUntagged = Boolean(values["include-untagged"]);
 
   ensureBucketDirs(bucketDir);
 
   if (fs.existsSync(path.join(bucketDir, "PAUSED"))) {
-    throw new CliError("Bucket is paused (PAUSED exists); no tasks may be claimed.", 2);
+    throw new CliError("Bucket is paused (PAUSED exists); no tasks may be claimed.", 4);
   }
 
   const wip = getActiveWipTasks(bucketDir, entityId);
@@ -1705,22 +1700,9 @@ async function cmdClaim(argv) {
     validateTaskId(values.task);
     const found = byId.get(values.task);
     if (!found) {
-      throw new CliError(`Task "${values.task}" not found.`, 2);
+      throw new CliError(`Task "${values.task}" not found.`);
     }
-    const eligible =
-      found.task.status === "pending" &&
-      found.task.claimed_by === "" &&
-      (found.task.assignee === entityId ||
-        (found.task.assignee === "" &&
-          matchesTags(found.task, entityId, workerTags, includeUntagged))) &&
-      dependenciesSatisfied(found.task, byId) &&
-      !hasCompetingRoundClaim(found, entityId);
-    if (!eligible) {
-      throw new CliError(
-        `Task "${values.task}" is not eligible for "${entityId}" (status=${found.task.status}, claimed_by=${found.task.claimed_by || "none"}).`,
-        2
-      );
-    }
+    assertTransition("claim", found, entityId, { bucketDir, workerTags, includeUntagged, byId });
     candidates = [found];
   } else {
     candidates = findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged, true);
@@ -1743,6 +1725,8 @@ async function cmdClaim(argv) {
     if (preTask.status !== "pending" || preTask.claimed_by !== "") {
       continue;
     }
+    if (!canClaim({ ...candidate, task: preTask }, entityId, workerTags, includeUntagged, byId)) continue;
+    assertTransition("claim", { ...candidate, task: preTask }, entityId, { bucketDir, workerTags, includeUntagged, byId });
 
     const claimRound = Number(preTask.claim_round) || 1;
     const { winner: preWinner } = getRoundClaims(candidate.eventsDir, claimRound);
@@ -1789,8 +1773,11 @@ async function cmdClaim(argv) {
     }
 
     if (fs.existsSync(path.join(bucketDir, "PAUSED"))) {
-      throw new CliError("Bucket was paused during claim; task remains pending.", 2);
+      throw new CliError("Bucket was paused during claim; task remains pending.", 4);
     }
+    assertTransition("claim", { ...candidate, task: postTask }, entityId, {
+      bucketDir, workerTags, includeUntagged, byId: scanAllTasks(bucketDir).byId,
+    });
 
     postTask.status = "in-progress";
     postTask.claimed_by = entityId;
@@ -1808,7 +1795,7 @@ async function cmdClaim(argv) {
   }
 
   if (!claimedEntry || !finalTask) {
-    throw new CliError("Lost claim race; no remaining eligible tasks.", 2);
+    throw new CliError("Lost claim race; no remaining eligible tasks.", 3);
   }
 
   touchExistingEntity(bucketDir, entityId);
@@ -1820,14 +1807,10 @@ async function cmdClaim(argv) {
     console.log(
       JSON.stringify(
         {
-          task_id: finalTask.id,
-          stage: "tasks",
-          path: claimedEntry.dir,
-          task_path: claimedEntry.taskPath,
+          ...serializeTaskSummary({ ...claimedEntry, task: finalTask }),
           claimed_event: claimedEvent.filename,
           last_event_seen: lastEventSeen,
           events,
-          task: finalTask,
           instructions: readStandingInstructions(bucketDir, finalTask),
           unread_events: unreadTaskInstructions({ ...claimedEntry, task: finalTask }),
         },
@@ -1845,37 +1828,10 @@ async function cmdClaim(argv) {
   return 0;
 }
 
-function cmdPost(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      bucket: { type: "string", short: "b" },
-      entity: { type: "string", short: "e" },
-      "session-nonce": { type: "string" },
-      task: { type: "string" },
-      type: { type: "string" },
-      message: { type: "string", short: "m" },
-      "body-file": { type: "string" },
-      stdin: { type: "boolean", default: false },
-      status: { type: "string" },
-      "bump-revision": { type: "boolean", default: false },
-      "accept-amends": { type: "boolean", default: false },
-      outcome: { type: "string" },
-      assignee: { type: "string" },
-      "claimed-by": { type: "string" },
-      "add-depends-on": { type: "string", multiple: true },
-      "remove-depends-on": { type: "string", multiple: true },
-      "check-ac": { type: "boolean", default: false },
-      reopen: { type: "boolean", default: false },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
-
+function cmdTransition(command, argv) {
+  const { values } = parseCommand(command, argv);
   if (values.help) {
-    printPostHelp();
+    printCommandHelp(command);
     return 0;
   }
 
@@ -1884,11 +1840,9 @@ function cmdPost(argv) {
   const entityId = validateIdentifier(values.entity, "--entity");
   useEntitySession(bucketDir, entityId, values);
   const taskId = validateTaskId(values.task);
-  const eventType = String(values.type || "").toLowerCase();
-  if (!VALID_EVENT_TYPES.has(eventType)) {
-    throw new CliError(
-      `Invalid --type "${eventType}". Must be one of: ${Array.from(VALID_EVENT_TYPES).join(", ")}.`
-    );
+  const intent = command === "post" ? values.type || "log" : command;
+  if (command === "post" && !["log", "note"].includes(intent)) {
+    throw new CliError('post only accepts --type log|note; use an intent command. Run "wb.mjs post --help".');
   }
 
   ensureBucketDirs(bucketDir);
@@ -1896,103 +1850,25 @@ function cmdPost(argv) {
   if (!found) {
     throw new CliError(`Task "${taskId}" not found.`);
   }
-  if (found.task.status === "complete" || found.task.status === "cancelled") {
-    throw new CliError(`Task "${taskId}" is already ${found.task.status} and cannot be modified.`);
+  const addDeps = parseListFlags(values["add-depends-on"]);
+  const removeDeps = new Set(parseListFlags(values["remove-depends-on"]));
+  const metadataChange = values.assignee !== undefined || addDeps.length > 0 || removeDeps.size > 0;
+  const rule = assertTransition(intent, found, entityId, { bucketDir, targetStatus: values.status, metadataChange });
+  const eventType = rule.event || intent;
+  const targetStatus = values.status ?? rule.to;
+  if (values.outcome !== undefined && !["pass", "partial", "fail", "abandoned"].includes(values.outcome)) {
+    throw new CliError("--outcome must be pass|partial|fail|abandoned.");
   }
-
-  let targetStatus = values.status ? String(values.status).toLowerCase() : null;
-  if (targetStatus && !VALID_STATUSES.has(targetStatus)) {
-    throw new CliError(
-      `Invalid --status "${targetStatus}". Must be one of: ${Array.from(VALID_STATUSES).join(", ")}.`
-    );
-  }
-
-  // Convenience defaults for terminal/reset event types when --status is omitted
-  if (!targetStatus) {
-    if (eventType === "complete") targetStatus = "complete";
-    else if (eventType === "cancelled") targetStatus = "cancelled";
-    else if (eventType === "reset") targetStatus = "pending";
-    else if (values.reopen) targetStatus = "pending";
-  }
-
-  if (values.outcome !== undefined &&
-      (!["complete", "cancelled"].includes(targetStatus) ||
-       !["pass", "partial", "fail", "abandoned"].includes(values.outcome))) {
-    throw new CliError("--outcome requires complete/cancelled status and pass|partial|fail|abandoned.");
-  }
-  if (values["accept-amends"] && (eventType !== "log" || found.task.status !== "in-progress")) {
-    throw new CliError("--accept-amends requires --type log on an in-progress task.");
-  }
-  const acceptedAmends = values["accept-amends"]
+  const acceptedAmends = intent === "accept-amends"
     ? unreadTaskInstructions(found).filter((event) => event.type === "amend")
     : [];
-  if (values["accept-amends"] && acceptedAmends.length === 0) {
+  if (intent === "accept-amends" && acceptedAmends.length === 0) {
     throw new CliError("No unaccepted amend events.");
   }
 
-  const addDeps = parseListFlags(values["add-depends-on"]);
-  const removeDeps = new Set(parseListFlags(values["remove-depends-on"]));
-  for (const dep of addDeps) validateTaskId(dep);
-
-  const mutatesTaskMd = Boolean(
-    targetStatus ||
-      values["bump-revision"] ||
-      values.assignee !== undefined ||
-      values["claimed-by"] !== undefined ||
-      addDeps.length > 0 ||
-      removeDeps.size > 0 ||
-      values["check-ac"] ||
-      values.reopen ||
-      values["accept-amends"]
-  );
-
-  // Enforce single-writer rule and late-sync split-brain guard on task.md
-  let roundWinner = null;
-  if (mutatesTaskMd) {
-    const curStatus = found.task.status;
-    if (curStatus === "in-progress" && eventType !== "reset") {
-      const claimRound = Number(found.task.claim_round) || 1;
-      const { winner } = getRoundClaims(found.eventsDir, claimRound);
-      roundWinner = winner;
-      if (winner) {
-        if (winner.entityId !== entityId) {
-          const isClaimedBy = entityId === found.task.claimed_by;
-          throw new CliError(
-            isClaimedBy
-              ? `Split-brain claim conflict: round ${claimRound} winner is "${winner.entityId}", not "${entityId}".`
-              : `Single-writer violation: task "${taskId}" is in-progress (claimed_by="${found.task.claimed_by}"); "${entityId}" may only append events without modifying task.md.`,
-            isClaimedBy ? 2 : 1
-          );
-        }
-      } else if (entityId !== found.task.claimed_by) {
-        throw new CliError(
-          `Single-writer violation: task "${taskId}" is in-progress (claimed_by="${found.task.claimed_by}"); "${entityId}" may only append events without modifying task.md.`
-        );
-      }
-    } else if (curStatus === "blocked" || curStatus === "review") {
-      if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
-        throw new CliError(
-          `Single-writer violation: task "${taskId}" is ${curStatus} (owner="${found.task.owner}"); only owner may modify task.md.`
-        );
-      }
-    } else if (curStatus === "draft" || curStatus === "ready" || curStatus === "pending") {
-      if (found.task.owner && entityId !== found.task.owner && eventType !== "reset") {
-        throw new CliError(
-          `Single-writer violation: ${curStatus} task "${taskId}" belongs to owner "${found.task.owner}".`
-        );
-      }
-    }
-
-    if (
-      (curStatus === "draft" || curStatus === "ready" || curStatus === "pending") &&
-      targetStatus &&
-      ["in-progress", "blocked", "review"].includes(targetStatus)
-    ) {
-      throw new CliError(
-        `Invalid status transition: cannot set status "${targetStatus}" directly from status "${curStatus}".`
-      );
-    }
-  }
+  for (const dep of [...addDeps, ...removeDeps]) validateTaskId(dep);
+  if (values.assignee) validateIdentifier(values.assignee, "--assignee");
+  const mutatesTaskMd = Boolean(targetStatus || metadataChange || acceptedAmends.length);
 
   const now = new Date();
   const isoUtc = formatIsoUtc(now);
@@ -2001,64 +1877,30 @@ function cmdPost(argv) {
     ...(acceptedAmends.length ? [`Accepted amendments:\n${acceptedAmends.map((event) => `- ${event.filename}`).join("\n")}`] : []),
   ].filter(Boolean).join("\n\n");
   if (eventType === "amend" && ["review", "blocked"].includes(found.task.status)) {
-    console.error(`Warning: task "${taskId}" is ${found.task.status}; amend does not reopen it. Use feedback/answer --status pending to resume execution.`);
+    console.error(`Warning: task "${taskId}" is ${found.task.status}; amend does not reopen it. Use feedback/answer to resume execution.`);
   }
 
   const updatedTask = { ...found.task };
   let updatedBody = found.body;
 
   if (mutatesTaskMd) {
-    const returningFromActive =
-      (found.task.status === "in-progress" ||
-        found.task.status === "blocked" ||
-        found.task.status === "review") &&
-      targetStatus === "pending";
-    const returningToPinnedPending =
-      (found.task.status === "blocked" || found.task.status === "review") &&
-      targetStatus === "pending" &&
-      !values.reopen &&
-      eventType !== "reset";
-
-    if (targetStatus) {
-      updatedTask.status = targetStatus;
-    }
-    if (returningFromActive) {
+    if (targetStatus) updatedTask.status = targetStatus;
+    if (["feedback", "answer", "reset"].includes(intent)) {
       updatedTask.claim_round = (Number(updatedTask.claim_round) || 1) + 1;
+      updatedTask.claimed_by = "";
+      updatedTask.assignee = intent === "reset" || values.reopen
+        ? "" : found.task.claimed_by || found.task.assignee;
+      if (intent === "reset" || values.reopen) updatedTask.affinity = "";
     }
-    if (values["bump-revision"] || values["accept-amends"] ||
-        (["review", "blocked"].includes(found.task.status) &&
-         targetStatus === "pending" && ["feedback", "answer"].includes(eventType))) {
+    if (["feedback", "answer", "accept-amends"].includes(intent) || metadataChange) {
       updatedTask.revision = (Number(updatedTask.revision) || 1) + 1;
     }
-    if (values["claimed-by"] !== undefined) {
-      if (values["claimed-by"]) validateIdentifier(values["claimed-by"], "--claimed-by");
-      updatedTask.claimed_by = values["claimed-by"];
-    } else if (
-      targetStatus === "complete" ||
-      targetStatus === "cancelled" ||
-      eventType === "reset" ||
-      values.reopen ||
-      returningToPinnedPending ||
-      returningFromActive
-    ) {
+    if (TERMINAL_STATUSES.has(targetStatus)) {
       updatedTask.claimed_by = "";
-    } else if (roundWinner && roundWinner.entityId === entityId) {
-      // Heal claimed_by if a split-brain loser overwrote task.md via LWW sync
+    } else if (rule.actor === "claimant") {
       updatedTask.claimed_by = entityId;
     }
-
-    if (values.assignee !== undefined) {
-      if (values.assignee) validateIdentifier(values.assignee, "--assignee");
-      updatedTask.assignee = values.assignee;
-    } else if (values.reopen || eventType === "reset") {
-      updatedTask.assignee = "";
-    } else if (returningToPinnedPending && !updatedTask.assignee && found.task.claimed_by) {
-      updatedTask.assignee = found.task.claimed_by;
-    }
-
-    if (values["check-ac"]) {
-      updatedBody = updatedBody.replace(/^(\s*[-*]\s+)\[ \]/gm, "$1[x]");
-    }
+    if (values.assignee !== undefined) updatedTask.assignee = values.assignee;
     if (acceptedAmends.length) {
       updatedBody = `${updatedBody.trimEnd()}\n\n${acceptedAmends.map((event) =>
         `## Amendment: ${event.filename}\n\n${event.body}`).join("\n\n")}\n`;
@@ -2087,14 +1929,11 @@ function cmdPost(argv) {
     console.log(
       JSON.stringify(
         {
-          task_id: updatedTask.id,
-          stage: "tasks",
-          path: found.dir,
+          ...serializeTaskSummary({ ...found, task: updatedTask }),
           event: eventResult.filename,
           task_updated: mutatesTaskMd,
           previous_revision: found.task.revision,
           previous_claim_round: found.task.claim_round,
-          task: updatedTask,
         },
         null,
         2
@@ -2112,20 +1951,7 @@ function cmdPost(argv) {
 }
 
 function cmdRender(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      bucket: { type: "string", short: "b" },
-      task: { type: "string" },
-      "after-event": { type: "string" },
-      "tail-events": { type: "string" },
-      "latest-event": { type: "boolean", default: false },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
+  const { values } = parseCommand("render", argv);
 
   if (values.help) {
     printRenderHelp();
@@ -2190,11 +2016,8 @@ function cmdRender(argv) {
     console.log(
       JSON.stringify(
         {
-          task_id: found.task.id,
-          stage: found.stage,
-          path: found.dir,
+          ...serializeTaskSummary(found),
           claim_winner: claimWinner,
-          task: found.task,
           body: found.body.trim(),
           events,
         },
@@ -2228,36 +2051,27 @@ function cmdRender(argv) {
 }
 
 function cmdList(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      bucket: { type: "string", short: "b" },
-      status: { type: "string", multiple: true },
-      tag: { type: "string", multiple: true },
-      tags: { type: "string", multiple: true },
-      owner: { type: "string" },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
+  const { values } = parseCommand("list", argv);
   if (values.help) {
     printListHelp();
     return 0;
   }
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
   if (values.owner) validateIdentifier(values.owner, "--owner");
+  if (values.assignee) validateIdentifier(values.assignee, "--assignee");
+  if (values["claimed-by"]) validateIdentifier(values["claimed-by"], "--claimed-by");
   const statuses = new Set(parseListFlags(values.status));
   for (const status of statuses) {
     if (!VALID_STATUSES.has(status)) throw new CliError(`Invalid --status "${status}".`);
   }
-  const tags = new Set(normalizeTags([...parseListFlags(values.tag), ...parseListFlags(values.tags)]));
+  const tags = new Set(normalizeTags(parseListFlags(values.tag)));
   const tasks = listTasks(path.resolve(values.bucket))
     .filter(({ task }) =>
       (!statuses.size || statuses.has(task.status)) &&
       (!tags.size || task.tags.some((tag) => tags.has(tag))) &&
-      (!values.owner || task.owner === values.owner))
+       (!values.owner || task.owner === values.owner) &&
+       (values.assignee === undefined || task.assignee === values.assignee) &&
+       (values["claimed-by"] === undefined || task.claimed_by === values["claimed-by"]))
     .sort(sortByPriorityAndAge)
     .map((item) => serializeTaskSummary(item));
   if (values.json) {
@@ -2271,19 +2085,9 @@ function cmdList(argv) {
 }
 
 function cmdFsck(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      bucket: { type: "string", short: "b" },
-      repair: { type: "boolean", default: false },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
+  const { values } = parseCommand("fsck", argv);
   if (values.help) {
-    console.log("Usage: wb.mjs fsck --bucket <dir> [--repair] [--json]\nReplay state snapshots, report legacy history and drift; never repair terminal tasks.");
+    printCommandHelp("fsck");
     return 0;
   }
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -2405,19 +2209,9 @@ function cmdBucket(argv) {
     return 0;
   }
   if (!["pause", "resume"].includes(action)) throw new CliError(`Unknown bucket action "${action}". Expected: pause, resume.`);
-  const { values } = parseArgs({
-    args: rest,
-    options: {
-      bucket: { type: "string", short: "b" },
-      message: { type: "string", short: "m" },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
+  const { values } = parseCommand(`bucket ${action}`, rest);
   if (values.help) {
-    printBucketHelp();
+    printCommandHelp(`bucket ${action}`);
     return 0;
   }
   if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -2425,7 +2219,7 @@ function cmdBucket(argv) {
   ensureBucketDirs(bucketDir);
   const pausePath = path.join(bucketDir, "PAUSED");
   if (action === "pause") {
-    atomicWriteFile(pausePath, `${String(values.message || "Paused.").replace(/\r/g, "").trim()}\n`);
+    atomicWriteFile(pausePath, `${String(readBodyInput(values) || "Paused.").replace(/\r/g, "").trim()}\n`);
   } else {
     try {
       fs.unlinkSync(pausePath);
@@ -2440,32 +2234,7 @@ function cmdBucket(argv) {
 }
 
 async function cmdWatch(argv) {
-  const { values } = parseArgs({
-    args: argv,
-    options: {
-      bucket: { type: "string", short: "b" },
-      entity: { type: "string", short: "e" },
-      "session-nonce": { type: "string" },
-      task: { type: "string" },
-      tag: { type: "string", multiple: true },
-      tags: { type: "string", multiple: true },
-      "include-untagged": { type: "boolean", default: false },
-      "owner-only": { type: "boolean", default: false },
-      "all-actionable": { type: "boolean", default: false },
-      "exclude-task": { type: "string", multiple: true },
-      "include-events": { type: "boolean", default: false },
-      "event-lines": { type: "string", default: "5" },
-      "after-event": { type: "string" },
-      "after-msg": { type: "string" },
-      "since-status": { type: "string" },
-      "poll-ms": { type: "string", default: "1000" },
-      timeout: { type: "string", default: "0" },
-      json: { type: "boolean", default: false },
-      help: { type: "boolean", short: "h", default: false },
-    },
-    strict: true,
-    allowPositionals: false,
-  });
+  const { values } = parseCommand("watch", argv);
 
   if (values.help) {
     printWatchHelp();
@@ -2478,7 +2247,7 @@ async function cmdWatch(argv) {
   const entityId = values.entity ? validateIdentifier(values.entity, "--entity") : null;
   if (entityId) useEntitySession(bucketDir, entityId, values);
   const ownerOnly = Boolean(values["owner-only"]);
-  const excludedTasks = new Set(values["exclude-task"] ?? []);
+  const excludedTasks = new Set(parseListFlags(values["exclude-task"]));
   for (const taskId of excludedTasks) validateTaskId(taskId);
   const eventLines = Number(values["event-lines"]);
   if (!Number.isInteger(eventLines) || eventLines < 0) {
@@ -2494,17 +2263,14 @@ async function cmdWatch(argv) {
     throw new CliError("--owner-only cannot be combined with --task.");
   }
 
-  const workerTags = new Set(
-    normalizeTags([
-      ...parseListFlags(values.tag),
-      ...parseListFlags(values.tags),
-    ])
-  );
+  const workerTags = new Set(normalizeTags(parseListFlags(values.tag)));
   const includeUntagged = Boolean(values["include-untagged"]);
-  const pollMs = Math.max(50, Number.parseInt(values["poll-ms"], 10) || 1000);
+  const pollMs = Number(values["poll-ms"]);
+  if (!Number.isSafeInteger(pollMs) || pollMs < 1) throw new CliError("--poll-ms must be a positive integer.");
   const config = readBucketConfig(bucketDir);
   const msgCoalesceMs = config.msg_coalesce_ms;
-  const timeoutSec = Math.max(0, Number.parseFloat(values.timeout) || 0);
+  const timeoutSec = Number(values.timeout);
+  if (!Number.isFinite(timeoutSec) || timeoutSec < 0) throw new CliError("--timeout must be a non-negative number.");
 
   ensureBucketDirs(bucketDir);
 
@@ -2521,6 +2287,7 @@ async function cmdWatch(argv) {
   let initialTaskState = null;
   if (watchTaskId) {
     const initial = findTask(bucketDir, watchTaskId);
+    if (!initial) throw new CliError(`Task "${watchTaskId}" not found.`);
     if (initial) {
       initialTaskState = {
         stage: initial.stage,
@@ -2539,7 +2306,7 @@ async function cmdWatch(argv) {
         if (initialTaskState) {
           return {
             mode: "task",
-            task_id: watchTaskId,
+            id: watchTaskId,
             reason: "removed",
             stage: null,
             status: null,
@@ -2580,24 +2347,15 @@ async function cmdWatch(argv) {
       if (newEvents.length > 0 || statusChanged || stageChanged || appeared) {
         return {
           mode: "task",
-          task_id: watchTaskId,
+          ...serializeTaskSummary(current, values["include-events"], eventLines),
           reason: newEvents.length ? "new_events" : statusChanged ? "status_changed" : "appeared",
-          stage: current.stage,
-          path: current.dir,
-          status: current.task.status,
           previous_status: baselineStatus,
           status_changed: statusChanged,
           stage_changed: stageChanged,
           new_events: newEvents,
           last_event_seen:
             currentEvents.length > 0 ? currentEvents[currentEvents.length - 1] : "",
-          task: current.task,
           paused: fs.existsSync(path.join(bucketDir, "PAUSED")),
-          revision: current.task.revision,
-          claim_round: current.task.claim_round,
-          claimed_by: current.task.claimed_by,
-          assignee: current.task.assignee,
-          latest_event: currentEvents.length ? readEventFile(current.eventsDir, currentEvents.at(-1), values["include-events"], eventLines) : null,
           events: newEvents.map((filename) => readEventFile(current.eventsDir, filename, values["include-events"], eventLines)),
         };
       }
@@ -2730,7 +2488,7 @@ async function cmdWatch(argv) {
       }
     } else {
       console.log(
-        `Task update for ${result.task_id}: stage=${result.stage} status=${result.status} revision=${result.revision ?? "-"} claim_round=${result.claim_round ?? "-"} claimed_by=${result.claimed_by || "-"} assignee=${result.assignee || "-"}`
+        `Task update for ${result.id}: stage=${result.stage} status=${result.status} revision=${result.revision ?? "-"} claim_round=${result.claim_round ?? "-"} claimed_by=${result.claimed_by || "-"} assignee=${result.assignee || "-"}`
       );
       if (result.status_changed) {
         console.log(`Status changed: ${result.previous_status} -> ${result.status}`);
@@ -2930,28 +2688,9 @@ function cmdMsg(argv) {
   }
 
   if (action === "send") {
-    const { values } = parseArgs({
-      args: rest,
-      options: {
-        bucket: { type: "string", short: "b" },
-        entity: { type: "string", short: "e" },
-        "session-nonce": { type: "string" },
-        to: { type: "string", multiple: true },
-        tag: { type: "string", multiple: true },
-        tags: { type: "string", multiple: true },
-        slug: { type: "string" },
-        message: { type: "string", short: "m" },
-        body: { type: "string" },
-        "body-file": { type: "string" },
-        stdin: { type: "boolean", default: false },
-        json: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
-      },
-      strict: true,
-      allowPositionals: false,
-    });
+    const { values } = parseCommand("msg send", rest);
     if (values.help) {
-      printMsgHelp();
+      printCommandHelp("msg send");
       return 0;
     }
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -2967,10 +2706,7 @@ function cmdMsg(argv) {
     for (const r of rawTo) {
       if (r !== "*") validateIdentifier(r, "--to");
     }
-    const tags = normalizeTags([
-      ...parseListFlags(values.tag),
-      ...parseListFlags(values.tags),
-    ]);
+    const tags = normalizeTags(parseListFlags(values.tag));
     const toList = rawTo.length > 0 ? rawTo : tags.length > 0 ? [] : ["*"];
 
     ensureBucketDirs(bucketDir);
@@ -3003,24 +2739,9 @@ function cmdMsg(argv) {
   }
 
   if (action === "list") {
-    const { values } = parseArgs({
-      args: rest,
-      options: {
-        bucket: { type: "string", short: "b" },
-        entity: { type: "string", short: "e" },
-        tag: { type: "string", multiple: true },
-        tags: { type: "string", multiple: true },
-        "after-msg": { type: "string" },
-        unread: { type: "boolean", default: false },
-        all: { type: "boolean", default: false },
-        json: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
-      },
-      strict: true,
-      allowPositionals: false,
-    });
+    const { values } = parseCommand("msg list", rest);
     if (values.help) {
-      printMsgHelp();
+      printCommandHelp("msg list");
       return 0;
     }
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -3029,12 +2750,7 @@ function cmdMsg(argv) {
     if (values.unread && !entityId) {
       throw new CliError("--unread requires --entity <id>.");
     }
-    const workerTags = new Set(
-      normalizeTags([
-        ...parseListFlags(values.tag),
-        ...parseListFlags(values.tags),
-      ])
-    );
+    const workerTags = new Set(normalizeTags(parseListFlags(values.tag)));
 
     const messagesDir = path.join(bucketDir, "messages");
     try {
@@ -3102,20 +2818,9 @@ function cmdEntity(argv) {
   }
 
   if (action === "end") {
-    const { values } = parseArgs({
-      args: rest,
-      options: {
-        bucket: { type: "string", short: "b" },
-        entity: { type: "string", short: "e" },
-        target: { type: "string" },
-        json: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
-      },
-      strict: true,
-      allowPositionals: false,
-    });
+    const { values } = parseCommand("entity end", rest);
     if (values.help) {
-      printEntityHelp();
+      printCommandHelp("entity end");
       return 0;
     }
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -3134,29 +2839,9 @@ function cmdEntity(argv) {
   }
 
   if (action === "register") {
-    const { values } = parseArgs({
-      args: rest,
-      options: {
-        bucket: { type: "string", short: "b" },
-        entity: { type: "string", short: "e" },
-        "session-nonce": { type: "string" },
-        tag: { type: "string", multiple: true },
-        tags: { type: "string", multiple: true },
-        "include-untagged": { type: "boolean", default: false },
-        mode: { type: "string" },
-        ttl: { type: "string" },
-        message: { type: "string", short: "m" },
-        body: { type: "string" },
-        "body-file": { type: "string" },
-        stdin: { type: "boolean", default: false },
-        json: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
-      },
-      strict: true,
-      allowPositionals: false,
-    });
+    const { values } = parseCommand("entity register", rest);
     if (values.help) {
-      printEntityHelp();
+      printCommandHelp("entity register");
       return 0;
     }
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -3167,16 +2852,14 @@ function cmdEntity(argv) {
       throw new CliError(`Invalid --mode "${values.mode}".`);
     }
     ensureBucketDirs(bucketDir);
-    const tags = normalizeTags([
-      ...parseListFlags(values.tag),
-      ...parseListFlags(values.tags),
-    ]);
-    const ttlSec = values.ttl
-      ? Math.max(10, Number.parseInt(values.ttl, 10) || DEFAULT_ENTITY_TTL_SECONDS)
-      : undefined;
+    const tags = normalizeTags(parseListFlags(values.tag));
+    const ttlSec = values.ttl !== undefined ? Number(values.ttl) : undefined;
+    if (ttlSec !== undefined && (!Number.isSafeInteger(ttlSec) || ttlSec < 1)) {
+      throw new CliError("--ttl must be a positive integer.");
+    }
     const note = readBodyInput(values);
     const saved = upsertEntityFile(bucketDir, entityId, {
-      ...(values.tag || values.tags ? { tags } : {}),
+      ...(values.tag ? { tags } : {}),
       ...(values["include-untagged"] ? { include_untagged: true } : {}),
       ...(values.mode ? { mode: values.mode } : {}),
       ...(ttlSec !== undefined ? { ttl_seconds: ttlSec } : {}),
@@ -3194,20 +2877,9 @@ function cmdEntity(argv) {
   }
 
   if (action === "list") {
-    const { values } = parseArgs({
-      args: rest,
-      options: {
-        bucket: { type: "string", short: "b" },
-        online: { type: "boolean", default: false },
-        all: { type: "boolean", default: false },
-        json: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
-      },
-      strict: true,
-      allowPositionals: false,
-    });
+    const { values } = parseCommand("entity list", rest);
     if (values.help) {
-      printEntityHelp();
+      printCommandHelp("entity list");
       return 0;
     }
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -3242,35 +2914,18 @@ function cmdTag(argv) {
   }
 
   if (action === "set") {
-    const { values } = parseArgs({
-      args: rest,
-      options: {
-        bucket: { type: "string", short: "b" },
-        entity: { type: "string", short: "e" },
-        "session-nonce": { type: "string" },
-        tag: { type: "string" },
-        message: { type: "string", short: "m" },
-        body: { type: "string" },
-        "body-file": { type: "string" },
-        stdin: { type: "boolean", default: false },
-        json: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
-      },
-      strict: true,
-      allowPositionals: false,
-    });
+    const { values } = parseCommand("tag set", rest);
     if (values.help) {
-      printTagHelp();
+      printCommandHelp("tag set");
       return 0;
     }
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
     const bucketDir = path.resolve(values.bucket);
     const entityId = validateIdentifier(values.entity, "--entity");
     useEntitySession(bucketDir, entityId, values);
-    const tagName = validateIdentifier(
-      String(values.tag || "").trim().toLowerCase(),
-      "--tag"
-    );
+    const tags = normalizeTags(parseListFlags(values.tag));
+    if (tags.length !== 1) throw new CliError("tag set requires exactly one --tag.");
+    const tagName = validateIdentifier(tags[0], "--tag");
     const description = readBodyInput(values);
     ensureBucketDirs(bucketDir);
     const isoUtc = formatIsoUtc(new Date());
@@ -3299,18 +2954,9 @@ function cmdTag(argv) {
   }
 
   if (action === "list") {
-    const { values } = parseArgs({
-      args: rest,
-      options: {
-        bucket: { type: "string", short: "b" },
-        json: { type: "boolean", default: false },
-        help: { type: "boolean", short: "h", default: false },
-      },
-      strict: true,
-      allowPositionals: false,
-    });
+    const { values } = parseCommand("tag list", rest);
     if (values.help) {
-      printTagHelp();
+      printCommandHelp("tag list");
       return 0;
     }
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
@@ -3335,166 +2981,43 @@ function cmdTag(argv) {
 }
 
 function printMainHelp() {
-  console.log(`Usage: wb.mjs <subcommand> [options]
-
-Subcommands:
-  create   Create a new task in tasks/ with initial created event
-  claim    Claim an eligible task via lockless 2-phase event election
-  post     Append an immutable event to events/ and optionally transition task.md
-  watch    Block with native fs.watch + 1000ms stat polling until work, owner update, or messages arrive
-  render   Render task.md and chronologically sorted events/*.md
-  list     List one compact line per task, with optional filters
-  fsck     Replay state snapshots and optionally repair non-terminal frontmatter
-  bucket   Pause or resume executor claims via the plain PAUSED file
-  msg      Send or list public messages in messages/
-  entity   Register or list advisory entity presence in entities/
-  tag      Document or list capability tags in tags/
-
-All entity-writing commands accept --session-nonce <token> (or WB_SESSION_NONCE).
-Register the entity first; a different live nonce warns but does not lock out or block writes.
-Omitting a nonce preserves the stored value without collision detection.
-Run "wb.mjs <subcommand> --help" for subcommand options.`);
+  printCommandHelp();
 }
 
 function printCreateHelp() {
-  console.log(`Usage: wb.mjs create --bucket <dir> --entity <id> --title <text> [options]
-  --priority <low|medium|high|critical>  Task priority (default: medium)
-  --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
-  --assignee <entity_id>                 Optional target executor
-  --parent <task_id>                     Optional parent task_id
-  --depends-on <id1,id2>                 Upstream task_ids that must be complete
-  --backlog / --draft                    Create with status "draft"
-  --status <draft|ready|pending>         Initial status (default: pending)
-  --workspace <path>                     Workspace path for default template
-  --files <f1,f2>                        Relevant files for default template
-  --description <text>                   Description for default template
-  --ac <criterion>                       Acceptance criterion (repeatable)
-  --body <markdown> | --body-file <path> | --stdin   Custom Markdown body
-  --slug <slug>                          Override auto-generated task slug
-  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
-  --json                                 Output JSON`);
+  printCommandHelp("create");
 }
 
 function printClaimHelp() {
-  console.log(`Usage: wb.mjs claim --bucket <dir> --entity <id> [options]
-  --task <task_id>                       Claim a specific task (otherwise picks top eligible)
-  --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
-  --include-untagged                     Also accept untagged tasks when --tag is set
-  bucket.md                             claim_settle_ms: positive settle wait (local: 250; shared/cloud: 2000)
-  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
-  --json                                 Output JSON, including instructions: [{file, body}] and unread_events
-  unread_events includes full unaccepted amend bodies (including pre-claim amends) and feedback since
-  the previous round's claim. Read these before executing; accepted amendments are not repeated.
-  Read optional INSTRUCTIONS.md and each task tag's tags/<tag>.md body before claiming/executing.
-  All claims, including pinned reclaims, settle before checking the round winner.
-  PAUSED refuses claims (exit 2), including a pause detected during settle.`);
-}
-
-function printPostHelp() {
-  console.log(`Usage: wb.mjs post --bucket <dir> --entity <id> --task <id> --type <type> [options]
-  --type <type>                          created|claimed|amend|question|answer|log|review|feedback|complete|cancelled|reset
-  --message <text> | --body-file <path> | --stdin    Event body
-  --status <status>                      draft|ready|pending|in-progress|blocked|review|complete|cancelled
-  --bump-revision                        Increment revision (feedback/answer to pending already bump once)
-  --accept-amends                        With --type log: append unaccepted amend bodies to task.md,
-                                        bump revision once, record last_amend_seen and log filenames
-  --outcome <pass|partial|fail|abandoned>  Optional result on complete/cancelled status
-  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
-  --assignee <id>                        Update assignee (pass "" to clear)
-  --claimed-by <id>                      Update claimed_by (pass "" to clear)
-  --add-depends-on <id1,id2>             Append task IDs to depends_on
-  --remove-depends-on <id1,id2>          Remove task IDs from depends_on
-  --check-ac                             Check all '- [ ]' acceptance criteria boxes to '- [x]'
-  --reopen                               Reset status to pending, increment claim_round, clear claimed_by/assignee
-  --json                                 Output JSON, including previous_revision/previous_claim_round
-  Feedback/answer returning review/blocked to pending automatically increment revision and claim_round.
-  Amend on review/blocked warns; it does not reopen the task.
-  --accept-amends is executor-only on in-progress tasks, preserves original text and appends amendments
-  verbatim in chronological sections. No unaccepted amends is an error; it never double-applies them.
-  A completed investigation can have outcome fail/partial; abandoned means work was not finished.`);
+  printCommandHelp("claim");
 }
 
 function printWatchHelp() {
-  console.log(`Usage: wb.mjs watch --bucket <dir> [--entity <id>] [--task <id>] [options]
-  --entity <id>                          Watch for tasks, owned blocked/review tasks, and unread messages
-  --owner-only                           Do not wake for claimable tasks (owner updates + messages only)
-  --all-actionable                       Include all owned review/blocked tasks, even already delivered
-  --exclude-task <id>                    Exclude a task from pool/owner results (repeatable)
-  --event-lines <N>                      Event body preview lines (default: 5; 0 for metadata only)
-  --include-events                       Include full bodies instead of previews
-  --task <task_id>                       Watch a specific task for new events or status change
-  --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
-  --include-untagged                     Also match untagged tasks when --tag is set
-  --after-event <filename>               Wake immediately if events newer than filename exist
-  --after-msg <filename>                 Override stored last_msg_seen cursor
-  --since-status <status>                Wake immediately if task status differs from status
-  --poll-ms <ms>                         Stat polling fallback interval (default: 1000)
-  bucket.md                             msg_coalesce_ms and default_ttl_seconds configure watches
-  --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
-  --timeout <seconds>                    Optional timeout (exits 124)
-  --json                                 Output JSON
-  Pool watches skip pending tasks with any claimed event for the current claim_round.
-  Owner updates are edge-triggered; delivery stores per-task owner_task_seen cursors in entities/<id>.md.
-  Stale owned in-progress tasks wake with reason "stale" and stale_tasks containing heartbeat details.
-  Requires a registered claimed_by entity; each claim-round/heartbeat is delivered once (stale_task_seen).
-  Pool watch returns reason "paused", paused:true and no ready tasks while PAUSED exists: stop the
-  executor loop until explicitly resumed. Owner-only watches still deliver reviews/messages/stalls,
-  but do not wake solely for pause; task watches retain lifecycle updates and include paused.
-  Task summaries include revision, claim_round, claimed_by, assignee and latest_event
-  {filename,type,entity_id,timestamp,body,truncated}. --task also includes events for new_events filenames.
-  --include-events expands only the surfaced events, not the entire task history.`);
+  printCommandHelp("watch");
 }
 
 function printRenderHelp() {
-  console.log(`Usage: wb.mjs render --bucket <dir> --task <task_id> [options]
-  --after-event <filename>               Only include events newer than filename
-  --tail-events <N>                      Last N events after filtering (0 for no events)
-  --latest-event                         Alias for --tail-events 1; cannot combine both
-  --json                                 Output {task_id,stage,path,claim_winner,task,body,events}
-  task holds frontmatter fields (e.g. task.status); events is an array of
-  {filename,type,entity_id,timestamp,body}. Default includes the full event history.`);
+  printCommandHelp("render");
 }
 
 function printListHelp() {
-  console.log(`Usage: wb.mjs list --bucket <dir> [options]
-  --status <status>                      Filter lifecycle states (repeatable / comma-separated)
-  --tag <tag> / --tags <a,b>             Filter task tags (OR; repeatable / comma-separated)
-  --owner <id>                           Filter owner (combined with other filters using AND)
-  --json                                 Output {count,tasks:[{id,status,assignee,claimed_by,
-                                        revision,claim_round,latest_event,...}]}
-  Text output is one line per task with the latest event filename/type; JSON previews 5 body lines.`);
+  printCommandHelp("list");
 }
 
 function printBucketHelp() {
-  console.log(`Usage: wb.mjs bucket <pause|resume> --bucket <dir> [options]
-  pause [-m <reason>]                    Atomically create plain PAUSED file; stop new claims
-  resume                                Remove PAUSED (also succeeds if already absent)
-  --json                                 Output {paused,path}
-  Humans may create/remove PAUSED directly. Pause is not cancellation; owners may still review.
-  Executors stop at checkpoints and wait for explicit resume instructions before re-arming pool watch.`);
+  printCommandHelp("bucket");
 }
 
 function printMsgHelp() {
-  console.log(`Usage: wb.mjs msg <send|list> --bucket <dir> [options]
-  send --entity <id> [--to <id|*,...>] [--tag <t>] [--slug <s>] -m <text> [--session-nonce <token>] [--json]
-       Optional session marker also reads WB_SESSION_NONCE.
-  list [--entity <id>] [--tag <t>] [--after-msg <file>] [--unread] [--all] [--json]`);
+  printCommandHelp("msg");
 }
 
 function printEntityHelp() {
-  console.log(`Usage: wb.mjs entity <register|end|list> --bucket <dir> [options]
-  register --entity <id> [--tag <t>] [--include-untagged] [--mode <m>] [--ttl <sec>] [-m <note>] [--session-nonce <token>] [--json]
-       Nonce defaults to WB_SESSION_NONCE; different live nonce warns, not an exclusive lease.
-       Writes preserve the nonce when omitted; explicit flag overrides the environment.
-  end --entity <id> [--target <child>]    End self or a child with a recorded dispatcher relationship
-  list [--online] [--all] [--json]        Default hides ended entities and entities older than 3x TTL`);
+  printCommandHelp("entity");
 }
 
 function printTagHelp() {
-  console.log(`Usage: wb.mjs tag <set|list> --bucket <dir> [options]
-  set --entity <id> --tag <name> [-m <description>] [--session-nonce <token>] [--json]
-       Optional session marker also reads WB_SESSION_NONCE.
-  list [--json]`);
+  printCommandHelp("tag");
 }
 
 async function main(argv = process.argv.slice(2)) {
@@ -3510,7 +3033,19 @@ async function main(argv = process.argv.slice(2)) {
     case "claim":
       return await cmdClaim(rest);
     case "post":
-      return cmdPost(rest);
+    case "promote":
+    case "demote":
+    case "amend":
+    case "review":
+    case "question":
+    case "feedback":
+    case "answer":
+    case "reset":
+    case "complete":
+    case "cancel":
+    case "log":
+    case "accept-amends":
+      return cmdTransition(sub, rest);
     case "watch":
       return await cmdWatch(rest);
     case "render":
@@ -3542,13 +3077,9 @@ if (isEntrypoint) {
       process.exitCode = code;
     })
     .catch((err) => {
-      if (err instanceof CliError) {
-        console.error(err.message);
-        process.exitCode = err.exitCode;
-      } else {
-        console.error(err?.stack || String(err));
-        process.exitCode = 1;
-      }
+      const message = String(err.message || err).replace(/\s+/g, " ");
+      console.error(`${message}${message.includes('Run "wb.mjs') ? "" : ` Run "wb.mjs ${process.argv.slice(2).filter((arg) => !arg.startsWith("-")).slice(0, 1).join("")} --help".`}`);
+      process.exitCode = err instanceof CliError ? err.exitCode : 1;
     });
 }
 
@@ -3565,4 +3096,5 @@ export {
   writeUniqueMarkdown,
   writeUniqueEvent,
   writeUniqueMessage,
+  TRANSITIONS,
 };

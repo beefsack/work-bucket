@@ -54,6 +54,14 @@ msg_coalesce_ms: 500
 | Pinned reclaims skip settle | Every election settles |
 | Second-precision event/message names | Millisecond names; old names remain readable |
 | Entity list includes all historical identities | `entity list --all`; `entity end` marks exit |
+| `post --type review --status review` (and other lifecycle combinations) | Intent commands: `review`, `question`, `feedback`, `answer`, `reset`, `complete`, `cancel`, `promote`, `demote` |
+| Generic `post` changes state or metadata | `post` only appends `log`/`note`; owner metadata changes use `amend` on unclaimed draft/ready/pending tasks |
+| `post --type log --accept-amends` | `accept-amends` |
+| `--bump-revision` | Intent commands advance revision/round when required |
+| `--check-ac` mutates all boxes | Removed; reviews do not change the owner's brief |
+| `--body`, `--tags` | `-m`/`--message`, `--body-file`, `--stdin`; repeatable/comma-split `--tag` |
+| Nested `task` or `task_id` JSON fields | Top-level task-summary fields, with `id` |
+| Claim not-found/paused/conflict all exit 2 | Not-found 1, conflict/permission 3, paused 4 |
 
 `fsck --bucket <dir>` is read-only. `fsck --repair` rebuilds drifting
 non-terminal task frontmatter from immutable state snapshots, preserving the
@@ -64,27 +72,87 @@ intents; only an elected winner's `claim-committed` event materializes the claim
 
 Run the tests with `npm test` or `node --test test/` (Node.js 20+).
 
+### Transition authority
+
+| Intent | Source state | Actor |
+| --- | --- | --- |
+| `create`; `promote`/`demote` | New; draft/ready/pending in the requested direction | Owner |
+| `claim` | Eligible pending task | Executor |
+| `amend` | Any non-terminal; metadata only when unclaimed draft/ready/pending | Owner |
+| `review` / `question` | In-progress to review / blocked | Elected claimant |
+| `feedback` / `answer` | Review / blocked to pending | Owner |
+| `reset` | In-progress to pending, clearing claim and pin | Owner |
+| `complete` / `cancel` | Any non-terminal state, clearing claim | Owner |
+| `log` / `post --type log\|note` | Append only, non-terminal | Owner, elected claimant or their recorded dispatcher |
+| `accept-amends` | In-progress | Elected claimant |
+
+An executor owns the tasks they create and can close, cancel or reset those tasks.
+They cannot close another owner's task. Hand-written legacy tasks without `owner`
+remain readable and claimable, but no caller gains owner authority by default:
+establish an explicit owner before using owner transitions. Terminal tasks cannot
+receive further events or state changes.
+
+`promote` defaults to pending; `--status ready` refines a draft without releasing
+it. `demote` defaults to ready; `--status draft` holds ready/pending work.
+`amend --assignee ""` clears an unclaimed pin; dependency edits use repeatable,
+comma-split `--add-depends-on` / `--remove-depends-on`.
+
+### CLI contracts
+
+- Every body-writing command accepts exactly one of `-m`/`--message`,
+  `--body-file`, or `--stdin`. No shell substitution is needed for multiline text.
+- Every list-valued option is repeatable and comma-split, including `--exclude-task`,
+  `--files` and `create --ac`. Use a custom body when a criterion needs literal commas.
+- `<command> --help` is generated from the parser's option table and includes an
+  executable example checked against a suitable test fixture.
+- Argument errors are one line with a help hint, never a stack trace.
+
+| Exit | Meaning |
+| --- | --- |
+| 0 | Success |
+| 1 | Usage, validation or not-found |
+| 2 | No work or not eligible (including WIP limit) |
+| 3 | Conflict, lost race, split-brain or permission denied |
+| 4 | Claims paused |
+| 124 | Watch timeout |
+| 130 | Watch interrupted by signal |
+
+`TaskSummary` has these fixed fields:
+
+```text
+id, title, stage, status, priority, tags, owner, assignee, affinity, claimed_by,
+parent, depends_on, revision, claim_round, outcome, last_amend_seen,
+instructions_seen, state_seq, updated_by, updated_at, path, task_path, latest_event
+```
+
+`list` and pool/owner `watch` return arrays of this summary. `create`, `claim`,
+intent commands and task `watch` return it at the top level with command-specific
+evidence fields. `render` adds `body`, `events` and `claim_winner`; it never nests
+the state under `task`. `latest_event` is null or
+`{filename,type,entity_id,timestamp,body,truncated}`. Previews default to five lines;
+watch `--include-events` expands the surfaced events.
+
 A bucket uses plain Markdown directories:
 
 ```text
 <bucket_dir>/
-├── tasks/     # Fixed-path task folders (<YYYYMMDDTHHMMSSZ>-<slug>/task.md + events/)
-├── messages/  # Append-only public announcements (to / tags)
-├── entities/  # Advisory entity presence & message cursor files
-└── tags/      # Optional Markdown descriptions of capability tags
++-- tasks/     # Fixed-path task folders (<YYYYMMDDTHHMMSSZ>-<slug>/task.md + events/)
++-- messages/  # Append-only public announcements (to / tags)
++-- entities/  # Advisory entity presence & message cursor files
++-- tags/      # Optional Markdown descriptions of capability tags
 ```
 
 Each task lives at a permanent path `tasks/<YYYYMMDDTHHMMSSZ>-<slug>/` containing `task.md` (`status`: `draft | ready | pending | in-progress | blocked | review | complete | cancelled`) plus `events/` (immutable, timestamped Markdown files named `<UTC>-<entity_id>-<type>.md`).
 
 You can manage the bucket directly in any text editor or with `node scripts/wb.mjs`:
 
-- **Create a task (ready or backlog):** Run `wb.mjs create --bucket <dir> --entity <you> --title "..."` (or pass `--backlog` for `status: "draft"`). Promote a refined draft/ready task with `wb.mjs post --bucket <dir> --entity <you> --task <id> --type log -m "Ready" --status pending`.
-- **Amend a running task:** Never edit `tasks/<id>/task.md` while `status` is `in-progress`. Instead, drop a new file in `tasks/<id>/events/<UTC>-<you>-amend.md` (or run `wb.mjs post --type amend -m "..."`). The executor checks for new amendments at checkpoints and merges them.
-- **Unblock a `blocked` task:** Read the latest question; `wb.mjs post --type answer -m "..." --status pending` automatically increments `revision` and `claim_round` once, even with legacy `--bump-revision`.
+- **Create a task (ready or backlog):** Run `wb.mjs create --bucket <dir> --entity <you> --title "..."` (or pass `--backlog` for `status: "draft"`). Promote a refined draft/ready task with `wb.mjs promote --bucket <dir> --entity <you> --task <id> -m "Ready"`.
+- **Amend a running task:** Never edit `tasks/<id>/task.md` while `status` is `in-progress`. Run `wb.mjs amend --bucket <dir> --entity <you> --task <id> -m "..."`. The executor checks for new amendments at checkpoints and merges them.
+- **Unblock a `blocked` task:** Read the latest question; owner `answer` automatically increments `revision` and `claim_round` once.
 - **Review a `review` task:** Inspect `wb.mjs render --bucket <dir> --task <id>` (or read `task.md` and `events/`).
-  - Approve: post `events/*-complete.md` and set `status: "complete"`, `claimed_by: ""` (or run `wb.mjs post --type complete`).
-   - Request changes: `wb.mjs post --type feedback -m "..." --status pending` automatically bumps `revision` and `claim_round`, pinning the previous executor. Use `--reopen` if that assignee is gone.
-  - Cancel: run `wb.mjs post --type cancelled`.
+  - Approve: owner `complete` sets `status: "complete"` and clears `claimed_by`.
+  - Request changes: owner `feedback -m "..."` automatically bumps `revision` and `claim_round`, pinning the previous executor. Use `--reopen` to return it to the pool.
+  - Cancel: owner `cancel`, including while in-progress.
 - **Send or read public messages:** Run `wb.mjs msg send --bucket <dir> --entity <you> [--to <id|*,...>] [--tag <t>] -m "..."` and `wb.mjs msg list --bucket <dir> --all`. All messages in `messages/` are public to everyone in the bucket.
 - **Inspect active entities and tags:** Run `wb.mjs entity list --bucket <dir>` and `wb.mjs tag list --bucket <dir>` (document tags via `wb.mjs tag set --bucket <dir> --entity <you> --tag <name> -m "..."`).
 
@@ -95,13 +163,13 @@ You can manage the bucket directly in any text editor or with `node scripts/wb.m
 - Only a multithreaded dispatcher watches tags/messages. Children use `once`, `claim --task <id>`, and return after `review`/`blocked`, without pool/message watches. The dispatcher checks pending pins to its `<entity_id>-N` IDs and spawns children under those IDs for rework; owners use `--reopen` when a pinned assignee cannot return.
 - Session modes are `once`, `continuous`, `owner`; non-owner pool watches record advisory `mode: "worker"`, also accepted by `entity register`.
 - Read optional `INSTRUCTIONS.md` and `tags/<tag>.md` bodies for every task tag before claiming/executing. `claim --json` includes `instructions: [{file, body}]`; task bodies need only task-specific content.
-- Correct `in-progress` tasks with `amend`; resume `review` with `feedback`, `blocked` with `answer`, using `--status pending`. Amend alone does not reopen actionable tasks and prints a warning.
+- Correct `in-progress` tasks with `amend`; resume `review` with `feedback`, `blocked` with `answer`. Amend alone does not reopen actionable tasks and prints a warning.
 - Review bodies include claims, raw evidence with `file:line`, observed vs inferred conclusions, unverified items, files changed/diff status, and verification commands/output.
 - Task corrections use task events; cross-cutting notices use public messages; parent reports use the harness; pauses use bucket-level pause.
-- `create` and `post` accept `--body-file <path>` or `--stdin`. Avoid shell substitution in multiline bodies:
+- Body-writing commands accept `--body-file <path>` or `--stdin`. Avoid shell substitution in multiline bodies:
 
 ```bash
-wb.mjs post --bucket "$BUCKET" --entity "$ENTITY" --task "$TASK" --type review --status review --stdin <<'REVIEW'
+wb.mjs review --bucket "$BUCKET" --entity "$ENTITY" --task "$TASK" --stdin <<'REVIEW'
 - Claims: <claims>; raw evidence: <verbatim excerpt, file:line>.
 - Observed: <facts>; inferred: <interpretation>; unverified: <list>.
 - Files/diff status: <paths and status>; verification: <command and output>.
@@ -121,19 +189,19 @@ REVIEW
 
 ## Compact Inspection, Amendments and Control
 
-- `render --tail-events N` limits history after any `--after-event` filter; `--latest-event` means one event, `--tail-events 0` means none. JSON shape: `{task_id, stage, path, claim_winner, task, body, events}`; frontmatter is nested (use `task.status`, not `status`). Events contain `{filename,type,entity_id,timestamp,body}`.
-- `list --bucket <dir>` emits one line per task: ID, status, assignee/claimed_by, revision, claim_round, latest event filename/type. Filter with repeatable/comma-separated `--status`, OR-matching `--tag`/`--tags`, and `--owner` (filters combine with AND). `--json` returns `{count,tasks:[summary]}` with the watch summary fields and 5-line latest-event previews.
+- `render --tail-events N` limits history after any `--after-event` filter; `--latest-event` means one event, `--tail-events 0` means none. JSON is a top-level summary plus body/events. Events contain `{filename,type,entity_id,timestamp,body}`.
+- `list --bucket <dir>` emits one line per task: ID, status, assignee/claimed_by, revision, claim_round, latest event filename/type. Filter with repeatable/comma-separated `--status`, OR-matching `--tag`, `--owner`, `--assignee`, and `--claimed-by` (filters combine with AND). Empty assignee/claimant filter values select unassigned/unclaimed tasks. `--json` returns `{count,tasks:[summary]}`.
 - `claim --json` adds `unread_events` with full bodies: unaccepted amends, including those before the first claim, plus feedback since the previous round's claim. Amends remain visible across rounds until accepted, even if older than that previous claim.
-- The current executor uses `post --type log --accept-amends` on an `in-progress` task. This preserves the original brief and appends unaccepted amendment bodies verbatim under chronological filename headings; apply their meaning during execution. It bumps revision once (also with `--bump-revision`), stores `last_amend_seen`, and publishes a log of filenames before atomically updating `task.md`. A repeated call with no new amends fails without changes. Old manually merged amendments without a cursor are conservatively treated as unaccepted.
+- The current executor uses `accept-amends` on an `in-progress` task. This preserves the original brief and appends unaccepted amendment bodies verbatim under chronological filename headings; apply their meaning during execution. It bumps revision once, stores `last_amend_seen`, and publishes a log of filenames before atomically updating `task.md`. A repeated call with no new amends fails without changes. Old manually merged amendments without a cursor are conservatively treated as unaccepted.
 - Register executors with `entity register` before execution, and refresh their entity heartbeat at checkpoints. Owner watch wakes with `reason: "stale"` and `stale_tasks` when an owned `in-progress` task's registered `claimed_by` heartbeat exceeds its TTL. Results include executor, timestamp, TTL and age. Each task/round/heartbeat alert is delivered once (`stale_task_seen`); a newer heartbeat or claim round can signal a later stall. Missing/unparseable heartbeats cannot signal TTL expiry. This is advisory, not an automatic reset or proof that execution stopped.
-- Terminal `post --type complete|cancelled --outcome pass|partial|fail|abandoned` optionally records `outcome` in `task.md`; existing lifecycle states and dependency rules are unchanged. A completed bounded investigation with negative findings uses `complete --outcome fail`; partial verification can use `complete --outcome partial` when the investigation's own acceptance criteria are met. Unfinished work uses `cancelled --outcome abandoned`. State the product verdict separately.
-- `bucket pause --bucket <dir> [-m <reason>]` atomically creates plain `PAUSED`; `bucket resume --bucket <dir>` removes it (idempotently). Humans can create/remove the file directly. Pause is bucket-wide, not task cancellation. `claim` refuses with exit 2, including a pause detected during settle; that election's immutable claim remains and can be resumed by its winner or reset by the owner.
+- Owner `complete|cancel --outcome pass|partial|fail|abandoned` optionally records `outcome` in `task.md`; existing lifecycle states and dependency rules are unchanged. A completed bounded investigation with negative findings uses `complete --outcome fail`; partial verification can use `complete --outcome partial` when the investigation's own acceptance criteria are met. Unfinished work uses `cancel --outcome abandoned`. State the product verdict separately.
+- `bucket pause --bucket <dir> [-m <reason>]` atomically creates plain `PAUSED`; `bucket resume --bucket <dir>` removes it (idempotently). Humans can create/remove the file directly. Pause is bucket-wide, not task cancellation. `claim` refuses with exit 4, including a pause detected during settle; that election's immutable claim remains and can be resumed by its winner. The owner can demote/promote pending work to hold/release it; `reset` requires in-progress work.
 - Paused pool `watch` reports `reason: "paused"`, `paused: true` and no ready work. Executors stop at checkpoints and do not repeatedly re-arm pool watches until explicitly resumed. Owners may continue `--owner-only` watches/reviews/messages/stall handling; those watches include the pause flag but do not wake solely for pause. Task-specific watches retain lifecycle/event behavior and include `paused` on updates.
 
 ## Reclaims and Session Handover
 
 - All claims, including pinned reclaims, use the positive settle configured in `bucket.md`. Winner election and late-sync split-brain checks remain in place.
-- Optional `--session-nonce <token>` is accepted by `create`, `claim`, `post`, `watch`, `msg send`, `entity register` and `tag set`; it overrides `WB_SESSION_NONCE`. Register the entity first, then supply the same caller-chosen token on writes (or inherit the environment variable). The marker is stored as `session_nonce` in `entities/<id>.md`.
+- Optional `--session-nonce <token>` is accepted by task-writing commands, `watch`, `msg send`, `entity register`, `entity end` and `tag set`; it overrides `WB_SESSION_NONCE`. Register the entity first, then supply the same caller-chosen token on writes (or inherit the environment variable). The marker is stored as `session_nonce` in `entities/<id>.md`.
 - A different nonce on a still-live entity prints one warning per command but does not refuse the write: presence remains advisory, not an exclusive lease. Stale transfers do not warn. Commands without a nonce preserve an existing marker and cannot detect collisions; existing buckets need no migration. Resolve unexpected identity sharing with the coordinator rather than inventing a new ID.
 - Before context handover, capture task IDs, last-seen event filename and the existing watcher's handle/PID. The successor must stop that known watcher for its entity before re-arming, even if its completion targets the predecessor session. Resume task waits with `watch --task <id> --after-event <last_seen> --since-status <review|blocked>`; owner/pool watches reuse persisted entity cursors. An already `in-progress` task resumes from its checkpoint without another claim.
 

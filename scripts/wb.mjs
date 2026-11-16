@@ -22,6 +22,7 @@ const ENTITY_HEARTBEAT_MS = 60_000;
 const DEFAULT_MSG_COALESCE_MS = 500;
 const MAX_MSG_COALESCE_MS = 2000;
 const DEFAULT_CLAIM_SETTLE_MS = 2000;
+const TERMINAL_STATUSES = new Set(["complete", "cancelled"]);
 const BUCKET_SUBDIRS = [
   "tasks",
   "messages",
@@ -81,11 +82,37 @@ class CliError extends Error {
 }
 
 function formatIsoUtc(date = new Date()) {
-  return date.toISOString().replace(/\.\d{3}Z$/, "Z");
+  return date.toISOString();
 }
 
 function formatCompactUtc(date = new Date()) {
-  return formatIsoUtc(date).replace(/[-:]/g, "");
+  return formatIsoUtc(date).replace(/[-:.]/g, "");
+}
+
+function readBucketConfig(bucketDir) {
+  let data;
+  try {
+    ({ data } = parseFrontmatter(fs.readFileSync(path.join(bucketDir, "bucket.md"), "utf8")));
+  } catch (err) {
+    if (err.code !== "ENOENT") throw err;
+    data = {};
+  }
+  const sync = data.sync ?? "shared";
+  if (!["local", "shared", "cloud"].includes(sync)) {
+    throw new CliError('bucket.md: sync must be local|shared|cloud.');
+  }
+  const config = {
+    sync,
+    claim_settle_ms: data.claim_settle_ms ?? (sync === "local" ? 250 : DEFAULT_CLAIM_SETTLE_MS),
+    default_ttl_seconds: data.default_ttl_seconds ?? DEFAULT_ENTITY_TTL_SECONDS,
+    msg_coalesce_ms: data.msg_coalesce_ms ?? DEFAULT_MSG_COALESCE_MS,
+  };
+  for (const key of ["claim_settle_ms", "default_ttl_seconds", "msg_coalesce_ms"]) {
+    if (!Number.isSafeInteger(config[key]) || config[key] < (key === "msg_coalesce_ms" ? 0 : 1)) {
+      throw new CliError(`bucket.md: ${key} must be ${key === "msg_coalesce_ms" ? "a non-negative" : "a positive"} integer.`);
+    }
+  }
+  return config;
 }
 
 function validateIdentifier(value, label) {
@@ -147,6 +174,7 @@ function normalizeTags(tags) {
 }
 
 function ensureBucketDirs(bucketDir) {
+  readBucketConfig(bucketDir);
   for (const sub of BUCKET_SUBDIRS) {
     fs.mkdirSync(path.join(bucketDir, sub), { recursive: true });
   }
@@ -534,11 +562,11 @@ function findTask(bucketDir, taskId) {
 
 function parseEventFilenameParts(filename) {
   const m = filename.match(
-    /^(\d{8}T\d{6}Z)-(.+)-(created|claimed|amend|question|answer|log|review|feedback|complete|cancelled|reset)(?:-(\d+))?\.md$/
+    /^(\d{8}T\d{6}(?:\d{3})?Z)-(.+)-(claim-committed|created|claimed|amend|question|answer|log|review|feedback|complete|cancelled|reset)(?:-(\d+))?\.md$/
   );
   if (!m) return null;
   return {
-    utc: m[1],
+    utc: m[1].length === 16 ? m[1].replace("Z", "000Z") : m[1],
     entityId: m[2],
     type: m[3],
     seq: m[4] ? Number.parseInt(m[4], 10) : 1,
@@ -604,7 +632,8 @@ function listEventFiles(eventsDir) {
       ) {
         return a.parts.seq - b.parts.seq;
       }
-      if (a.mtimeNs !== b.mtimeNs) {
+      if (a.name.match(/^\d{8}T\d{6}Z-/) && b.name.match(/^\d{8}T\d{6}Z-/) &&
+          a.mtimeNs !== b.mtimeNs) {
         return a.mtimeNs < b.mtimeNs ? -1 : 1;
       }
     }
@@ -631,10 +660,10 @@ function isEventAfter(eventsDir, candidateName, afterName) {
     ) {
       return candParts.seq > afterParts.seq;
     }
-    const candMtime = getFileMtimeNs(path.join(eventsDir, candidateName));
-    const afterMtime = getFileMtimeNs(path.join(eventsDir, afterName));
-    if (candMtime !== afterMtime) {
-      return candMtime > afterMtime;
+    if (/^\d{8}T\d{6}Z-/.test(candidateName) && /^\d{8}T\d{6}Z-/.test(afterName)) {
+      const candMtime = getFileMtimeNs(path.join(eventsDir, candidateName));
+      const afterMtime = getFileMtimeNs(path.join(eventsDir, afterName));
+      if (candMtime !== afterMtime) return candMtime > afterMtime;
     }
   }
   return compareEventFilenames(candidateName, afterName) > 0;
@@ -686,7 +715,6 @@ function writeUniqueMarkdown(targetDir, prefix, content, label = "file") {
     const suffix = seq === 1 ? "" : `-${seq}`;
     const filename = `${prefix}${suffix}.md`;
     const targetPath = path.join(targetDir, filename);
-    if (fs.existsSync(targetPath)) continue;
     tmpCounter += 1;
     const tmpPath = path.join(
       targetDir,
@@ -694,11 +722,13 @@ function writeUniqueMarkdown(targetDir, prefix, content, label = "file") {
     );
     try {
       fs.writeFileSync(tmpPath, content, { encoding: "utf8", flag: "wx" });
-      if (fs.existsSync(targetPath)) {
-        fs.unlinkSync(tmpPath);
-        continue;
+      try {
+        fs.linkSync(tmpPath, targetPath);
+      } catch (err) {
+        if (!["EXDEV", "ENOTSUP", "EOPNOTSUPP", "EPERM", "ENOSYS"].includes(err.code)) throw err;
+        fs.writeFileSync(targetPath, content, { encoding: "utf8", flag: "wx" });
       }
-      fs.renameSync(tmpPath, targetPath);
+      fs.unlinkSync(tmpPath);
       return { filename, path: targetPath };
     } catch (err) {
       try {
@@ -739,6 +769,22 @@ function writeUniqueEvent(
     "event"
   );
   return { ...res, timestamp: isoUtc };
+}
+
+function publishTaskState(item, task, body, entityId, eventType, message, now = new Date(), extra = {}) {
+  task.affinity ??= "";
+  task.outcome ??= "";
+  task.last_amend_seen ??= "";
+  task.instructions_seen ??= "";
+  task.state_seq = (Number(task.state_seq) || 0) + 1;
+  const event = writeUniqueEvent(item.eventsDir, entityId, eventType, message, now, {
+    ...extra,
+    snapshot_version: 1,
+    state_keys: Object.keys(task),
+    ...task,
+  });
+  atomicWriteFile(item.taskPath, formatTaskMarkdown(task, body));
+  return event;
 }
 
 function getRoundClaims(eventsDir, claimRound = 1) {
@@ -794,9 +840,9 @@ function hasCompetingRoundClaim(item, entityId) {
 }
 
 function parseMessageFilenameParts(filename) {
-  const m = filename.match(/^(\d{8}T\d{6}Z)-(.+)\.md$/);
+  const m = filename.match(/^(\d{8}T\d{6}(?:\d{3})?Z)-(.+)\.md$/);
   if (!m) return null;
-  return { utc: m[1], rest: m[2] };
+  return { utc: m[1].length === 16 ? m[1].replace("Z", "000Z") : m[1], rest: m[2] };
 }
 
 function compareTimestampedPrefixAndSeq(aRest, bRest) {
@@ -859,7 +905,8 @@ function listMessageFiles(messagesDir) {
       ) {
         return seqCmp;
       }
-      if (a.mtimeNs !== b.mtimeNs) {
+      if (/^\d{8}T\d{6}Z-/.test(a.name) && /^\d{8}T\d{6}Z-/.test(b.name) &&
+          a.mtimeNs !== b.mtimeNs) {
         return a.mtimeNs < b.mtimeNs ? -1 : 1;
       }
     }
@@ -886,10 +933,10 @@ function isMessageAfter(messagesDir, candidateName, afterName) {
     ) {
       return compareTimestampedPrefixAndSeq(candParts.rest, afterParts.rest) > 0;
     }
-    const candMtime = getFileMtimeNs(path.join(messagesDir, candidateName));
-    const afterMtime = getFileMtimeNs(path.join(messagesDir, afterName));
-    if (candMtime !== afterMtime) {
-      return candMtime > afterMtime;
+    if (/^\d{8}T\d{6}Z-/.test(candidateName) && /^\d{8}T\d{6}Z-/.test(afterName)) {
+      const candMtime = getFileMtimeNs(path.join(messagesDir, candidateName));
+      const afterMtime = getFileMtimeNs(path.join(messagesDir, afterName));
+      if (candMtime !== afterMtime) return candMtime > afterMtime;
     }
   }
   return compareMessageFilenames(candidateName, afterName) > 0;
@@ -1022,6 +1069,8 @@ function readEntityFile(bucketDir, entityId) {
       last_msg_seen: String(data.last_msg_seen ?? ""),
       owner_task_seen: coerceStringList(data.owner_task_seen),
       stale_task_seen: coerceStringList(data.stale_task_seen),
+      dispatcher: String(data.dispatcher ?? ""),
+      ended_at: String(data.ended_at ?? ""),
       updated_at: String(data.updated_at ?? ""),
       body: body.trim(),
       path: entityPath,
@@ -1072,15 +1121,28 @@ function upsertEntityFile(bucketDir, entityId, updates = {}) {
         ? updates.ttl_seconds
         : existing
         ? existing.ttl_seconds
-        : DEFAULT_ENTITY_TTL_SECONDS,
+        : readBucketConfig(bucketDir).default_ttl_seconds,
     last_msg_seen:
       updates.last_msg_seen !== undefined
         ? String(updates.last_msg_seen)
         : initialLastMsgSeen,
     owner_task_seen: updates.owner_task_seen ?? existing?.owner_task_seen ?? [],
     stale_task_seen: updates.stale_task_seen ?? existing?.stale_task_seen ?? [],
+    dispatcher: updates.dispatcher ?? existing?.dispatcher ?? "",
+    ended_at: updates.ended_at ?? existing?.ended_at ?? "",
     updated_at: isoUtc,
   };
+  for (const key of ["owner_task_seen", "stale_task_seen"]) {
+    nextData[key] = nextData[key].filter((cursor) => {
+      try {
+        const task = findTask(bucketDir, cursor.split("/")[0]);
+        return !task || !TERMINAL_STATUSES.has(task.task.status);
+      } catch (err) {
+        if (err instanceof CliError) return true;
+        throw err;
+      }
+    });
+  }
   const nextBody =
     updates.body !== undefined ? updates.body : existing ? existing.body : "";
   atomicWriteFile(entityPath, formatEntityMarkdown(nextData, nextBody));
@@ -1140,11 +1202,11 @@ function listEntities(bucketDir) {
       }
     }
     const ageSec = Math.max(0, Math.round((nowMs - updatedMs) / 1000));
-    const online = ageSec <= info.ttl_seconds;
+    const online = !info.ended_at && ageSec <= info.ttl_seconds;
     out.push({
       ...info,
       age_seconds: ageSec,
-      state: online ? "online" : "stale",
+      state: info.ended_at ? "ended" : online ? "online" : "stale",
       online,
     });
   }
@@ -1337,6 +1399,7 @@ function sortByPriorityAndAge(a, b) {
 function findEligibleTasks(bucketDir, entityId, workerTags, includeUntagged, includeOwnClaim = false) {
   const { tasks, byId } = scanAllTasks(bucketDir);
   const available = tasks.filter((item) => {
+    if (item.task.status !== "pending" || item.task.claimed_by !== "") return false;
     const { winner } = getRoundClaims(item.eventsDir, item.task.claim_round);
     return !winner || (includeOwnClaim && winner.entityId === entityId);
   });
@@ -1481,7 +1544,7 @@ function cmdCreate(argv) {
 
   ensureBucketDirs(bucketDir);
   const now = new Date();
-  const compactUtc = formatCompactUtc(now);
+  const compactUtc = formatCompactUtc(now).replace(/\d{3}Z$/, "Z");
   const isoUtc = formatIsoUtc(now);
   const baseSlug = slugify(values.slug || values.title);
 
@@ -1508,14 +1571,6 @@ function cmdCreate(argv) {
 
   const eventsDir = path.join(taskDir, "events");
   fs.mkdirSync(eventsDir, { recursive: true });
-  const createdEvent = writeUniqueEvent(
-    eventsDir,
-    entityId,
-    "created",
-    `Task created: ${values.title.trim()}`,
-    now
-  );
-
   let body;
   const explicitBody = readBodyInput(values);
   if (explicitBody) {
@@ -1554,15 +1609,22 @@ function cmdCreate(argv) {
     claimed_by: "",
     claim_round: 1,
     assignee: values.assignee || "",
+    affinity: "",
     parent: values.parent || "",
     depends_on: dependsOn,
     revision: 1,
     updated_by: entityId,
     updated_at: isoUtc,
+    outcome: "",
+    last_amend_seen: "",
+    instructions_seen: "",
   };
 
   const taskPath = path.join(taskDir, "task.md");
-  atomicWriteFile(taskPath, formatTaskMarkdown(taskData, body));
+  const createdEvent = publishTaskState(
+    { eventsDir, taskPath }, taskData, body, entityId, "created",
+    `Task created: ${values.title.trim()}`, now
+  );
   touchExistingEntity(bucketDir, entityId);
 
   if (values.json) {
@@ -1598,7 +1660,6 @@ async function cmdClaim(argv) {
       tag: { type: "string", multiple: true },
       tags: { type: "string", multiple: true },
       "include-untagged": { type: "boolean", default: false },
-      "claim-settle-ms": { type: "string", default: String(DEFAULT_CLAIM_SETTLE_MS) },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
     },
@@ -1615,10 +1676,7 @@ async function cmdClaim(argv) {
   const bucketDir = path.resolve(values.bucket);
   const entityId = validateIdentifier(values.entity, "--entity");
   useEntitySession(bucketDir, entityId, values);
-  const settleMs = Number.parseInt(values["claim-settle-ms"], 10);
-  if (!Number.isFinite(settleMs) || settleMs < 0) {
-    throw new CliError(`Invalid --claim-settle-ms "${values["claim-settle-ms"]}".`);
-  }
+  const settleMs = readBucketConfig(bucketDir).claim_settle_ms;
   const workerTags = new Set(
     normalizeTags([
       ...parseListFlags(values.tag),
@@ -1706,9 +1764,7 @@ async function cmdClaim(argv) {
       );
     }
 
-    if (settleMs > 0 && !(preTask.assignee === entityId && claimRound > 1)) {
-      await new Promise((resolve) => setTimeout(resolve, settleMs));
-    }
+    await new Promise((resolve) => setTimeout(resolve, settleMs));
 
     let postTask;
     let postBody;
@@ -1741,7 +1797,9 @@ async function cmdClaim(argv) {
     postTask.claim_round = claimRound;
     postTask.updated_by = entityId;
     postTask.updated_at = formatIsoUtc(new Date());
-    atomicWriteFile(candidate.taskPath, formatTaskMarkdown(postTask, postBody));
+    publishTaskState(candidate, postTask, postBody, entityId, "claim-committed",
+      `Claim election won by ${entityId} (round ${claimRound}).`, new Date(),
+      { claim_event: myClaimEvent.filename, round: claimRound });
 
     claimedEntry = candidate;
     claimedEvent = myClaimEvent;
@@ -1946,19 +2004,9 @@ function cmdPost(argv) {
     console.error(`Warning: task "${taskId}" is ${found.task.status}; amend does not reopen it. Use feedback/answer --status pending to resume execution.`);
   }
 
-  // 1. Payload-before-flag: write immutable event file first
-  const eventResult = writeUniqueEvent(
-    found.eventsDir,
-    entityId,
-    eventType,
-    message,
-    now
-  );
-
   const updatedTask = { ...found.task };
   let updatedBody = found.body;
 
-  // 2. Atomically update task.md if requested
   if (mutatesTaskMd) {
     const returningFromActive =
       (found.task.status === "in-progress" ||
@@ -2028,9 +2076,10 @@ function cmdPost(argv) {
 
     updatedTask.updated_by = entityId;
     updatedTask.updated_at = isoUtc;
-
-    atomicWriteFile(found.taskPath, formatTaskMarkdown(updatedTask, updatedBody));
   }
+  const eventResult = mutatesTaskMd
+    ? publishTaskState(found, updatedTask, updatedBody, entityId, eventType, message, now)
+    : writeUniqueEvent(found.eventsDir, entityId, eventType, message, now);
 
   touchExistingEntity(bucketDir, entityId);
 
@@ -2221,6 +2270,134 @@ function cmdList(argv) {
   return 0;
 }
 
+function cmdFsck(argv) {
+  const { values } = parseArgs({
+    args: argv,
+    options: {
+      bucket: { type: "string", short: "b" },
+      repair: { type: "boolean", default: false },
+      json: { type: "boolean", default: false },
+      help: { type: "boolean", short: "h", default: false },
+    },
+    strict: true,
+    allowPositionals: false,
+  });
+  if (values.help) {
+    console.log("Usage: wb.mjs fsck --bucket <dir> [--repair] [--json]\nReplay state snapshots, report legacy history and drift; never repair terminal tasks.");
+    return 0;
+  }
+  if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+  const bucketDir = path.resolve(values.bucket);
+  const config = readBucketConfig(bucketDir);
+  const issues = [];
+  let checked = 0;
+  let repaired = 0;
+  const tasksDir = path.join(bucketDir, "tasks");
+  const entries = fs.existsSync(tasksDir) ? fs.readdirSync(tasksDir, { withFileTypes: true }) : [];
+  const sameState = (a, b) => {
+    const keys = [...new Set([...Object.keys(a), ...Object.keys(b)])].sort();
+    return keys.every((key) => JSON.stringify(a[key]) === JSON.stringify(b[key]));
+  };
+  for (const entry of entries) {
+    if (!entry.isDirectory() || entry.name.startsWith(".") || isSyncConflictFilename(entry.name)) continue;
+    checked += 1;
+    const taskDir = path.join(tasksDir, entry.name);
+    const taskPath = path.join(taskDir, "task.md");
+    const eventsDir = path.join(taskDir, "events");
+    for (const dir of [taskDir, eventsDir]) {
+      if (!fs.existsSync(dir)) continue;
+      for (const name of fs.readdirSync(dir).filter(isSyncConflictFilename)) {
+        issues.push({ task_id: entry.name, kind: "sync_conflict", file: name, sync: config.sync });
+      }
+    }
+    const snapshots = [];
+    let invalid = false;
+    for (const filename of listEventFiles(eventsDir)) {
+      let data;
+      try {
+        ({ data } = parseFrontmatter(fs.readFileSync(path.join(eventsDir, filename), "utf8")));
+      } catch (err) {
+        if (!(err instanceof CliError)) throw err;
+        issues.push({ task_id: entry.name, kind: "invalid_event", event: filename });
+        invalid = true;
+        continue;
+      }
+      if (data.snapshot_version === undefined) continue;
+      if (data.snapshot_version !== 1 || !Array.isArray(data.state_keys) ||
+          ![...CANONICAL_TASK_KEYS, "state_seq", "affinity", "outcome", "last_amend_seen", "instructions_seen"]
+            .every((key) => data.state_keys.includes(key)) || data.id !== entry.name ||
+          !VALID_STATUSES.has(data.status) || !Number.isSafeInteger(data.state_seq) || data.state_seq < 1 ||
+          data.state_keys.some((key) => !Object.hasOwn(data, key))) {
+        issues.push({ task_id: entry.name, kind: "invalid_snapshot", event: filename });
+        invalid = true;
+        continue;
+      }
+      const state = Object.fromEntries(data.state_keys.map((key) => [key, data[key]]));
+      if (data.type === "claim-committed") {
+        const { winner } = getRoundClaims(eventsDir, data.claim_round);
+        if (!winner || winner.entityId !== data.entity_id || winner.filename !== data.claim_event) {
+          issues.push({ task_id: entry.name, kind: "losing_claim_snapshot", event: filename });
+          continue;
+        }
+      }
+      snapshots.push({ filename, state });
+    }
+    let current;
+    try {
+      current = parseFrontmatter(fs.readFileSync(taskPath, "utf8"));
+    } catch (err) {
+      if (!(err instanceof CliError) && err.code !== "ENOENT") throw err;
+      issues.push({ task_id: entry.name, kind: "invalid_view", message: "Missing or invalid task.md; body cannot be reconstructed." });
+      continue;
+    }
+    if (!snapshots.length) {
+      issues.push({
+        task_id: entry.name,
+        kind: "legacy",
+        message: Number(current.data.revision) !== Number(current.data.claim_round)
+          ? "legacy: revision not bumped on rework"
+          : "legacy: no state snapshots",
+      });
+      continue;
+    }
+    snapshots.sort((a, b) => a.state.state_seq - b.state.state_seq || compareEventFilenames(a.filename, b.filename));
+    for (let i = 1; i < snapshots.length; i += 1) {
+      if (snapshots[i].state.state_seq === snapshots[i - 1].state.state_seq &&
+          !sameState(snapshots[i].state, snapshots[i - 1].state)) {
+        issues.push({ task_id: entry.name, kind: "snapshot_conflict", event: snapshots[i].filename });
+        invalid = true;
+      }
+    }
+    const latest = snapshots.at(-1);
+    const terminal = TERMINAL_STATUSES.has(current.data.status) ||
+      snapshots.some(({ state }) => TERMINAL_STATUSES.has(state.status));
+    if (!sameState(current.data, latest.state)) {
+      const issue = { task_id: entry.name, kind: "drift", event: latest.filename, terminal, repaired: false };
+      if (values.repair && !terminal && !invalid) {
+        atomicWriteFile(taskPath, formatTaskMarkdown(latest.state, current.body));
+        issue.repaired = true;
+        repaired += 1;
+      }
+      issues.push(issue);
+    }
+  }
+  for (const dir of [bucketDir, ...["tasks", "messages", "entities"].map((sub) => path.join(bucketDir, sub))]) {
+    if (!fs.existsSync(dir)) continue;
+    for (const name of fs.readdirSync(dir).filter(isSyncConflictFilename)) {
+      issues.push({ kind: "sync_conflict", file: name, sync: config.sync });
+    }
+  }
+  const unresolved = issues.filter((issue) => issue.kind !== "legacy" && !issue.repaired).length;
+  if (values.json) console.log(JSON.stringify({ checked, repaired, unresolved, issues }, null, 2));
+  else {
+    for (const issue of issues) {
+      console.log(`${issue.task_id || "bucket"}: ${issue.kind}: ${issue.message || issue.event || issue.file}${issue.repaired ? " (repaired)" : issue.terminal ? " (terminal; not repaired)" : ""}${issue.kind === "sync_conflict" && issue.sync === "local" ? " (warning: local bucket contains sync conflicts)" : ""}`);
+    }
+    console.log(`Checked ${checked} tasks; repaired ${repaired}; unresolved ${unresolved}.`);
+  }
+  return unresolved ? 1 : 0;
+}
+
 function cmdBucket(argv) {
   const [action, ...rest] = argv;
   if (!action || action === "--help" || action === "-h") {
@@ -2282,11 +2459,6 @@ async function cmdWatch(argv) {
       "after-msg": { type: "string" },
       "since-status": { type: "string" },
       "poll-ms": { type: "string", default: "1000" },
-      "msg-coalesce-ms": {
-        type: "string",
-        default: String(DEFAULT_MSG_COALESCE_MS),
-      },
-      ttl: { type: "string" },
       timeout: { type: "string", default: "0" },
       json: { type: "boolean", default: false },
       help: { type: "boolean", short: "h", default: false },
@@ -2330,14 +2502,9 @@ async function cmdWatch(argv) {
   );
   const includeUntagged = Boolean(values["include-untagged"]);
   const pollMs = Math.max(50, Number.parseInt(values["poll-ms"], 10) || 1000);
-  const parsedCoalesce = Number.parseInt(values["msg-coalesce-ms"], 10);
-  const msgCoalesceMs = Number.isFinite(parsedCoalesce)
-    ? Math.max(0, parsedCoalesce)
-    : DEFAULT_MSG_COALESCE_MS;
+  const config = readBucketConfig(bucketDir);
+  const msgCoalesceMs = config.msg_coalesce_ms;
   const timeoutSec = Math.max(0, Number.parseFloat(values.timeout) || 0);
-  const ttlSec = values.ttl
-    ? Math.max(10, Number.parseInt(values.ttl, 10) || DEFAULT_ENTITY_TTL_SECONDS)
-    : undefined;
 
   ensureBucketDirs(bucketDir);
 
@@ -2346,7 +2513,8 @@ async function cmdWatch(argv) {
       tags: Array.from(workerTags),
       include_untagged: includeUntagged,
       mode: ownerOnly ? "owner" : "worker",
-      ...(ttlSec !== undefined ? { ttl_seconds: ttlSec } : {}),
+      ttl_seconds: config.default_ttl_seconds,
+      ended_at: "",
     });
   }
 
@@ -2933,6 +3101,38 @@ function cmdEntity(argv) {
     return 0;
   }
 
+  if (action === "end") {
+    const { values } = parseArgs({
+      args: rest,
+      options: {
+        bucket: { type: "string", short: "b" },
+        entity: { type: "string", short: "e" },
+        target: { type: "string" },
+        json: { type: "boolean", default: false },
+        help: { type: "boolean", short: "h", default: false },
+      },
+      strict: true,
+      allowPositionals: false,
+    });
+    if (values.help) {
+      printEntityHelp();
+      return 0;
+    }
+    if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
+    const bucketDir = path.resolve(values.bucket);
+    const entityId = validateIdentifier(values.entity, "--entity");
+    const targetId = values.target ? validateIdentifier(values.target, "--target") : entityId;
+    const target = readEntityFile(bucketDir, targetId);
+    if (!target) throw new CliError(`Entity "${targetId}" not found.`);
+    if (targetId !== entityId && target.dispatcher !== entityId) {
+      throw new CliError(`Only "${targetId}" or its recorded dispatcher may end it.`, 3);
+    }
+    const saved = upsertEntityFile(bucketDir, targetId, { ended_at: target.ended_at || formatIsoUtc() });
+    if (values.json) console.log(JSON.stringify(saved, null, 2));
+    else console.log(`Ended entity ${targetId}.`);
+    return 0;
+  }
+
   if (action === "register") {
     const { values } = parseArgs({
       args: rest,
@@ -2981,6 +3181,7 @@ function cmdEntity(argv) {
       ...(values.mode ? { mode: values.mode } : {}),
       ...(ttlSec !== undefined ? { ttl_seconds: ttlSec } : {}),
       ...(note ? { body: note } : {}),
+      ended_at: "",
     });
     if (values.json) {
       console.log(JSON.stringify(saved, null, 2));
@@ -2998,6 +3199,7 @@ function cmdEntity(argv) {
       options: {
         bucket: { type: "string", short: "b" },
         online: { type: "boolean", default: false },
+        all: { type: "boolean", default: false },
         json: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
       },
@@ -3011,6 +3213,7 @@ function cmdEntity(argv) {
     if (!values.bucket) throw new CliError("Missing required --bucket <dir>.");
     const bucketDir = path.resolve(values.bucket);
     let entities = listEntities(bucketDir);
+    if (!values.all) entities = entities.filter((e) => !e.ended_at && e.age_seconds <= e.ttl_seconds * 3);
     if (values.online) {
       entities = entities.filter((e) => e.online);
     }
@@ -3028,7 +3231,7 @@ function cmdEntity(argv) {
     return 0;
   }
 
-  throw new CliError(`Unknown entity action "${action}". Expected: register, list.`);
+  throw new CliError(`Unknown entity action "${action}". Expected: register, end, list.`);
 }
 
 function cmdTag(argv) {
@@ -3141,6 +3344,7 @@ Subcommands:
   watch    Block with native fs.watch + 1000ms stat polling until work, owner update, or messages arrive
   render   Render task.md and chronologically sorted events/*.md
   list     List one compact line per task, with optional filters
+  fsck     Replay state snapshots and optionally repair non-terminal frontmatter
   bucket   Pause or resume executor claims via the plain PAUSED file
   msg      Send or list public messages in messages/
   entity   Register or list advisory entity presence in entities/
@@ -3176,14 +3380,13 @@ function printClaimHelp() {
   --task <task_id>                       Claim a specific task (otherwise picks top eligible)
   --tag <tag> / --tags <a,b>             Capability tags (repeatable / comma-separated)
   --include-untagged                     Also accept untagged tasks when --tag is set
-  --claim-settle-ms <ms>                 Settle wait before electing round winner (default: ${DEFAULT_CLAIM_SETTLE_MS})
+  bucket.md                             claim_settle_ms: positive settle wait (local: 250; shared/cloud: 2000)
   --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
   --json                                 Output JSON, including instructions: [{file, body}] and unread_events
   unread_events includes full unaccepted amend bodies (including pre-claim amends) and feedback since
   the previous round's claim. Read these before executing; accepted amendments are not repeated.
   Read optional INSTRUCTIONS.md and each task tag's tags/<tag>.md body before claiming/executing.
-  Reclaims with assignee == entity and claim_round > 1 skip settle (even when explicitly set);
-  initial/pool claims retain settle and all claims retain the round-winner/split-brain guards.
+  All claims, including pinned reclaims, settle before checking the round winner.
   PAUSED refuses claims (exit 2), including a pause detected during settle.`);
 }
 
@@ -3226,8 +3429,7 @@ function printWatchHelp() {
   --after-msg <filename>                 Override stored last_msg_seen cursor
   --since-status <status>                Wake immediately if task status differs from status
   --poll-ms <ms>                         Stat polling fallback interval (default: 1000)
-  --msg-coalesce-ms <ms>                 Quiet window for message-only bursts (default: 500)
-  --ttl <seconds>                        Entity presence TTL in seconds (default: 300)
+  bucket.md                             msg_coalesce_ms and default_ttl_seconds configure watches
   --session-nonce <token>                Optional entity session marker (or WB_SESSION_NONCE)
   --timeout <seconds>                    Optional timeout (exits 124)
   --json                                 Output JSON
@@ -3280,11 +3482,12 @@ function printMsgHelp() {
 }
 
 function printEntityHelp() {
-  console.log(`Usage: wb.mjs entity <register|list> --bucket <dir> [options]
+  console.log(`Usage: wb.mjs entity <register|end|list> --bucket <dir> [options]
   register --entity <id> [--tag <t>] [--include-untagged] [--mode <m>] [--ttl <sec>] [-m <note>] [--session-nonce <token>] [--json]
        Nonce defaults to WB_SESSION_NONCE; different live nonce warns, not an exclusive lease.
        Writes preserve the nonce when omitted; explicit flag overrides the environment.
-  list [--online] [--json]`);
+  end --entity <id> [--target <child>]    End self or a child with a recorded dispatcher relationship
+  list [--online] [--all] [--json]        Default hides ended entities and entities older than 3x TTL`);
 }
 
 function printTagHelp() {
@@ -3314,6 +3517,8 @@ async function main(argv = process.argv.slice(2)) {
       return cmdRender(rest);
     case "list":
       return cmdList(rest);
+    case "fsck":
+      return cmdFsck(rest);
     case "bucket":
       return cmdBucket(rest);
     case "msg":
@@ -3355,4 +3560,9 @@ export {
   parseFrontmatter,
   serializeFrontmatter,
   slugify,
+  readBucketConfig,
+  findEligibleTasks,
+  writeUniqueMarkdown,
+  writeUniqueEvent,
+  writeUniqueMessage,
 };

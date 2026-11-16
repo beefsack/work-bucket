@@ -13,13 +13,27 @@ import {
   parseFrontmatter,
   serializeFrontmatter,
   slugify,
+  readBucketConfig,
+  findEligibleTasks,
+  writeUniqueMarkdown,
+  writeUniqueEvent,
+  writeUniqueMessage,
 } from "../scripts/wb.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const WB_PATH = path.resolve(__dirname, "../scripts/wb.mjs");
 
 function makeTempBucket() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "work-bucket-test-"));
+  const bucket = fs.mkdtempSync(path.join(os.tmpdir(), "work-bucket-test-"));
+  setBucketConfig(bucket);
+  return bucket;
+}
+
+function setBucketConfig(bucket, data = {}) {
+  fs.mkdirSync(bucket, { recursive: true });
+  fs.writeFileSync(path.join(bucket, "bucket.md"), `${serializeFrontmatter({
+    sync: "local", claim_settle_ms: 250, default_ttl_seconds: 300, msg_coalesce_ms: 250, ...data,
+  })}\n`);
 }
 
 function runWb(args, options = {}) {
@@ -59,12 +73,392 @@ function runWbAsync(args) {
   });
 }
 
+test("bucket config chooses deployment defaults and rejects zero/invalid settings before writes", () => {
+  const bucket = makeTempBucket();
+  try {
+    fs.unlinkSync(path.join(bucket, "bucket.md"));
+    assert.deepEqual(readBucketConfig(bucket), {
+      sync: "shared", claim_settle_ms: 2000, default_ttl_seconds: 300, msg_coalesce_ms: 500,
+    });
+    for (const [sync, settle] of [["local", 250], ["shared", 2000], ["cloud", 2000]]) {
+      fs.writeFileSync(path.join(bucket, "bucket.md"), `${serializeFrontmatter({ sync })}\n`);
+      assert.equal(readBucketConfig(bucket).claim_settle_ms, settle);
+    }
+    for (const data of [
+      { sync: "invalid" }, { claim_settle_ms: 0 }, { claim_settle_ms: -1 },
+      { claim_settle_ms: "1ms" }, { default_ttl_seconds: 0 }, { msg_coalesce_ms: -1 },
+    ]) {
+      setBucketConfig(bucket, data);
+      const result = runWb(["create", "--bucket", bucket, "--entity", "owner", "--title", "Invalid config"]);
+      assert.equal(result.status, 1, result.stderr);
+      assert.match(result.stderr, /bucket.md:/);
+      assert.equal(fs.existsSync(path.join(bucket, "tasks")), false);
+    }
+    setBucketConfig(bucket, { default_ttl_seconds: 42, msg_coalesce_ms: 0 });
+    const entity = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "reader"]);
+    assert.equal(entity.ttl_seconds, 42);
+    const watched = runWb(["watch", "--bucket", bucket, "--entity", "watcher", "--timeout", "0.1"]);
+    assert.equal(watched.status, 124);
+    const watcher = parseFrontmatter(fs.readFileSync(path.join(bucket, "entities", "watcher.md"), "utf8")).data;
+    assert.equal(watcher.ttl_seconds, 42);
+    for (const args of [
+      ["claim", "--entity", "executor", "--claim-settle-ms", "0"],
+      ["watch", "--entity", "reader", "--msg-coalesce-ms", "0"],
+      ["watch", "--entity", "reader", "--ttl", "10"],
+    ]) {
+      assert.equal(runWb([...args, "--bucket", bucket]).status, 1);
+    }
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("millisecond event/message names coexist with legacy names in chronological order", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Names"]);
+    const date = new Date("2026-11-16T00:00:00.123Z");
+    const event = writeUniqueEvent(path.join(created.path, "events"), "owner", "log", "new", date);
+    const message = writeUniqueMessage(path.join(bucket, "messages"), "owner", ["*"], [], "notice", "new", date);
+    assert.equal(event.filename, "20261116T000000123Z-owner-log.md");
+    assert.equal(message.filename, "20261116T000000123Z-owner-notice.md");
+    const events = [
+      "20261116T000001Z-old-log.md", event.filename,
+      "20261116T000000Z-old-log.md", "20261116T000000001Z-new-log.md",
+    ];
+    assert.deepEqual(events.sort(compareEventFilenames), [
+      "20261116T000000Z-old-log.md", "20261116T000000001Z-new-log.md",
+      event.filename, "20261116T000001Z-old-log.md",
+    ]);
+    assert.ok(compareMessageFilenames("20261116T000000Z-old-notice.md", message.filename) < 0);
+    fs.writeFileSync(path.join(created.path, "events", "20261116T000000Z-old-log.md"),
+      '---\ntype: log\nentity_id: old\n---\nlegacy\n');
+    const rendered = runWbJson(["render", "--bucket", bucket, "--task", created.task_id,
+      "--after-event", "20261116T000000Z-old-log.md"]);
+    assert.equal(rendered.events[0].filename, event.filename);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("immutable publication never clobbers concurrent same-ID same-millisecond writes", async () => {
+  const bucket = makeTempBucket();
+  try {
+    const dir = path.join(bucket, "events");
+    const moduleUrl = new URL("../scripts/wb.mjs", import.meta.url).href;
+    const results = await Promise.all(Array.from({ length: 16 }, (_, index) =>
+      new Promise((resolve, reject) => {
+        const code = `import {writeUniqueEvent} from ${JSON.stringify(moduleUrl)};
+          writeUniqueEvent(${JSON.stringify(dir)}, "same", "log", ${JSON.stringify(`payload-${index}`)}, new Date("2026-11-16T00:00:00.123Z"));`;
+        const child = spawn(process.execPath, ["--input-type=module", "--eval", code], { stdio: ["ignore", "pipe", "pipe"] });
+        let stderr = "";
+        child.stderr.on("data", (data) => { stderr += data; });
+        child.on("error", reject);
+        child.on("close", (status) => resolve({ status, stderr }));
+      })));
+    for (const result of results) assert.equal(result.status, 0, result.stderr);
+    const files = fs.readdirSync(dir);
+    assert.equal(files.length, 16);
+    assert.equal(new Set(files.map((name) =>
+      parseFrontmatter(fs.readFileSync(path.join(dir, name), "utf8")).body.trim())).size, 16);
+    assert.equal(files.some((name) => name.startsWith(".")), false);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("exclusive-create fallback preserves existing immutable files and cleans temporary payloads", (t) => {
+  const bucket = makeTempBucket();
+  try {
+    t.mock.method(fs, "linkSync", () => { throw Object.assign(new Error("Unsupported"), { code: "ENOTSUP" }); });
+    const first = writeUniqueMarkdown(bucket, "same", "first");
+    const second = writeUniqueMarkdown(bucket, "same", "second");
+    assert.equal(first.filename, "same.md");
+    assert.equal(second.filename, "same-2.md");
+    assert.equal(fs.readFileSync(first.path, "utf8"), "first");
+    assert.equal(fs.readFileSync(second.path, "utf8"), "second");
+    assert.equal(fs.readdirSync(bucket).some((name) => name.startsWith(".")), false);
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("a state mutation during claim settle preserves increasing snapshot sequences", async () => {
+  const bucket = makeTempBucket();
+  let claiming;
+  try {
+    setBucketConfig(bucket, { claim_settle_ms: 1000 });
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Settle mutation"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    const eventsDir = path.join(created.path, "events");
+    claiming = runWbAsync(["claim", ...args, "--entity", "executor", "--json"]);
+    const deadline = Date.now() + 2000;
+    while (!fs.readdirSync(eventsDir).some((file) => file.endsWith("-claimed.md")) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(fs.readdirSync(eventsDir).some((file) => file.endsWith("-claimed.md")));
+    const mutated = runWbJson(["post", ...args, "--entity", "owner", "--type", "log", "--bump-revision"]);
+    const claimed = await claiming;
+    assert.equal(claimed.status, 0, claimed.stderr);
+    assert.equal(mutated.task.state_seq, 2);
+    assert.equal(JSON.parse(claimed.stdout).task.state_seq, 3);
+    const sequences = fs.readdirSync(eventsDir).map((file) =>
+      parseFrontmatter(fs.readFileSync(path.join(eventsDir, file), "utf8")).data)
+      .filter((data) => data.snapshot_version === 1).map((data) => data.state_seq).sort();
+    assert.deepEqual(sequences, [1, 2, 3]);
+    assert.equal(runWbJson(["fsck", "--bucket", bucket]).unresolved, 0);
+  } finally {
+    if (claiming) await claiming;
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("all materialized state changes carry complete snapshots and fsck repairs frontmatter only", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Replay"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    const claimed = runWbJson(["claim", ...args, "--entity", "executor"]);
+    runWbJson(["post", ...args, "--entity", "owner", "--type", "amend", "-m", "Correction"]);
+    runWbJson(["post", ...args, "--entity", "executor", "--type", "log", "--accept-amends"]);
+    runWbJson(["post", ...args, "--entity", "executor", "--type", "review", "--status", "review"]);
+    const feedback = runWbJson(["post", ...args, "--entity", "owner", "--type", "feedback", "--status", "pending"]);
+    const original = fs.readFileSync(created.task_path, "utf8");
+    const eventsDir = path.join(created.path, "events");
+    const snapshots = fs.readdirSync(eventsDir).map((file) =>
+      parseFrontmatter(fs.readFileSync(path.join(eventsDir, file), "utf8")).data)
+      .filter((data) => data.snapshot_version === 1);
+    assert.equal(snapshots.length, 5);
+    for (const state of snapshots) {
+      for (const key of ["status", "assignee", "affinity", "claimed_by", "revision", "claim_round",
+        "outcome", "depends_on", "last_amend_seen", "instructions_seen"]) {
+        assert.ok(Object.hasOwn(state, key), `Missing ${key}`);
+      }
+    }
+    assert.ok(snapshots.some((data) => data.type === "claim-committed" && data.claim_event === claimed.claimed_event));
+    assert.equal(runWbJson(["fsck", "--bucket", bucket]).unresolved, 0);
+    fs.writeFileSync(created.task_path, original.replace('assignee: "executor"', 'assignee: "wrong"'));
+    const stat = fs.statSync(created.task_path);
+    const drift = runWb(["fsck", "--bucket", bucket, "--json"]);
+    assert.equal(drift.status, 1);
+    assert.equal(JSON.parse(drift.stdout).issues[0].kind, "drift");
+    assert.equal(fs.statSync(created.task_path).mtimeMs, stat.mtimeMs);
+    const repair = runWbJson(["fsck", "--bucket", bucket, "--repair"]);
+    assert.equal(repair.repaired, 1);
+    assert.equal(fs.readFileSync(created.task_path, "utf8"), original);
+    assert.equal(runWbJson(["fsck", "--bucket", bucket, "--repair"]).repaired, 0);
+    assert.equal(feedback.task.state_seq, 5);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("fsck uses state sequence rather than filenames or mtimes and refuses ambiguous repair", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Sequence"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    const updated = runWbJson(["post", ...args, "--entity", "owner", "--type", "log", "--bump-revision"]);
+    const eventsDir = path.join(created.path, "events");
+    const newestPath = path.join(eventsDir, updated.event);
+    fs.renameSync(newestPath, path.join(eventsDir, "20000101T000000000Z-owner-log.md"));
+    assert.equal(runWbJson(["fsck", "--bucket", bucket]).unresolved, 0);
+    const conflicting = fs.readFileSync(path.join(eventsDir, "20000101T000000000Z-owner-log.md"), "utf8")
+      .replace("revision: 2", "revision: 99");
+    fs.writeFileSync(path.join(eventsDir, "20000101T000000001Z-owner-log.md"), conflicting);
+    const original = fs.readFileSync(created.task_path, "utf8");
+    const broken = original.replace("revision: 2", "revision: 8");
+    fs.writeFileSync(created.task_path, broken);
+    const result = runWb(["fsck", "--bucket", bucket, "--repair", "--json"]);
+    assert.equal(result.status, 1);
+    assert.ok(JSON.parse(result.stdout).issues.some((issue) => issue.kind === "snapshot_conflict"));
+    assert.equal(fs.readFileSync(created.task_path, "utf8"), broken);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("fsck refuses invalid snapshot repair and rejects losing-election state", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Election replay"]);
+    const args = ["--bucket", bucket, "--task", created.task_id];
+    runWbJson(["claim", ...args, "--entity", "zeta"]);
+    const eventsDir = path.join(created.path, "events");
+    const legitimate = fs.readFileSync(created.task_path, "utf8");
+    const winnerIntent = "20000101T000000000Z-alpha-claimed.md";
+    fs.writeFileSync(path.join(eventsDir, winnerIntent),
+      `${serializeFrontmatter({ type: "claimed", entity_id: "alpha", timestamp: "2000-01-01T00:00:00.000Z", round: 1 })}\n`);
+    const winnerState = {
+      ...parseFrontmatter(legitimate).data, claimed_by: "alpha", updated_by: "alpha",
+    };
+    fs.writeFileSync(path.join(eventsDir, "20000101T000001000Z-alpha-claim-committed.md"),
+      `${serializeFrontmatter({
+        type: "claim-committed", entity_id: "alpha", claim_event: winnerIntent,
+        snapshot_version: 1, state_keys: Object.keys(winnerState), ...winnerState,
+      })}\n`);
+    const repaired = runWb(["fsck", "--bucket", bucket, "--repair", "--json"]);
+    assert.equal(repaired.status, 1);
+    const data = JSON.parse(repaired.stdout);
+    assert.equal(data.repaired, 1);
+    assert.ok(data.issues.some((issue) => issue.kind === "losing_claim_snapshot"));
+    assert.equal(parseFrontmatter(fs.readFileSync(created.task_path, "utf8")).data.claimed_by, "alpha");
+    fs.writeFileSync(path.join(eventsDir, "20000101T000002000Z-owner-log.md"),
+      `${serializeFrontmatter({
+        type: "log", snapshot_version: 1, state_keys: ["id"], id: created.task_id,
+        status: "pending", state_seq: 3,
+      })}\n`);
+    fs.writeFileSync(created.task_path, legitimate);
+    const invalid = runWb(["fsck", "--bucket", bucket, "--repair", "--json"]);
+    assert.equal(invalid.status, 1);
+    assert.equal(JSON.parse(invalid.stdout).repaired, 0);
+    assert.ok(JSON.parse(invalid.stdout).issues.some((issue) => issue.kind === "invalid_snapshot"));
+    assert.equal(fs.readFileSync(created.task_path, "utf8"), legitimate);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("fsck tolerates legacy revision mismatches and never repairs terminal records", () => {
+  const bucket = makeTempBucket();
+  try {
+    const legacyDir = path.join(bucket, "tasks", "legacy");
+    fs.mkdirSync(path.join(legacyDir, "events"), { recursive: true });
+    const legacyPath = path.join(legacyDir, "task.md");
+    const legacy = '---\nid: legacy\nstatus: complete\nrevision: 1\nclaim_round: 2\n---\nHistorical brief\n';
+    fs.writeFileSync(legacyPath, legacy);
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Terminal"]);
+    runWbJson(["post", "--bucket", bucket, "--entity", "owner", "--task", created.task_id, "--type", "complete"]);
+    const terminal = fs.readFileSync(created.task_path, "utf8").replace("revision: 1", "revision: 99");
+    fs.writeFileSync(created.task_path, terminal);
+    for (const flags of [[], ["--repair"]]) {
+      const result = runWb(["fsck", "--bucket", bucket, ...flags, "--json"]);
+      assert.equal(result.status, 1);
+      const data = JSON.parse(result.stdout);
+      assert.equal(data.repaired, 0);
+      assert.ok(data.issues.some((issue) => issue.kind === "legacy" && issue.message === "legacy: revision not bumped on rework"));
+      assert.ok(data.issues.some((issue) => issue.kind === "drift" && issue.terminal));
+      assert.equal(fs.readFileSync(legacyPath, "utf8"), legacy);
+      assert.equal(fs.readFileSync(created.task_path, "utf8"), terminal);
+    }
+    fs.writeFileSync(created.task_path, terminal.replace('status: "complete"', 'status: "pending"'));
+    assert.equal(runWb(["fsck", "--bucket", bucket, "--repair"]).status, 1);
+    assert.match(fs.readFileSync(created.task_path, "utf8"), /status: "pending"/);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("fsck warns about local sync conflicts without editing or treating them as events", () => {
+  const bucket = makeTempBucket();
+  try {
+    const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Conflict"]);
+    fs.writeFileSync(path.join(created.path, "events", "note (conflicted copy).md"), "conflict");
+    const result = runWb(["fsck", "--bucket", bucket]);
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /warning: local bucket contains sync conflicts/);
+    assert.equal(fs.readFileSync(path.join(created.path, "events", "note (conflicted copy).md"), "utf8"), "conflict");
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("terminal cursor pruning preserves active deliveries on every entity write", () => {
+  const bucket = makeTempBucket();
+  try {
+    const active = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Active"]);
+    const done = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Done"]);
+    runWbJson(["post", "--bucket", bucket, "--entity", "owner", "--task", done.task_id, "--type", "complete"]);
+    const entity = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "owner"]);
+    const data = parseFrontmatter(fs.readFileSync(entity.path, "utf8")).data;
+    fs.mkdirSync(path.join(bucket, "tasks", "partly-synced"));
+    fs.writeFileSync(path.join(bucket, "tasks", "partly-synced", "task.md"), "---\n");
+    data.owner_task_seen = [`${active.task_id}/live.md`, `${done.task_id}/old.md`, "not-synced-yet/old.md", "partly-synced/old.md"];
+    data.stale_task_seen = [`${active.task_id}/1/child/old`, `${done.task_id}/1/child/old`];
+    fs.writeFileSync(entity.path, `${serializeFrontmatter(data)}\n`);
+    const saved = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "owner"]);
+    assert.deepEqual(saved.owner_task_seen, [`${active.task_id}/live.md`, "not-synced-yet/old.md", "partly-synced/old.md"]);
+    assert.deepEqual(saved.stale_task_seen, [`${active.task_id}/1/child/old`]);
+    runWbJson(["entity", "end", "--bucket", bucket, "--entity", "owner"]);
+    const ended = parseFrontmatter(fs.readFileSync(entity.path, "utf8")).data;
+    assert.deepEqual(ended.owner_task_seen, saved.owner_task_seen);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("entities end explicitly, restrict dispatcher writes, and list history only with --all", () => {
+  const bucket = makeTempBucket();
+  try {
+    const args = ["--bucket", bucket];
+    const child = runWbJson(["entity", "register", ...args, "--entity", "child"]);
+    const data = parseFrontmatter(fs.readFileSync(child.path, "utf8")).data;
+    data.dispatcher = "pool";
+    fs.writeFileSync(child.path, `${serializeFrontmatter(data)}\n`);
+    const before = fs.readFileSync(child.path, "utf8");
+    assert.equal(runWb(["entity", "end", ...args, "--entity", "stranger", "--target", "child"]).status, 3);
+    assert.equal(fs.readFileSync(child.path, "utf8"), before);
+    const ended = runWbJson(["entity", "end", ...args, "--entity", "pool", "--target", "child"]);
+    assert.ok(ended.ended_at);
+    assert.equal(runWbJson(["entity", "list", ...args]).count, 0);
+    const history = runWbJson(["entity", "list", ...args, "--all"]).entities[0];
+    assert.equal(history.state, "ended");
+    assert.equal(history.online, false);
+    runWbJson(["entity", "register", ...args, "--entity", "child"]);
+    assert.equal(runWbJson(["entity", "list", ...args]).count, 1);
+    const stale = parseFrontmatter(fs.readFileSync(child.path, "utf8")).data;
+    stale.updated_at = new Date(Date.now() - 1000 * stale.ttl_seconds * 4).toISOString();
+    fs.writeFileSync(child.path, `${serializeFrontmatter(stale)}\n`);
+    assert.equal(runWbJson(["entity", "list", ...args]).count, 0);
+    assert.equal(runWbJson(["entity", "list", ...args, "--all"]).count, 1);
+    assert.equal(runWbJson(["entity", "list", ...args, "--all", "--online"]).count, 0);
+    assert.equal(runWb(["entity", "end", ...args, "--entity", "missing"]).status, 1);
+  } finally {
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
+test("eligibility never scans terminal event streams even with a thousand completed tasks", (t) => {
+  const bucket = makeTempBucket();
+  try {
+    const pending = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Pending"]);
+    for (let index = 0; index < 1000; index += 1) {
+      const dir = path.join(bucket, "tasks", `terminal-${index}`);
+      fs.mkdirSync(dir);
+      fs.writeFileSync(path.join(dir, "task.md"), `${serializeFrontmatter({
+        id: `terminal-${index}`, status: "complete", claimed_by: "", assignee: "",
+      })}\n`);
+    }
+    const readdir = fs.readdirSync;
+    let terminalEventReads = 0;
+    t.mock.method(fs, "readdirSync", (dir, ...args) => {
+      if (String(dir).includes("terminal-") && path.basename(String(dir)) === "events") terminalEventReads += 1;
+      return readdir(dir, ...args);
+    });
+    assert.deepEqual(findEligibleTasks(bucket, "executor", new Set(), false).map((item) => item.task.id), [pending.task_id]);
+    assert.equal(terminalEventReads, 0);
+    const entity = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "owner"]);
+    const data = parseFrontmatter(fs.readFileSync(entity.path, "utf8")).data;
+    data.owner_task_seen = Array.from({ length: 1000 }, (_, index) => `terminal-${index}/old.md`);
+    data.stale_task_seen = Array.from({ length: 1000 }, (_, index) => `terminal-${index}/1/child/old`);
+    data.owner_task_seen.push(`${pending.task_id}/live.md`);
+    fs.writeFileSync(entity.path, `${serializeFrontmatter(data)}\n`);
+    const saved = runWbJson(["entity", "register", "--bucket", bucket, "--entity", "owner"]);
+    assert.deepEqual(saved.owner_task_seen, [`${pending.task_id}/live.md`]);
+    assert.deepEqual(saved.stale_task_seen, []);
+  } finally {
+    t.mock.restoreAll();
+    fs.rmSync(bucket, { recursive: true, force: true });
+  }
+});
+
 test("rework auto-bumps revision once, warns on actionable amends, and reports transitions", () => {
   const bucket = makeTempBucket();
   try {
     const { task_id: id } = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Revisions"]);
     for (const [index, status] of ["review", "blocked"].entries()) {
-      runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", id, "--claim-settle-ms", "0"]);
+      runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", id]);
       runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", id, "--type", status === "review" ? "review" : "question", "--status", status]);
       const amend = runWb(["post", "--bucket", bucket, "--entity", "owner", "--task", id, "--type", "amend", "-m", "Correction", "--json"]);
       assert.equal(amend.status, 0, amend.stderr);
@@ -94,7 +488,7 @@ test("claim JSON includes bucket/tag instructions and multiline stdin/file bodie
     const id = JSON.parse(created.stdout).task_id;
     fs.writeFileSync(path.join(bucket, "INSTRUCTIONS.md"), "No git writes.\r\n");
     runWbJson(["tag", "set", "--bucket", bucket, "--entity", "owner", "--tag", "linux", "-m", "Use the toolchain."]);
-    const claim = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", id, "--claim-settle-ms", "0"]);
+    const claim = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", id]);
     assert.deepEqual(claim.instructions, [
       { file: "INSTRUCTIONS.md", body: "No git writes." },
       { file: "tags/linux.md", body: "Use the toolchain." },
@@ -102,7 +496,7 @@ test("claim JSON includes bucket/tag instructions and multiline stdin/file bodie
     const reviewPath = path.join(bucket, "review-body.md");
     fs.writeFileSync(reviewPath, body);
     runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", id, "--type", "review", "--status", "review", "--body-file", reviewPath]);
-    const rendered = runWbJson(["render", "--bucket", bucket, "--task", id, "--after-event", claim.claimed_event]);
+    const rendered = runWbJson(["render", "--bucket", bucket, "--task", id, "--after-event", claim.last_event_seen]);
     assert.equal(rendered.body, body.trim());
     assert.equal(rendered.events.length, 1);
     assert.equal(rendered.events[0].body, body.trim());
@@ -123,7 +517,7 @@ test("pool watches skip current-round claim events, preserve claim recovery, and
     const ready = runWbJson(["watch", "--bucket", bucket, "--entity", "worker", "--exclude-task", second.task_id, "--timeout", "1"]);
     assert.deepEqual(ready.tasks.map((t) => t.id), [third.task_id]);
     assert.equal(runWb(["watch", "--bucket", bucket, "--entity", "dispatcher", "--exclude-task", second.task_id, "--exclude-task", third.task_id, "--timeout", "0.1"]).status, 124);
-    const recovered = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", first.task_id, "--claim-settle-ms", "0"]);
+    const recovered = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", first.task_id]);
     assert.equal(recovered.task_id, first.task_id);
     runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", first.task_id, "--type", "review", "--status", "review"]);
     runWbJson(["post", "--bucket", bucket, "--entity", "owner", "--task", first.task_id, "--type", "feedback", "--reopen"]);
@@ -141,7 +535,7 @@ test("owner watches deliver each task edge once, persist cursors, and can list a
     const first = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "First review"]);
     const second = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Second review"]);
     for (const task of [first, second]) {
-      runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", task.task_id, "--claim-settle-ms", "0"]);
+      runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", task.task_id]);
       runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", task.task_id, "--type", "review", "--status", "review", "-m", "Evidence"]);
     }
     const watchArgs = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only"];
@@ -169,7 +563,7 @@ test("watch summaries and task updates include bounded event evidence or full bo
   const bucket = makeTempBucket();
   try {
     const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Preview"]);
-    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "0"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id]);
     const body = "one\ntwo\nthree\nfour\nfive\nsix";
     const review = runWbJson(["post", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--type", "review", "--status", "review", "-m", body]);
     const args = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--all-actionable"];
@@ -266,7 +660,7 @@ test("claim surfaces pre-claim/unaccepted amends and feedback; accept-amends mer
     const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Amends"]);
     const args = ["--bucket", bucket, "--task", created.task_id];
     const pre = runWbJson(["post", ...args, "--entity", "owner", "--type", "amend", "-m", "Pre-claim correction"]);
-    const claim = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    const claim = runWbJson(["claim", ...args, "--entity", "worker"]);
     assert.deepEqual(claim.unread_events.map((event) => event.filename), [pre.event]);
     assert.equal(claim.unread_events[0].body, "Pre-claim correction");
     const mid = runWbJson(["post", ...args, "--entity", "owner", "--type", "amend", "-m", "Mid-flight correction"]);
@@ -287,12 +681,12 @@ test("claim surfaces pre-claim/unaccepted amends and feedback; accept-amends mer
     assert.equal(runWbJson(["render", ...args]).events.length, render.events.length);
     runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
     const feedback = runWbJson(["post", ...args, "--entity", "owner", "--type", "feedback", "--status", "pending", "-m", "Fix the test"]);
-    const rework = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    const rework = runWbJson(["claim", ...args, "--entity", "worker"]);
     assert.deepEqual(rework.unread_events.map((event) => event.filename), [feedback.event]);
     const later = runWbJson(["post", ...args, "--entity", "owner", "--type", "amend", "-m", "Still unaccepted"]);
     runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
     const nextFeedback = runWbJson(["post", ...args, "--entity", "owner", "--type", "feedback", "--status", "pending", "-m", "Another fix"]);
-    const nextClaim = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    const nextClaim = runWbJson(["claim", ...args, "--entity", "worker"]);
     assert.deepEqual(nextClaim.unread_events.map((event) => event.filename), [later.event, nextFeedback.event]);
     runWbJson(["post", ...args, "--entity", "worker", "--type", "log", "--accept-amends"]);
     const merged = runWbJson(["render", ...args]);
@@ -308,7 +702,7 @@ test("owner watches signal stale registered executors once per round/heartbeat a
   try {
     runWbJson(["entity", "register", "--bucket", bucket, "--entity", "worker", "--ttl", "10"]);
     const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Stalled"]);
-    runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "0"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id]);
     const entityPath = path.join(bucket, "entities", "worker.md");
     fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/updated_at: "[^"]+"/, 'updated_at: "2000-01-01T00:00:00Z"'));
     const args = ["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--poll-ms", "50"];
@@ -336,7 +730,7 @@ test("owner watch notices TTL expiry while armed, without requiring task events"
   try {
     runWbJson(["entity", "register", "--bucket", bucket, "--entity", "worker"]);
     const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Expiry"]);
-    runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "0"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id]);
     const entityPath = path.join(bucket, "entities", "worker.md");
     fs.writeFileSync(entityPath, fs.readFileSync(entityPath, "utf8").replace(/ttl_seconds: \d+/, "ttl_seconds: 2"));
     const result = await runWbAsync(["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--poll-ms", "50", "--timeout", "4", "--json"]);
@@ -376,7 +770,7 @@ test("plain PAUSED blocks claims and pool delivery while owners can still review
     const pause = runWbJson(["bucket", "pause", "--bucket", bucket, "-m", "Await decision"]);
     assert.equal(pause.paused, true);
     assert.equal(fs.readFileSync(pause.path, "utf8"), "Await decision\n");
-    assert.equal(runWb(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]).status, 2);
+    assert.equal(runWb(["claim", ...args, "--entity", "worker"]).status, 2);
     const watch = runWbJson(["watch", "--bucket", bucket, "--entity", "worker"]);
     assert.equal(watch.reason, "paused");
     assert.equal(watch.paused, true);
@@ -384,7 +778,7 @@ test("plain PAUSED blocks claims and pool delivery while owners can still review
     assert.equal(runWb(["watch", "--bucket", bucket, "--entity", "owner", "--owner-only", "--timeout", "0.1"]).status, 124);
     assert.equal(runWbJson(["bucket", "resume", "--bucket", bucket]).paused, false);
     runWbJson(["bucket", "resume", "--bucket", bucket]);
-    const claim = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "0"]);
+    const claim = runWbJson(["claim", ...args, "--entity", "worker"]);
     fs.writeFileSync(pause.path, "Human pause\n");
     runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
     const taskUpdate = runWbJson(["watch", ...args, "--after-event", claim.last_event_seen]);
@@ -402,7 +796,8 @@ test("a pause during claim settle leaves the task pending and wakes an armed poo
   const bucket = makeTempBucket();
   try {
     const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Settle pause"]);
-    const claiming = runWbAsync(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--claim-settle-ms", "500", "--json"]);
+    setBucketConfig(bucket, { claim_settle_ms: 500 });
+    const claiming = runWbAsync(["claim", "--bucket", bucket, "--entity", "worker", "--task", created.task_id, "--json"]);
     await new Promise((resolve) => setTimeout(resolve, 120));
     const watching = runWbAsync(["watch", "--bucket", bucket, "--entity", "observer", "--owner-only", "--timeout", "0.2"]);
     runWbJson(["bucket", "pause", "--bucket", bucket]);
@@ -423,19 +818,19 @@ test("a pause during claim settle leaves the task pending and wakes an armed poo
   }
 });
 
-test("pinned reclaims skip settle while initially assigned claims still settle", () => {
+test("initial and pinned reclaims both honor positive bucket settle", () => {
   const bucket = makeTempBucket();
   try {
     const created = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Pinned", "--assignee", "worker"]);
     const args = ["--bucket", bucket, "--task", created.task_id];
     const start = Date.now();
-    runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "250"]);
+    runWbJson(["claim", ...args, "--entity", "worker"]);
     assert.ok(Date.now() - start >= 250, "Initial assigned claim must still settle");
     runWbJson(["post", ...args, "--entity", "worker", "--type", "review", "--status", "review"]);
     runWbJson(["post", ...args, "--entity", "owner", "--type", "feedback", "--status", "pending"]);
     const reclaimStart = Date.now();
-    const reclaimed = runWbJson(["claim", ...args, "--entity", "worker", "--claim-settle-ms", "2000"]);
-    assert.ok(Date.now() - reclaimStart < 1500, "Pinned reclaim must skip the explicit 2s settle");
+    const reclaimed = runWbJson(["claim", ...args, "--entity", "worker"]);
+    assert.ok(Date.now() - reclaimStart >= 250, "Pinned reclaim must still settle");
     assert.equal(reclaimed.task.claim_round, 2);
     assert.equal(reclaimed.task.claimed_by, "worker");
     assert.equal(runWbJson(["render", ...args]).claim_winner, "worker");
@@ -491,7 +886,7 @@ test("all entity writers accept nonce flags and inherited nonce collision checks
     assert.match(created.stderr, /different live session nonce/);
     const id = JSON.parse(created.stdout).task_id;
     const commands = [
-      ["claim", ...base, "--task", id, "--claim-settle-ms", "0"],
+      ["claim", ...base, "--task", id],
       ["post", ...base, "--task", id, "--type", "log", "-m", "Checkpoint"],
       ["msg", "send", ...base, "-m", "Notice"],
       ["tag", "set", ...base, "--tag", "test", "-m", "Instructions"],
@@ -682,8 +1077,6 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
         "win-worker",
         "--tag",
         "windows",
-        "--claim-settle-ms",
-        "0",
       ]);
       claimedIds.push(c.task_id);
       runWbJson([
@@ -725,8 +1118,6 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "win-worker",
       "--tag",
       "windows",
-      "--claim-settle-ms",
-      "0",
     ]);
     assert.equal(noMatch.status, 2);
 
@@ -740,8 +1131,6 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "--tag",
       "windows",
       "--include-untagged",
-      "--claim-settle-ms",
-      "0",
     ]);
     assert.equal(c3.task_id, tUntagged.task_id);
 
@@ -754,8 +1143,6 @@ test("capability tag routing, --include-untagged, and direct assignee bypass", (
       "win-cert-worker",
       "--tag",
       "windows-signing",
-      "--claim-settle-ms",
-      "0",
     ]);
     assert.equal(c4.task_id, tWinSigned.task_id);
   } finally {
@@ -829,11 +1216,11 @@ test("depends_on blocks until complete, stays blocked if cancelled, and priority
     ]);
 
     // Next claimable must be `dep` (because downstream & blockedByCancel have unmet deps)
-    const c1 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
+    const c1 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
     assert.equal(c1.task_id, dep.task_id);
 
     // WIP limit prevents exec-1 from claiming anything else while in-progress
-    const wipErr = runWb(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
+    const wipErr = runWb(["claim", "--bucket", bucket, "--entity", "exec-1"]);
     assert.equal(wipErr.status, 2);
 
     // Complete dep
@@ -863,10 +1250,10 @@ test("depends_on blocks until complete, stays blocked if cancelled, and priority
     ]);
 
     // Now downstream is claimable, while blockedByCancel remains blocked
-    const c2 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
+    const c2 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
     assert.equal(c2.task_id, downstream.task_id);
 
-    const noneLeft = runWb(["claim", "--bucket", bucket, "--entity", "exec-2", "--claim-settle-ms", "0"]);
+    const noneLeft = runWb(["claim", "--bucket", bucket, "--entity", "exec-2"]);
     assert.equal(noneLeft.status, 2);
 
     // Removing cancelled dep makes blockedByCancel claimable
@@ -883,7 +1270,7 @@ test("depends_on blocks until complete, stays blocked if cancelled, and priority
       "--remove-depends-on",
       cancelledUpstream.task_id,
     ]);
-    const c3 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2", "--claim-settle-ms", "0"]);
+    const c3 = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2"]);
     assert.equal(c3.task_id, blockedByCancel.task_id);
   } finally {
     fs.rmSync(bucket, { recursive: true, force: true });
@@ -907,7 +1294,7 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
     const id = created.task_id;
 
     // Claim
-    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b", "--claim-settle-ms", "0"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b"]);
     assert.equal(claimed.task_id, id);
     assert.equal(claimed.task.status, "in-progress");
     assert.equal(claimed.task.claimed_by, "worker-b");
@@ -986,7 +1373,7 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
     assert.equal(answered.task.assignee, "worker-b");
 
     // Worker-b re-claims
-    const reclaimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b", "--claim-settle-ms", "0"]);
+    const reclaimed = runWbJson(["claim", "--bucket", bucket, "--entity", "worker-b"]);
     assert.equal(reclaimed.task_id, id);
     assert.equal(reclaimed.task.status, "in-progress");
 
@@ -1011,7 +1398,7 @@ test("full lifecycle: amend mid-flight, question/answer preserving assignee, fee
     assert.equal(reset.task.assignee, "");
 
     // Another worker can now claim and complete
-    runWbJson(["claim", "--bucket", bucket, "--entity", "worker-c", "--claim-settle-ms", "0"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "worker-c"]);
     runWbJson([
       "post",
       "--bucket",
@@ -1069,9 +1456,9 @@ test("concurrent claim race allows only one winner", async () => {
     ]);
 
     const racers = await Promise.all([
-      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "250", "--json"]),
-      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-2", "--claim-settle-ms", "250", "--json"]),
-      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-3", "--claim-settle-ms", "250", "--json"]),
+      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-1", "--json"]),
+      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-2", "--json"]),
+      runWbAsync(["claim", "--bucket", bucket, "--entity", "w-3", "--json"]),
     ]);
 
     const winners = racers.filter((r) => r.status === 0);
@@ -1151,8 +1538,6 @@ test("watch blocks and wakes on matching task creation and on task event arrival
       "win-1",
       "--task",
       winTask.task_id,
-      "--claim-settle-ms",
-      "0",
     ]);
 
     const watchTaskPromise = runWbAsync([
@@ -1215,7 +1600,7 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
       "Parent epic",
     ]);
 
-    const cParent = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
+    const cParent = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
     assert.equal(cParent.task_id, parent.task_id);
 
     // Decompose into a child task and release WIP slot on parent
@@ -1260,7 +1645,7 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
     assert.deepEqual(parked.task.depends_on, [child.task_id]);
 
     // exec-1 can now claim child because parent WIP was freed (and parent is blocked by child)
-    const cChild = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
+    const cChild = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
     assert.equal(cChild.task_id, child.task_id);
 
     // Complete child
@@ -1290,7 +1675,7 @@ test("subtask decomposition, feedback loop, dotfile/incomplete-folder resilience
     ]);
 
     // Resume parent
-    const resumed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--claim-settle-ms", "0"]);
+    const resumed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1"]);
     assert.equal(resumed.task_id, parent.task_id);
 
     // Submit review -> owner sends feedback -> exec-1 re-claims -> review -> complete
@@ -1393,8 +1778,6 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       bucket,
       "--entity",
       "worker-1",
-      "--claim-settle-ms",
-      "0",
     ]);
     assert.equal(claimed.task.claimed_by, "worker-1");
     assert.equal(claimed.task.assignee, "");
@@ -1457,8 +1840,6 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       bucket,
       "--entity",
       "worker-2",
-      "--claim-settle-ms",
-      "0",
     ]);
     assert.equal(otherBlocked.status, 2);
 
@@ -1469,8 +1850,6 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       bucket,
       "--entity",
       "worker-1",
-      "--claim-settle-ms",
-      "0",
     ]);
     assert.equal(reclaimed.task_id, created.task_id);
     assert.equal(reclaimed.task.status, "in-progress");
@@ -1518,8 +1897,6 @@ test("post auto-pins assignee on feedback/answer from pool-claimed task and --ch
       bucket,
       "--entity",
       "worker-2",
-      "--claim-settle-ms",
-      "0",
     ]);
     assert.equal(claimedBy2.task_id, created.task_id);
   } finally {
@@ -1549,7 +1926,7 @@ test("human-created minimal/malformed tasks do not crash watch/render or deadloc
     assert.equal(watchBlocked.status, 124);
 
     // Complete blocker
-    runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2", "--include-untagged", "--task", blocker.task_id, "--claim-settle-ms", "0"]);
+    runWbJson(["claim", "--bucket", bucket, "--entity", "exec-2", "--include-untagged", "--task", blocker.task_id]);
     runWbJson(["post", "--bucket", bucket, "--entity", "exec-2", "--task", blocker.task_id, "--type", "review", "--status", "review"]);
     runWbJson(["post", "--bucket", bucket, "--entity", "human", "--task", blocker.task_id, "--type", "complete"]);
 
@@ -1559,7 +1936,7 @@ test("human-created minimal/malformed tasks do not crash watch/render or deadloc
     assert.equal(ready.tasks[0].id, "human-minimal");
 
     // Claiming must populate task_id from folder name and allow completion when owner is omitted
-    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--tag", "linux", "--task", "human-minimal", "--claim-settle-ms", "0"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "exec-1", "--tag", "linux", "--task", "human-minimal"]);
     assert.equal(claimed.task_id, "human-minimal");
     assert.equal(claimed.task.id, "human-minimal");
 
@@ -1595,7 +1972,7 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
     assert.ok(fs.existsSync(path.join(bucket, "tasks", draftTask.task_id, "task.md")));
 
     // Worker cannot claim draft task
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
 
     // Mark ready (still held back from workers)
     const markedReady = runWbJson([
@@ -1615,7 +1992,7 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
     ]);
     assert.equal(markedReady.stage, "tasks");
     assert.equal(markedReady.task.status, "ready");
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
 
     // Another draft task also remains unclaimable until promoted
     const cancelledDraft = runWbJson([
@@ -1629,7 +2006,7 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "--status",
       "draft",
     ]);
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
 
     // Promote draftTask to pending -> now claimable
     const promoted = runWbJson([
@@ -1668,7 +2045,7 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
     ]);
     assert.equal(pulledBack.stage, "tasks");
     assert.equal(pulledBack.task.status, "ready");
-    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]).status, 2);
+    assert.equal(runWb(["claim", "--bucket", bucket, "--entity", "w-1"]).status, 2);
 
     runWbJson([
       "post",
@@ -1685,7 +2062,7 @@ test("backlog draft/ready lifecycle prevents premature claims and promotes/demot
       "--status",
       "pending",
     ]);
-    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "w-1", "--claim-settle-ms", "0"]);
+    const claimed = runWbJson(["claim", "--bucket", bucket, "--entity", "w-1"]);
     assert.equal(claimed.task_id, draftTask.task_id);
 
     // Cancel draft task directly
@@ -1761,8 +2138,6 @@ test("public messages filter by recipient/tags, coalesce bursts, and track last_
       "bob-tasks",
       "--poll-ms",
       "100",
-      "--msg-coalesce-ms",
-      "250",
       "--timeout",
       "4",
       "--json",
@@ -1903,7 +2278,7 @@ test("entities, tags registry, and owner-only watch mode", async () => {
     );
     fs.writeFileSync(stalePath, staleRaw);
 
-    const entities = runWbJson(["entity", "list", "--bucket", bucket]);
+    const entities = runWbJson(["entity", "list", "--bucket", bucket, "--all"]);
     assert.equal(entities.count, 2);
     const macEnt = entities.entities.find((e) => e.entity_id === "mac-1");
     const staleEnt = entities.entities.find((e) => e.entity_id === "stale-1");
@@ -1944,8 +2319,6 @@ test("entities, tags registry, and owner-only watch mode", async () => {
       "worker-1",
       "--task",
       tOwned.task_id,
-      "--claim-settle-ms",
-      "0",
     ]);
 
     const ownerWatch = runWbAsync([
@@ -2174,14 +2547,15 @@ test("two-replica async-sync simulator executes concurrent claims without double
   }, 40);
 
   try {
+    setBucketConfig(replicaA, { sync: "cloud", claim_settle_ms: 300 });
     const t1 = runWbJson(["create", "--bucket", replicaA, "--entity", "owner-a", "--title", "Sim task 1"]);
     const t2 = runWbJson(["create", "--bucket", replicaA, "--entity", "owner-a", "--title", "Sim task 2"]);
     await new Promise((r) => setTimeout(r, 120));
 
     // Both replicas race to claim from their local directories while async sync runs every 40ms
     const [resA, resB] = await Promise.all([
-      runWbAsync(["claim", "--bucket", replicaA, "--entity", "worker-a", "--claim-settle-ms", "300", "--json"]),
-      runWbAsync(["claim", "--bucket", replicaB, "--entity", "worker-b", "--claim-settle-ms", "300", "--json"]),
+      runWbAsync(["claim", "--bucket", replicaA, "--entity", "worker-a", "--json"]),
+      runWbAsync(["claim", "--bucket", replicaB, "--entity", "worker-b", "--json"]),
     ]);
 
     assert.equal(resA.status, 0, `worker-a failed: ${resA.stderr}`);
@@ -2216,22 +2590,23 @@ test("two-replica async-sync simulator executes concurrent claims without double
   }
 });
 
-test("slow-sync simulator recovers when sync delay exceeds claim-settle-ms and LWW loser overwrites task.md", async () => {
+test("slow-sync simulator recovers when sync delay exceeds bucket settle and LWW loser overwrites task.md", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wb-slow-sim-"));
   const replicaA = path.join(root, "replica-a");
   const replicaB = path.join(root, "replica-b");
   const syncOnce = createReplicaSyncer(replicaA, replicaB);
 
   try {
+    setBucketConfig(replicaA, { sync: "cloud", claim_settle_ms: 50 });
     const t1 = runWbJson(["create", "--bucket", replicaA, "--entity", "owner-a", "--title", "Slow sync race"]);
     syncOnce();
 
     // Simulate slow cloud sync paused across claims (claimSettleMs=50ms < sync delay).
     // Start "alpha" first, then "zeta" slightly later so "zeta" loses the election ("alpha" < "zeta")
     // yet writes a newer LWW task.md mtime!
-    const resAlpha = await runWbAsync(["claim", "--bucket", replicaA, "--entity", "alpha", "--claim-settle-ms", "50", "--json"]);
+    const resAlpha = await runWbAsync(["claim", "--bucket", replicaA, "--entity", "alpha", "--json"]);
     await new Promise((r) => setTimeout(r, 30));
-    const resZeta = await runWbAsync(["claim", "--bucket", replicaB, "--entity", "zeta", "--claim-settle-ms", "50", "--json"]);
+    const resZeta = await runWbAsync(["claim", "--bucket", replicaB, "--entity", "zeta", "--json"]);
     assert.equal(resAlpha.status, 0, resAlpha.stderr);
     assert.equal(resZeta.status, 0, resZeta.stderr);
 
@@ -2303,7 +2678,7 @@ test("slow-sync simulator recovers when sync delay exceeds claim-settle-ms and L
     assert.equal(fb.task.assignee, "alpha");
     syncOnce();
 
-    runWbJson(["claim", "--bucket", replicaA, "--entity", "alpha", "--claim-settle-ms", "50"]);
+    runWbJson(["claim", "--bucket", replicaA, "--entity", "alpha"]);
     runWbJson(["post", "--bucket", replicaA, "--entity", "alpha", "--task", t1.task_id, "--type", "review", "--status", "review"]);
     syncOnce();
 

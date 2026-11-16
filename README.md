@@ -1,5 +1,7 @@
 # work-bucket
 
+Version 2.0.0 introduces a breaking protocol/CLI update.
+
 A lockfile-free, entity-agnostic filesystem Markdown work bucket skill (`SKILL.md`) with an optional zero-dependency Node.js 20+ CLI (`scripts/wb.mjs`). Humans, LLM agents across any harness, and automated scripts collaborate across local disks, SMB/NFS mounts, or consumer cloud-sync folders (Dropbox, Google Drive, OneDrive, Syncthing) through plain Markdown files, immutable event logs, and lockless 2-phase claim elections.
 
 ## Installation
@@ -23,6 +25,44 @@ When starting an agent session, provide three required inputs:
 - Optional capability tags (e.g. `--tag linux`) and `--include-untagged`.
 
 ## How Humans Interact with the Bucket
+
+### Bucket settings
+
+The owner edits `bucket.md` at the bucket root:
+
+```yaml
+---
+sync: local
+claim_settle_ms: 250
+default_ttl_seconds: 300
+msg_coalesce_ms: 500
+---
+```
+
+- `sync`: `local`, `shared`, or `cloud`. Omitted config defaults to `shared`.
+- Omitted settle defaults to 250 ms locally, 2000 ms otherwise. It must be a
+  positive integer, including for pinned reclaims.
+- TTL must be a positive integer; message coalescing must be a non-negative integer.
+- Local buckets containing sync-conflict copies are reported by `fsck`.
+
+### Migration to 2.0.0
+
+| Previous behavior | Replacement |
+| --- | --- |
+| Per-call `--claim-settle-ms` | Set positive `claim_settle_ms` in `bucket.md` |
+| Watch `--ttl` / `--msg-coalesce-ms` | `default_ttl_seconds` / `msg_coalesce_ms` in `bucket.md` |
+| Pinned reclaims skip settle | Every election settles |
+| Second-precision event/message names | Millisecond names; old names remain readable |
+| Entity list includes all historical identities | `entity list --all`; `entity end` marks exit |
+
+`fsck --bucket <dir>` is read-only. `fsck --repair` rebuilds drifting
+non-terminal task frontmatter from immutable state snapshots, preserving the
+body. Terminal tasks and legacy tasks without snapshots are never rewritten.
+Legacy revision/round mismatches are reported as known historical anomalies.
+Ambiguous or invalid snapshots prevent repair. Claim elections remain immutable
+intents; only an elected winner's `claim-committed` event materializes the claim.
+
+Run the tests with `npm test` or `node --test test/` (Node.js 20+).
 
 A bucket uses plain Markdown directories:
 
@@ -92,7 +132,7 @@ REVIEW
 
 ## Reclaims and Session Handover
 
-- Pinned reclaims (`assignee == entity`, `claim_round > 1`) skip the claim-settle delay, including an explicit `--claim-settle-ms`. Initially assigned tasks and open-pool claims retain the normal settle. Winner election and late-sync split-brain checks remain in place.
+- All claims, including pinned reclaims, use the positive settle configured in `bucket.md`. Winner election and late-sync split-brain checks remain in place.
 - Optional `--session-nonce <token>` is accepted by `create`, `claim`, `post`, `watch`, `msg send`, `entity register` and `tag set`; it overrides `WB_SESSION_NONCE`. Register the entity first, then supply the same caller-chosen token on writes (or inherit the environment variable). The marker is stored as `session_nonce` in `entities/<id>.md`.
 - A different nonce on a still-live entity prints one warning per command but does not refuse the write: presence remains advisory, not an exclusive lease. Stale transfers do not warn. Commands without a nonce preserve an existing marker and cannot detect collisions; existing buckets need no migration. Resolve unexpected identity sharing with the coordinator rather than inventing a new ID.
 - Before context handover, capture task IDs, last-seen event filename and the existing watcher's handle/PID. The successor must stop that known watcher for its entity before re-arming, even if its completion targets the predecessor session. Resume task waits with `watch --task <id> --after-event <last_seen> --since-status <review|blocked>`; owner/pool watches reuse persisted entity cursors. An already `in-progress` task resumes from its checkpoint without another claim.

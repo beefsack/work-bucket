@@ -3,104 +3,111 @@ name: work-bucket
 description: Lockfile-free, entity-agnostic filesystem Markdown work bucket with immutable event logs and capability tag routing for creating, claiming, decomposing, executing, clarifying, and reviewing work.
 ---
 
-# Filesystem Work-Bucket Protocol
+# Work-bucket
 
-## 1. Mandatory Session Initialization
-- Require three explicit parameters from the user before reading or modifying any bucket files:
-  1. `bucket_dir`: Path to the bucket root (`tasks/`, `messages/`, `entities/`, `tags/`).
-  2. `entity_id`: Your opaque identifier for this session (e.g., `entity-a`, `win-worker-1`, `ci-runner`).
-  3. `mode` (`once` | `continuous` | `owner`; alias `one-shot`):
-     - `once`: Claim and complete **1 task lifecycle**. After posting `review` or `blocked`, watch that specific task (`wb.mjs watch --task <id> --since-status <review|blocked> --after-event <event>`) until `status` is `complete` or `cancelled`, `status` returns to unassigned `pending` (`--reopen`), `reason == "removed"`, or `assignee` changes away from `<entity_id>`; if `feedback`/`answer` returns it to `status: "pending"` with `assignee == <entity_id>`, reclaim, fix/continue, and re-watch it until closed or reassigned.
-     - `continuous`: Continuous worker loop. After handling work, re-arm `watch`; in background-completion harnesses **END YOUR TURN** after arming it (no `--timeout`). That is the wait, not an exit. Never wait in-turn.
-     - `owner`: Non-worker coordinator/owner loop. **Never** claim tasks. Use `watch --entity <entity_id> --owner-only` for owned `blocked`/`review` tasks, stale executors and messages; handle them, then re-arm with the same waiting rule. A bounded owner acting for a parent/coordinator exits when every task in its assigned unit is `complete`/`cancelled`, or when a decision must be escalated: stop watching and report via the harness. Exit is not a bucket pause.
-- Record any optional capability/platform `tags` (and whether `--include-untagged` applies) supplied by the user for executor task matching and message filtering.
-  - **Owner vs executor tag scope:** `tags` only restrict which tasks you `claim` as an executor (and which tag-targeted messages wake you). Creating, watching (`--task`), answering, reviewing, completing, or cancelling tasks where `owner == <entity_id>` is always allowed regardless of `tags`.
-- Record optional concurrency parameter if supplied (default: `single-threaded`):
-   - **Concurrency (`single-threaded` | `multithreaded`):** `single-threaded` claims and executes 1 task inline (`WIP = 1`). `multithreaded` runs as a dispatcher watching the bucket and spawning up to `max_workers` subagents (with configured `agent`/`model`/`effort`), each using a distinct `entity_id` (e.g. `<entity_id>-1`, `<entity_id>-2`) so `WIP = 1` per `entity_id` and `claimed_by` single-writer rules hold; parallelize shared-repo tasks only when `depends_on` or separate git worktrees prevent file conflicts.
-   - **Dispatcher alone watches tags/messages.** Each child runs `once`, scoped to `claim --task <id>`, never watches tags/messages, and returns to the dispatcher immediately after posting `review`/`blocked` (exception to the standalone `once` lifecycle). The dispatcher checks pending tasks pinned to its `<entity_id>-N` child IDs and spawns a child under that same ID for rework; if that assignee cannot return, ask the owner to `post --reopen`.
-- **Never** invent, infer, default, or auto-generate `bucket_dir`, `entity_id`, `mode`, or `tags`. If `bucket_dir`, `entity_id`, or `mode` (`once` vs `continuous` vs `owner`) is missing, ask the user and wait.
-- Treat all other `entity_id` values as anonymous peers (use `wb.mjs entity list` / `wb.mjs tag list` to discover active peers and documented tags). Never assume what tool, model, script, or human sits behind another `entity_id`.
-- Ensure `<bucket_dir>/tasks`, `messages`, `entities`, and `tags` exist before operating. Keep host clocks reasonably synced (e.g., via NTP) so timestamp-ordered events and lockless claim elections stay deterministic across hosts/cloud sync folders.
-- If `<skill_dir>/scripts/wb.mjs` and `node` (Node 20+) are available, prefer `node "<skill_dir>/scripts/wb.mjs"` subcommands for lockless claim election, atomic file updates, and zero-token waiting; otherwise execute the identical filesystem rules below directly.
-- **Watching:** In harnesses that wake on background completion, arm one background `watch` **without `--timeout` and END YOUR TURN**; never wait in-turn. "Do not end your turn" applies only to foreground/blocking harnesses: run foreground with `--timeout` below the tool limit, re-running on `124` or outer timeout `143`. Keep at most one watcher per entity; re-arm after handling a match unless exiting a bounded unit.
-- **Mode vocabulary:** `once`/`continuous` describe session behavior; non-owner pool `watch` records advisory entity `mode: "worker"` (`entity register` also accepts `worker`). This is not a different execution policy.
-- **Session identity (optional):** Register first; entity-writing commands accept caller-supplied `--session-nonce <token>` or `WB_SESSION_NONCE` (flag wins). A different live nonce warns, never locks out writes; omission preserves it without collision detection. Do not invent a replacement identity; resolve unexpected sharing with the caller.
-- **Handover:** Record task IDs, last-seen event filename and watcher handle/PID. The successor stops any existing watcher for its entity (including one bound to the predecessor) before re-arming. Resume task waits with `watch --task <id> --after-event <last_seen>` plus the correct `--since-status`; owner/pool watches reuse persisted entity cursors.
+Use `node "<skill_dir>/scripts/wb.mjs"` (Node.js 20+), abbreviated `wb` below. Add `--bucket <bucket_dir>` to every command and `--entity <entity_id>` when acting. Use `wb --help` for commands and `<command> --help` for flags.
 
-## 2. Directory Layout & File Rules
-- `<bucket_dir>/tasks/<task_id>/task.md` + `events/` - Single fixed directory per task across its entire lifecycle (`status` in `task.md` is the sole lifecycle state: `draft`, `ready`, `pending`, `in-progress`, `blocked`, `review`, `complete`, `cancelled`). Never move or rename task folders after creation. Ignore folders missing `task.md`, dotfiles (`.*`), and sync-conflict files (`.sync-conflict-`, `conflicted copy`).
-- `<bucket_dir>/messages/<UTC>-<from_entity>-<slug>.md` - Append-only, immutable **public** messages (`from`, `to: [...]`, `tags: []`, `timestamp`).
-- `<bucket_dir>/entities/<entity_id>.md` - Advisory peer presence and delivery cursors (`last_msg_seen`, `owner_task_seen: ["<task_id>/<event_file>"]`, `stale_task_seen`), plus mode/tags/TTL/heartbeat. Single-writer: only `<entity_id>` edits its own file; presence never blocks restarts.
-- `<bucket_dir>/tags/<tag>.md` - Optional tag descriptions and standing instructions, not a strict allowlist. Executors read bodies for every task tag plus optional bucket-level `INSTRUCTIONS.md` before claiming/executing; task bodies contain only task-specific content. `claim --json` includes these as `instructions: [{file, body}]`.
-- `<bucket_dir>/PAUSED` - Plain-file pause (`bucket pause|resume`). Claim refuses (exit 2); pool watch returns `reason: "paused"` and no work. Stop executor work at checkpoints and do not re-arm pool watch until explicitly resumed; owners may still review with `--owner-only` (does not wake solely for pause). Pause is not cancellation.
-- **Immutable `events/` & `messages/` streams:** Append solely by creating unique timestamped files (via `.<file>.tmp` -> rename). **Never edit or delete an existing file in `events/` or `messages/`.**
-- **Single-writer rule on `task.md`:** Only `claimed_by` edits `task.md` while `status == in-progress`; only `owner` edits `task.md` while `status` is `draft`, `ready`, `blocked`, `review`, or unclaimed `pending`. Always write `task.md` via `.task.md.tmp` -> rename, quote all YAML strings (`"..."`), and strip `\r`.
-- **Payload-before-flag rule:** Always publish the new file in `events/` *before* updating `task.md` `status`.
+| Input | Use |
+| --- | --- |
+| Required | Obtain `bucket_dir`, `entity_id`, and `mode` (`owner`, `once`, `continuous`) from the caller; ask for missing values. |
+| Executor filters | Use supplied `--tag` and `--include-untagged`; do not invent capabilities. |
+| Dispatcher | Obtain `max_workers` and child agent/model settings from the caller. Treat peer IDs as opaque; discover peers with `entity list`/`tag list`. |
+| Bucket writes | Use the CLI for task/entity/event/message mutations. Keep task paths fixed and existing events/messages immutable. |
 
-## 3. Creating, Refining, Amending & Reviewing Tasks (Owner Role)
-- **Creating:** Create `<bucket_dir>/tasks/<task_id>/events/` (`--backlog` / `--draft` for `status: "draft"`, `--status ready` for held-back, or default `status: "pending"`), write `<UTC>-<entity_id>-created.md`, and atomically publish `task.md` with:
-  - Frontmatter: `id`, `title`, `status: "pending" | "draft" | "ready"`, `priority`, `tags: []` (e.g., `["windows"]`, `["macos"]`, `["linux"]`), `owner: "<entity_id>"`, `claimed_by: ""`, `claim_round: 1`, `assignee: ""`, `parent: ""`, `depends_on: []`, `revision: 1`, `updated_by: "<entity_id>"`, `updated_at: "<ISO-8601 UTC>"`.
-  - Body: `## Context & Target` (workspace path and target files), `## Description`, and numbered `- [ ] #N` `## Acceptance Criteria` including an exact verification command.
-- **Backlog Refinement & Promotion:** Tasks in `tasks/` with `status: "draft"` or `status: "ready"` stay out of worker queues. Promote to claimable work (`wb.mjs post --status pending`), or pull an unclaimed `pending` task back (`wb.mjs post --status ready` or `draft`).
-- **Amending Mid-Flight:** Never edit `tasks/<task_id>/task.md` while `status == in-progress`. Publish `tasks/<task_id>/events/<UTC>-<entity_id>-amend.md` instead.
-- **Owner decision table:** `in-progress` correction = `amend`; `review` rework = `feedback --status pending`; `blocked` continuation = `answer --status pending`. Amend alone on `review`/`blocked` warns and does not reopen execution.
-- **Answering Blocked Tasks:** For `tasks/<task_id>/task.md` where `owner == <entity_id>` and `status == blocked`, publish `events/<UTC>-<entity_id>-answer.md`, then update `task.md` (`revision + 1`, `claim_round + 1`, `status: "pending"`, `claimed_by: ""`, auto-pinning `assignee` to the prior executor so they retain context, or pass `--reopen` to clear `assignee` and open to the pool).
-- **Reviewing & Closing:** For `tasks/<task_id>/task.md` where `owner == <entity_id>` and `status == review`, inspect `events/`, workspace diffs, and test output. Either:
-  - Publish `events/<UTC>-<entity_id>-complete.md` and update `task.md` (`status: "complete"`, `claimed_by: ""`), **or**
-  - Publish `events/<UTC>-<entity_id>-feedback.md`, increment `revision` and `claim_round`, set `status: "pending"`, clear `claimed_by: ""`, and pin `assignee` to the prior executor (or pass `--reopen` to clear `assignee`), **or**
-  - To cancel a task, publish `events/<UTC>-<entity_id>-cancelled.md` and set `status: "cancelled"`, `claimed_by: ""`.
-- **Stale Recovery:** Owner watch returns `reason: "stale"` and `stale_tasks` with heartbeat details when a registered executor exceeds `ttl_seconds`, once per task/round/heartbeat. Investigate before resetting: publish `reset`, increment `claim_round`, set `pending`, clear `claimed_by`/`assignee`. Missing entity files cannot signal TTL expiry.
-- **Outcome vs lifecycle:** Optional terminal `--outcome pass|partial|fail|abandoned` records a result, not a new state. A bounded investigation completed with negative findings is `complete --outcome fail` (or `partial` for incomplete verification); unfinished/abandoned work is `cancelled --outcome abandoned`. Explain the evidence verdict separately.
+## Owner
 
-## 4. Claiming, Decomposing & Executing Tasks (Executor Role)
-1. **READY Gate:** Enforce a WIP limit of **1 active `in-progress` task** per `entity_id` (`review` and `blocked` tasks do **not** consume WIP, so you remain eligible to claim new `pending` tasks while earlier tasks await review or answers; in `multithreaded` mode allow up to `max_workers` subagents, each with its own `entity_id`). Never run `claim` in `owner` mode. Scan `tasks/*/task.md` (or run `wb.mjs watch` with any configured `--tag` / `--include-untagged` flags):
-   - Tasks where `status == pending`, `claimed_by == ""`, and `assignee == <entity_id>` (resume your own unblocked/rejected tasks first; direct `assignee` matches bypass tag filters), then
-   - Tasks where `status == pending`, `claimed_by == ""`, and `assignee == ""`. (Ignore `draft` and `ready`, and skip any task that already has a competing earlier `claimed` event for the current `claim_round`.)
-   - **Tag filter check (OR by default):** If session capability `tags` are configured, require at least one tag in `task.tags` to match your configured `tags` (`OR` matching; use a combined tag such as `macos-worker` when `AND` is required), and ignore untagged tasks (`tags: []`) unless `--include-untagged` was specified (or `assignee == <entity_id>`).
-   - **Dependency check:** Require every `<dep_id>` in `depends_on` to have `status: "complete"`. Sort eligible tasks by `priority` (`critical` > `high` > `medium` > `low`), tie-breaking by oldest `<task_id>`.
-2. **Lockless 2-Phase Claim:**
-   - Run `wb.mjs claim` (or manually: append `<UTC>-<entity_id>-claimed.md` with `round: <claim_round>`, settle [default `2000` ms], then check round claims). Pinned reclaims (`assignee == entity`, `claim_round > 1`) skip settle; initial/pool claims still wait. All keep winner/split-brain checks. Winner: earliest timestamp, then entity ID and filename.
-   - Only the winner updates `task.md` (`status: "in-progress"`, `claimed_by: "<entity_id>"`, `updated_at: "<UTC>"`) and records the latest filename in `events/` as `last_event_seen`. Losers exit without touching `task.md`.
-    - In `multithreaded` mode, pass `--task <task_id>`, child `entity_id`, `bucket_dir`, tags, and `mode=once` to the child. Only the dispatcher watches the pool/messages; the child returns after `review`/`blocked`.
-3. **Checkpoint & Amendment Check:** Before workspace writes/finalization, check `PAUSED`, refresh your entity heartbeat (`entity register`), and verify `claim_winner == <entity_id>` (`render --json`); abort writes if a late-synced claim won. Read `claim --json` `unread_events` (unaccepted amends, including pre-claim, plus feedback since the previous claim) and newer events via `render --after-event`. Incorporate amends with `post --type log --accept-amends`: appends bodies verbatim in chronological sections, bumps revision once, records `last_amend_seen`, and logs filenames atomically (payload first). Original text stays; apply amendment semantics during execution. Advance `last_event_seen`; do not rely on that cursor alone for pre-claim amends.
-4. **Subtask Decomposition (Optional):** You may split an oversized task into child tasks (`parent: "<task_id>"`, `owner: "<entity_id>"`, plus platform/capability `tags`) in `tasks/`, append all child IDs to the parent's `depends_on`, publish a `*-log.md` event, and set the parent to `status: "pending"`, `assignee: "<entity_id>"`, `claimed_by: ""` (`claim_round + 1`). Execute/review the children until all are `complete`, then resume the parent to verify its `## Acceptance Criteria`.
-5. **Assume & Flag Execution Policy:**
-   - Make tentative, idiomatic decisions on straightforward, reversible details without stopping, and log every assumption in `events/<UTC>-<entity_id>-log.md`.
-   - **Hard Stop (Halt Immediately)** if: (a) an unexpected public API, schema, wire protocol, or dependency change is required, (b) requirements conflict or allow two fundamentally different designs, or (c) verification still fails after **2 fix attempts**.
-6. **Halt, DONE Gate, Rework & Continuity:**
-   - **If Blocked / Halted:** Publish `events/<UTC>-<entity_id>-question.md`, then set `task.md` `status: "blocked"`.
-    - **If Complete (DONE Gate):** Verify every acceptance criterion passes, check `- [ ]` to `- [x]` (`--check-ac`), post `review --status review` (no `--bump-revision`). Review body template: claims; raw evidence excerpts with `file:line`; observed vs inferred; unverified list; files changed and diff/status; verification commands and verbatim output.
-   - **Rework after `feedback`:** Resume the task via `claim`, read the new `*-feedback.md` event(s), apply fixes, re-verify, optionally post `--type log`, and run `wb.mjs post --type review --status review --check-ac` (no `--bump-revision`).
-   - **Next step (`once` vs `continuous` vs `owner`):** (Run `wb.mjs watch` in the background when your harness wakes on background exit, otherwise foreground.)
-     - If `once`: Run `wb.mjs watch --bucket <dir> --task <task_id> --since-status <review|blocked> --after-event <event> --json` until `status == "complete"` or `"cancelled"`, `status == "pending"` with `assignee == ""` (`--reopen`), `reason == "removed"`, or `assignee` changes away from `<entity_id>`; if `status == "pending"` and `assignee == <entity_id>`, go to Step 2 (`claim`) and rework/continue; if still `review`/`blocked` (e.g., an intermediate event), advance `--after-event` and keep watching; otherwise exit cleanly.
-      - If `continuous`: Loop back to Step 1 and re-arm `watch --entity <entity_id> [--tag ...]` for rework, owned reviews, work and messages. Background-completion harness: arm without `--timeout`, **END YOUR TURN**. Foreground harness: block/re-arm, do not end your turn. Never wait in-turn.
-      - If `owner`: Re-arm `watch --entity <entity_id> --owner-only`, using the same wait rule, unless all assigned-unit tasks are terminal or a decision must be escalated; then stop watching and report.
+1. Put shared rules in `INSTRUCTIONS.md` or `tags/<tag>.md` bodies. Create task-specific briefs with scope, verification commands and numbered acceptance criteria (`- [ ] #N ...`, or `create --ac`). Use `create --status draft|ready` to hold work, then `promote` to release it.
+2. Arm `watch --owner-only --json`. Inspect delivered questions, reviews and evidence with `render --task <id> --after-event <cursor>`; use the transition table to answer, request rework, close or cancel. Apply accepted verdicts with `complete --accept-ac`.
+3. Send corrections through the channel table. After a failed bulk amend, inspect the reported completed IDs and stopped task before retrying.
+4. Investigate stall alerts with `status`, the workspace diff, process state and checkpoint manifests. Resolve dead pending pins with `amend --assignee <dispatcher-or-executor>` or `--assignee ""`; recover stopped in-progress work with `reset`, or cancel it. Do not treat TTL expiry alone as proof that execution stopped.
+5. On resumption, inspect `status` and `watch --owner-only --all-actionable` to recover delivered but unresolved work. Follow the wait/rollover table when re-arming.
+6. When the assigned unit is terminal or needs escalation, stop its watcher, run `entity end` and report through the parent harness. Do not pause the bucket merely to exit.
 
-## 5. Public Messaging (`messages/`)
-- **All messages are strictly public:** Every entity with bucket access can read every file in `messages/`, even when `to` or `tags` target specific recipients. Never put secrets or private assumptions in `messages/`.
-- Use `messages/` for cross-cutting announcements (e.g., breaking changes, coordination notices) rather than single-consumer tasks.
-- Task correction = task event; cross-cutting notice = public message; report to a parent = harness; pause = bucket-level pause, not a message or task cancellation.
-- `wb.mjs watch --entity <id> [--tag ...]` wakes only on messages newer than `last_msg_seen` where `from != <id>` and (`to` contains `"*"` or `<id>`, or `tags` intersect your `--tag`s), coalescing rapid message-only bursts (~500ms quiet window) and advancing `last_msg_seen` in `entities/<id>.md` on delivery.
+## Dispatcher
 
-## 6. Optional Helper CLI (`scripts/wb.mjs`)
-Do **not** read `scripts/wb.mjs` source; run `node "<skill_dir>/scripts/wb.mjs" <subcommand> --help` if you need flag details:
-- `create`: `wb.mjs create --bucket <dir> --entity <id> --title <text> [--backlog|--draft] [--status draft|ready|pending] [--priority ...] [--tag <t>] [--assignee <id>] [--depends-on <ids>] [--body-file <path>|--stdin]`
-- `claim`: `wb.mjs claim --bucket <dir> --entity <id> [--task <id>] [--tag <t>] [--include-untagged] [--claim-settle-ms 2000] [--json]`
-- `post`: `wb.mjs post --bucket <dir> --entity <id> --task <id> --type <type> [-m <text>|--body-file <path>|--stdin] [--status <status>] [--bump-revision] [--accept-amends] [--outcome <result>] [--check-ac] [--reopen]` (`feedback`/`answer` to pending auto-increment revision once, including with `--bump-revision`; returns increment `claim_round` and auto-pin prior executor)
-- `watch`: `wb.mjs watch --bucket <dir> [--entity <id>] [--owner-only] [--task <id>] [--tag <t>] [--include-untagged] [--after-event <file>] [--after-msg <file>] [--exclude-task <id> ...] [--all-actionable] [--event-lines 5|--include-events] [--json]` (`124` timeout/outer `143`: re-arm if still waiting). Pool watch skips current-round claim events; exclude dispatched tasks until children return. Owner wakes are edges: delivery advances `owner_task_seen`; `--all-actionable` includes previously delivered review/blocked tasks. Summaries include revision/round/executor/assignee and `latest_event: {filename,type,body,truncated,...}`; task watch adds `events` alongside `new_events` filenames. Bodies preview 5 lines; `--include-events` expands surfaced events only.
-- `render`: `wb.mjs render --bucket <dir> --task <id> [--after-event <file>] [--tail-events N|--latest-event] [--json]` (JSON: `{task_id,stage,path,claim_winner,task,body,events}`; fields such as status live under `task`)
-- `list`: `wb.mjs list --bucket <dir> [--status <states>] [--tag <t>] [--owner <id>] [--json]` (one line/task; JSON `{count,tasks:[summary]}`)
-- `bucket`: `wb.mjs bucket pause --bucket <dir> [-m <reason>]` | `wb.mjs bucket resume --bucket <dir>`
-- `msg`: `wb.mjs msg send --bucket <dir> --entity <id> [--to <id|*,...>] [--tag <t>] -m <text>` | `wb.mjs msg list --bucket <dir> [--entity <id>] [--unread] [--all]`
-- `entity`: `wb.mjs entity register --bucket <dir> --entity <id> [--tag <t>] [--mode <m>] [--ttl 300]` | `wb.mjs entity list --bucket <dir> [--online]`
-- `tag`: `wb.mjs tag set --bucket <dir> --entity <id> --tag <name> -m <description>` | `wb.mjs tag list --bucket <dir>`
+1. Register with `entity register --mode continuous` and supplied filters. Restore active child IDs, task IDs and watcher ownership on resumption; inspect `status` and checkpoints before dispatching replacements.
+2. Arm `watch --json` with supplied filters and `--exclude-task <id>` for each active child, including settling claims. Use `--owner-only` while all worker slots are occupied; on a child return, stop that watcher and re-arm the pool watch.
+3. Dispatch up to `max_workers`. Give each new child a fresh entity ID, task ID, bucket, dispatcher ID, scope and the dispatcher-child procedure. Prefer resuming the `affinity` session for rework when available; otherwise spawn a fresh child. Parallelize workspace writes only when dependencies or separate worktrees prevent conflicts.
+4. Remove a task's exclusion when its child returns. If it remains in-progress, inspect the tree, processes and checkpoint manifest: resume the same child identity without claiming again, or, after execution stops, `release --task <id> --notes <resume-state>` with its files/resources and dispatch a fresh child. Escalate unsafe recovery to the owner.
+5. On pause, stop children at checkpoints and suspend pool watches until explicitly resumed; retain owner-only watching for notices or owned decisions. On bounded exit, stop the watcher, settle or hand back active children, run `entity end` and report through the harness.
+6. Before rollover, transfer active child/task IDs, event cursors and the known watcher handle/PID. On resumption, stop that watcher and promptly re-arm from those cursors and current active-child exclusions before waiting.
 
-Use quoted here-docs for multi-line bodies (also supported by `create --stdin`):
-```bash
-wb.mjs post --bucket "$BUCKET" --entity "$ENTITY" --task "$TASK" --type review --status review --stdin <<'REVIEW'
-- Claim: implemented; observed: `test` passed (evidence.txt:1-4).
-- Raw evidence: <verbatim excerpt>; inferred: <interpretation>.
-- Unverified: none. Files/diff status: <paths and status>.
-- Verification: <command and verbatim output>.
-REVIEW
-```
+## Dispatcher-child
+
+1. For pending work, run `claim --task <id> --dispatcher <dispatcher-id> --json`. For interrupted in-progress work under this same identity, inspect its checkpoint and workspace. Then follow Execute.
+2. Run `entity end` and return the task ID, status and latest event to the dispatcher immediately after review, question or handback. Leave pool/message watching to the dispatcher.
+
+## Standalone (`once` / `continuous`)
+
+1. On resumption, inspect `status`: resume your in-progress task from its checkpoint or restore the saved wait using the rollover table. For new work, arm `watch --json` with supplied filters and claim a surfaced task with `claim --task <id> --json`. For claimed or resumed execution, follow Execute.
+2. After release, exit via step 4. In `once` mode after review/question, watch the task with `--task <id> --since-status <review|blocked> --after-event <last-event> --json`. Reclaim pending work pinned to you, then follow Execute; advance the cursor after intermediate events. Exit on complete, cancelled, removed, unassigned pending work or reassignment away from you.
+3. In `continuous` mode, re-arm the pool watch after review/question and handle owned decisions using the owner procedure. On pause, stop execution at a checkpoint and suspend pool watches until explicitly resumed.
+4. Follow the wait/rollover table. On actual exit, stop the watcher, run `entity end` and report through the harness.
+
+## Execute
+
+1. Read the brief, returned `instructions` and `unread_events`; follow the execution checkpoint table.
+2. Resolve reversible details within scope and log material assumptions. Use `question --task <id>` with the decision needed for conflicts or changes outside scope.
+3. Verify the criteria, then submit `review --task <id> --ac N=pass|fail|not-run --proposed-outcome <outcome>` with the review body below. For an early handback, use `release` with a checkpoint containing cleanup/resume notes and files/resources.
+
+## Execution checkpoints
+
+| When | Action |
+| --- | --- |
+| Between legs | Stop if the bucket is paused or `render --json` `claim_winner` is not you. Apply events after your cursor. Refresh presence with `entity register` if the next leg is unwrapped and may exceed TTL. |
+| Outstanding amends | Read and apply them, then `accept-amends`. Exclude a correction only with `--ignore-amend <event-file> --reason <text>`. |
+| Standing rules changed | Run `ack-instructions`, read its diff and apply it before continuing. |
+| Command expected to exceed TTL/2 | Use `run --task <id> [--log <file>] -- <command> [args...]`. |
+| Risky leg, interruption or handback | Record `checkpoint --notes <resume-and-cleanup-state>` with `--files-touched` and `--resources`; inspect and settle resources before replacement execution. |
+| Oversized task | Agree child scope and parent dependency edits with its owner; create children with `--parent <id>`. Review children before returning to the parent's criteria. |
+
+## Waiting and rollover
+
+| Situation | Action |
+| --- | --- |
+| Background-completion harness | Keep one watcher per entity; arm without `--timeout`, print a `waiting:` line from `status`, then end the turn. |
+| Foreground-only harness | Watch with `--timeout` below the tool limit; re-arm after 124 or an outer timeout while still waiting. |
+| Rollover | Transfer task IDs, status baselines, event cursors and watcher handle/PID. Stop the known predecessor watcher before re-arming. Task waits reuse `--after-event`/`--since-status`; pool/owner waits reuse entity cursors. |
+| Unexpected identity-sharing warning | Resolve sharing with the caller; reuse any caller-supplied session nonce rather than inventing a replacement identity. |
+
+## Transition reference
+
+| Intent | State change | Actor |
+| --- | --- | --- |
+| `create`; `promote` / `demote` | New draft/ready/pending; draft/ready toward pending / ready/pending toward draft | Owner |
+| `claim` | pending -> in-progress | Eligible executor |
+| `review` / `question` | in-progress -> review / blocked | Claimant |
+| `feedback` / `answer` | review / blocked -> pending; pin dispatcher or standalone claimant, retain child affinity | Owner |
+| `release` | in-progress -> pending with checkpoint; same pin/affinity rule | Claimant or recorded dispatcher |
+| `reset` | in-progress -> unpinned pending | Owner |
+| `complete` / `cancel` | Non-terminal -> complete / cancelled | Owner |
+| `amend` | Correction; metadata edits on unclaimed draft/ready/pending | Owner |
+| `accept-amends` / `ack-instructions` | Receipt / rule-version update in-progress | Claimant |
+| `log`, `post`, `checkpoint`, `run` | Append / execute, no lifecycle transition | Owner, claimant or recorded dispatcher |
+
+## Channels
+
+| Content | Destination |
+| --- | --- |
+| Shared rules | `INSTRUCTIONS.md`, `tags/<tag>.md` bodies |
+| Active task correction | `amend --task <id>`; bulk: `amend --all-in-progress [--tag <tag>]` |
+| Review rework / blocked continuation | `feedback` / `answer`; add `--reopen` to return to the pool |
+| Public notice | `msg send`; keep secrets out of all bucket files |
+| Parent report / bucket pause | Harness / `bucket pause` and `bucket resume` |
+
+## Review body
+
+| Result | Evidence |
+| --- | --- |
+| <observed result; label inference> | <file:line; command and result> |
+
+Unverified: <items or none>.
+
+## Exit codes
+
+| Exit | Meaning |
+| --- | --- |
+| 0 / 1 | Success / usage, validation or not-found |
+| 2 / 3 / 4 | No work, ineligible or non-polling recipient / conflict, race or permission / paused |
+| 124 / 130 | Watch timeout / interrupted watch |
+| `run` | Child exit; spawn failures 126/127; termination 128 + signal number |

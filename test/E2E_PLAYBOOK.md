@@ -1,87 +1,92 @@
-# Work-Bucket E2E Playbook (Two-Entity Stateful Run)
+# Stateful E2E playbook
 
-A low-token, stateful integration test run in a single temporary bucket (`/tmp/wb-e2e-*`) without cleanup between steps. Designed to be executed by two peer agents (`lead` in `owner` mode and `worker-1` in `continuous` mode) using `work-bucket`.
+Use one fresh temporary bucket and workspace throughout; retain them for inspection. Follow [SKILL.md](../SKILL.md) for role procedures and waiting. Commands below abbreviate `node "$SKILL_DIR/scripts/wb.mjs"` as `wb` and omit the common `--bucket "$BUCKET"` and acting `--entity <actor>` arguments.
 
-## Setup
-
-1. Create a fresh temp bucket and work dir (leave `/tmp/wb-e2e-*` in place after the run for inspection):
-   ```bash
-   BUCKET=$(mktemp -d /tmp/wb-e2e-XXXXXX)
-   WORKDIR=$(mktemp -d /tmp/wb-e2e-work-XXXXXX)
-   ```
-2. Spawn two agents against `$BUCKET` (with `$SKILL_DIR` = installed `work-bucket` path):
-   - **Agent A (`lead`):** `bucket_dir=$BUCKET`, `entity_id=lead`, `mode=owner`.
-   - **Agent B (`worker-1`):** `bucket_dir=$BUCKET`, `entity_id=worker-1`, `mode=continuous`, `tags=["e2e"]`.
-
-## Stateful Scenario Sequence
-
-Run these in one continuous flow in `$BUCKET`:
-
-1. **Discovery & Backlog Guard (`lead`):**
-   - Document tag `e2e` via `wb.mjs tag set --bucket "$BUCKET" --entity lead --tag e2e -m "E2E test tasks"`.
-   - Create **Task 1** as draft (`--backlog --tags "e2e,alt"`): write `ok-1` to `$WORKDIR/t1.txt` (`- [ ] #1` verified by `grep -qx ok-1 $WORKDIR/t1.txt`).
-   - Mark **Task 1** `ready` (`post --type log --status ready`). Confirm `status` is `ready` in `tasks/` and it is not claimed by `worker-1`.
-   - Promote **Task 1** to `pending` (`post --type log --status pending`).
-
-2. **Ambiguous Task + Targeted Message (`lead`):**
-   - Create **Task 2** in `pending` state (`--tag e2e`): *"Write either `alpha` or `beta` to `$WORKDIR/t2.txt` (do not guess - ask `lead` which value is wanted before writing)."*
-   - Send a targeted message: `wb.mjs msg send --bucket "$BUCKET" --entity lead --to worker-1 -m "Reply via msg send --to lead confirming you saw this."`
-   - Start watching in `owner` mode: `wb.mjs watch --bucket "$BUCKET" --entity lead --owner-only --json`.
-
-3. **Execution, Question & Reply (`worker-1`):**
-   - Claims **Task 1** via OR tag match (`e2e,alt` matches `e2e`), writes `$WORKDIR/t1.txt`, submits `review` (`--check-ac`).
-   - Claims **Task 2**, hits ambiguity Hard Stop, posts `question` with `--status blocked`, and re-arms `watch`.
-   - Wakes on `lead`'s message and sends `wb.mjs msg send --bucket "$BUCKET" --entity worker-1 --to lead -m "Confirmed receipt."`
-
-4. **Review, Answer & Feedback Rework (`lead` <-> `worker-1`):**
-   - `lead` wakes in `--owner-only` mode:
-     - Approves **Task 1** (`post --type complete`).
-      - Answers **Task 2** (`post --type answer -m "Use alpha." --status pending`), keeping `assignee: "worker-1"` and automatically incrementing `revision` and `claim_round`.
-     - Re-arms `watch --owner-only`.
-   - `worker-1` reclaims **Task 2**, writes `alpha` to `$WORKDIR/t2.txt`, submits `review` (`--check-ac`).
-    - `lead` sends **1 feedback round** (`post --type feedback -m "Append a second line 'verified' to $WORKDIR/t2.txt" --status pending`) and re-arms `watch --owner-only`.
-   - `worker-1` reclaims **Task 2**, appends `verified`, re-submits `review` (`--check-ac`).
-    - `lead` approves **Task 2** (`post --type complete`) and exits/reports done.
-
-In background-completion harnesses, each re-arm runs in the background without `--timeout`, then the agent ends its turn. Never wait in-turn. `lead` leaves no watcher after bounded completion. Add bucket `INSTRUCTIONS.md` and tag-body instructions before promotion; confirm workers read them and `claim --json` surfaces them. Submit reviews with a quoted `--stdin` here-doc containing raw evidence, observed/inferred/unverified sections and diff/verification output.
-
-## Wake-Quality Checks
-
-- Before answering/reviewing a delivered actionable task, re-arm `watch --owner-only --timeout 1`: it must time out rather than redeliver the same edge. `--all-actionable` must still show it. Post a new event while actionable and confirm the next normal watch delivers that new edge once.
-- Inspect `owner_task_seen` in `entities/lead.md`; confirm one `<task_id>/<event_file>` cursor per delivered task survives entity registration/heartbeat.
-- Confirm pool watches do not re-offer a pending task during a child's claim-settle window. With several pending tasks, repeat `--exclude-task <id>` for dispatched IDs and confirm only other work appears.
-- Submit a review body longer than 5 lines. Verify watch summary revision/round/executor/assignee and latest filename/type/body preview; `--event-lines 2` truncates to two lines, `--include-events` returns the full body. Task-specific watches retain `new_events` filenames and include matching `events` objects.
-
-## Inspection and Control Checks
-
-- Register executors before execution; refresh entity heartbeats at checkpoints. On an extra fixture task, stop refreshing the executor's short-TTL heartbeat while `in-progress`; an armed owner watch must wake with `reason: "stale"` and heartbeat age/TTL. Re-arm without changing the heartbeat and confirm no duplicate alert. Inspect before resetting; TTL expiry is not proof of stopped execution.
-- Post an amendment before a fixture claim and another during execution. Confirm claim `unread_events` includes the pre-claim body. Executor runs `post --type log --accept-amends`; inspect appended chronological sections, one revision increment, `last_amend_seen`, and immutable log filenames. Repeat with no new amendment: error and no additional task/event writes. After feedback/reclaim, confirm feedback appears but accepted amendments do not.
-- Compare `render --tail-events 2`, `--latest-event`, and `--after-event <file> --latest-event` with the full stream. JSON status is `task.status`. `list --status review,blocked --tag e2e --owner lead --json` returns `{count,tasks}`; text lists one line per matching task.
-- Use `bucket pause -m "Await decision"` before claiming a pending fixture: claim exits 2, pool watch reports paused/no work, task remains pending. Do not re-arm paused pool watches in a loop. Owners can review an existing review task while paused. Resume, explicitly resume executor loops, then confirm claims work. Also create/remove `PAUSED` directly.
-- Close a completed negative investigation with `complete --outcome fail` and an unfinished fixture task with `cancelled --outcome abandoned`; inspect outcome separately from lifecycle. Use `partial` only with an explicit unverified list, not an acceptance PASS claim.
-
-## Reclaim and Handover Checks
-
-- Time an initial assigned claim with a nonzero settle, then return it via feedback and reclaim under the pinned executor with `--claim-settle-ms 2000`. Only the pinned round (`claim_round > 1`) skips the delay; inspect `claim_winner` afterward. Existing concurrent-claim tests still exercise pool election.
-- Register a caller-selected `--session-nonce`; repeat it with no warning. Use a different token while the entity is live: expect a warning, not refusal, and the new marker. Omit the token: it is preserved without a collision check. Verify `WB_SESSION_NONCE` inheritance and explicit flag precedence; transfer a stale identity without a warning.
-- Handover while a task-specific background watcher is armed. Capture task ID, cursor, baseline status and watcher handle/PID. The successor stops the old watcher before arming `watch --task <id> --after-event <last_seen> --since-status <review|blocked>`. Post feedback before re-arm and confirm immediate delivery; no event may be missed and no predecessor watcher remains. Resume an `in-progress` task without re-claiming; owner/pool watches instead retain entity cursors.
-
-## Loose Pass Gates
-
-After both agents finish, run these checks against `$BUCKET`:
+## Fixture
 
 ```bash
-WB="node $SKILL_DIR/scripts/wb.mjs"
-$WB entity list --bucket "$BUCKET" --json
-$WB tag list --bucket "$BUCKET" --json
-$WB msg list --bucket "$BUCKET" --all --json
-ls "$BUCKET/tasks"
+BUCKET=$(mktemp -d)
+WORKDIR=$(mktemp -d)
+cat >"$BUCKET/bucket.md" <<'CONFIG'
+---
+sync: local
+default_ttl_seconds: 10
+---
+CONFIG
 ```
 
-- [ ] `entity list` contains both `lead` (`mode: "owner"`) and `worker-1` (`mode: "worker"`, `tags: ["e2e"]`), both `online: true` with non-empty `last_msg_seen`.
-- [ ] `tag list` shows `e2e` as `documented: true`.
-- [ ] `tasks/` contains **2** completed tasks (`status: "complete"`, `- [x]` boxes checked).
-- [ ] `wb.mjs render --bucket "$BUCKET" --task <task1_id> --json` shows `created` -> `log` (`ready`) -> `log` (`pending`) -> `claimed` -> `review` -> `complete`.
-- [ ] `wb.mjs render --bucket "$BUCKET" --task <task2_id> --json` shows `revision >= 3`, `claim_round >= 3`, and events including `question`, `answer`, `review`, `feedback`, `review`, `complete`.
-- [ ] `msg list --all` shows at least 2 messages (`lead` -> `worker-1` and `worker-1` -> `lead`).
-- [ ] `$WORKDIR/t1.txt` equals `ok-1` and `$WORKDIR/t2.txt` contains `alpha` and `verified`.
+Participants: `owner`, continuous executor `continuous`, dispatcher `dispatch` (one slot), and fresh once children `child-1` through `child-4`. Executor filter: `--tag e2e`.
+
+| Setup | Expected |
+| --- | --- |
+| Write `INSTRUCTIONS.md`: "Keep evidence in the fixture workspace." | Bucket rule selected by all claims |
+| Owner `tag set --tag e2e -m "Use exact fixture text."` | `tag list --json` reports documented e2e |
+| Start owner and continuous pool watches | Presence/delivery registered; notices after this point are deliverable |
+
+## A. Owner and continuous executor
+
+| Action | Expected |
+| --- | --- |
+| Owner `create --title "Write first file" --status draft --tag e2e,alt --ac "Write ok-1 to t1.txt and verify exact content"`; save ID as T1 | Draft absent from pool |
+| Owner `promote --task T1 --status ready`, then `promote --task T1` | Ready absent from pool; pending delivered via OR tag match |
+| Continuous `claim --task T1 --tag e2e --json` | Top-level in-progress summary, instructions and unread events |
+| Write `ok-1` to workspace t1.txt; verify `grep -qx ok-1 "$WORKDIR/t1.txt"`; `review --task T1 --ac 1=pass --proposed-outcome pass --stdin` using the SKILL evidence template | Review event stores verdict; brief box remains unchecked |
+| Owner `complete --task T1 --accept-ac` | Complete, checked criterion, outcome pass |
+| Owner creates T2 with criterion "Write alpha and verified on separate lines in t2.txt"; brief requires asking which first-line value to use | Pending work |
+| Continuous claims T2, then `question --task T2 -m "Choose first-line value"` | Blocked, owner wake |
+| Owner `answer --task T2 -m "Use alpha"` | Pending pin to continuous; revision/round advance |
+| Continuous reclaims, writes alpha only, verifies, reviews `--ac 1=fail --proposed-outcome fail` | Failed result reported without ticking brief |
+| Owner `feedback --task T2 -m "Append verified"`; continuous reclaims, appends verified, verifies and reviews `--ac 1=pass --proposed-outcome pass` | Rework retains standalone pin; new round evidence |
+| Owner `complete --task T2 --accept-ac` | Complete, checked criterion |
+| Owner sends a notice `msg send --to continuous -m "Confirm receipt"`; continuous replies to owner | Both pollers receive once; `msg list --all` retains public notices |
+
+## B. Dispatcher, receipts and fresh-child rework
+
+| Action | Expected |
+| --- | --- |
+| Start dispatch pool watch; owner creates T3 pinned with `--assignee dispatch`, tag e2e and criterion "Write corrected to t3.txt" | Dispatcher sees new pinned work |
+| Dispatch hands T3 to child-1 and excludes T3 from its watch; child-1 `claim --task T3 --dispatcher dispatch --json` | Child relationship recorded; settling task is not redispatched |
+| Owner `amend --task T3 -m "Use corrected, not initial"`; append "Verify exact content." to INSTRUCTIONS.md | Outstanding amend and new rule version |
+| Child-1 attempts `review --task T3 --ac 1=pass --proposed-outcome pass` | Refused, no review publication |
+| Child-1 reads correction, `accept-amends --task T3`, then `ack-instructions --task T3 --json` | Receipt cursor advances; rule diff contains added text |
+| Child-1 writes/validates corrected, reviews with verdict/evidence, ends identity and returns | No child pool/message watch; dispatcher removes exclusion |
+| Owner `feedback --task T3 -m "Repeat exact-content verification"` | Pending assignee dispatch, affinity child-1 |
+| Dispatch spawns child-2; `claim --task T3 --dispatcher dispatch --json` | Fresh child claims pin after positive settle; feedback visible, accepted amend absent from unread events |
+| Child-2 verifies, reviews, ends and returns; owner `complete --task T3 --accept-ac` | Complete, verdict applied |
+| Send a direct notice to child-2 without force | Exit 2; no message published |
+
+## C. Stopped child and checkpointed recovery
+
+| Action | Expected |
+| --- | --- |
+| Owner creates T4 pinned to dispatch, with a file-writing criterion; child-3 claims using recorded dispatcher | In-progress, auto-registered claimant |
+| Child-3 writes partial content, then `checkpoint --task T4 --files-touched <workspace-file> --notes "Partial content; resume by replacing it; no live resources"` | Structured manifest visible in render/watch |
+| Stop child-3 before review; inspect its workspace, checkpoint and any process state | No concurrent execution before recovery |
+| Dispatch `release --task T4 --files-touched <workspace-file> --notes "Child stopped; replace partial content; no live resources"` | Pending dispatcher pin, child-3 affinity, round advances |
+| Fresh child-4 claims, replaces partial content, verifies, reviews and ends; owner completes with `--accept-ac` | No same-round competing execution; complete |
+| Extra short-TTL task: stop a claimant's wrapper forcibly after its start checkpoint; owner watches | Abandoned advisory, task still in-progress; owner inspects before `reset` or `cancel` |
+
+## D. Delivery, pause and rollover checks
+
+| Probe | Expected |
+| --- | --- |
+| Owner watch immediately after consuming a review/blocked edge, with `--timeout 1` | Exit 124; `--all-actionable` still returns unresolved work |
+| Post a new log while actionable; rewatch normally | New edge delivered once; cursor survives entity registration |
+| Review body over five lines; compare default watch, `--event-lines 2`, `--include-events` | Five-line/two-line previews versus full surfaced bodies; verdict metadata retained |
+| Compare `render --tail-events 2`, `--latest-event`, `--after-event <cursor>` and `list --status review,blocked --json` | Top-level summary fields; list envelope `{count,tasks}` |
+| `bucket pause -m "Fixture pause"`; try claiming pending work and poll pool | Claim exit 4; paused pool has no work; owner can still review |
+| `bucket resume`; explicitly resume executor loop | Positive-settle claims work again |
+| Transfer an armed task watch: record baseline/cursor/handle, stop it, post feedback, then re-arm with saved `--after-event` and `--since-status review` | Immediate pending update, no predecessor watcher remains |
+| Transfer dispatcher watch ownership and active child IDs; re-arm with only current active exclusions | Existing dispatcher pins delivered; active children not duplicated |
+| Time initial claim and feedback reclaim under local config | Both elections settle; render reports the elected winner |
+| Wrap a command longer than TTL/2 with `run --task <id> --log <workspace-log> -- <command>` | Heartbeats preserve liveness; start/exit checkpoints and log agree with command result |
+
+## Final checks
+
+| Check | Pass condition |
+| --- | --- |
+| T1-T4 renders | Complete, owner-applied boxes; T2 answer/feedback and T3 dispatcher/fresh-child history retained |
+| Workspace | t1 equals ok-1; t2 contains alpha then verified; t3 equals corrected; T4 has no partial content |
+| `fsck --json` | No drift or invalid snapshots |
+| `status --json` | No unexpected active work/resources; waiting parties and any retained fixture alerts accurate |
+| End participants; `entity list --all --json` | Explicit ended identities retained; no test watcher or fixture process left running |

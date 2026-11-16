@@ -109,10 +109,19 @@ Check the documented test entry and command references against the implementatio
   receives its own amend event and receipt; a fanout failure identifies completed
   IDs and the stopped task for inspection, without claiming atomic rollback.
 
-## Remaining work
+## Documentation outcome
 
-Role procedures, generated command reference, migration/roadmap documentation and
-stateful end-to-end scenarios.
+- SKILL is the agent procedure source: one numbered procedure per role, shared
+  Execute steps and compact execution, waiting, transition, channel and exit
+  references.
+  Brief numbering appears in the owner procedure; review bodies use only an
+  evidence table and unverified line.
+- Command and flag discovery use CLI help rather than a duplicate skill table.
+  README contains installation, concepts, bucket settings,
+  migration, tests and pointers rather than duplicate procedures.
+- The roadmap reflects current intents. The stateful playbook covers continuous
+  execution, dispatcher pins, fresh-child rework, stopped-child recovery,
+  receipts, rule changes, pause and watch transfer.
 
 ## Accepted evidence
 
@@ -185,3 +194,11 @@ stateful end-to-end scenarios.
   body/revision preservation, and independent instruction gating. Bulk tests
   cover owner/tag/state filters, metadata refusals, literal stdin fanout, separate
   receipts and a forced second-publication failure retaining the first event.
+- Documentation regression run: `npm test`, 85 passed, 0 failed, 0 skipped
+  (84 retained tests and 1 new stateful test); syntax and whitespace checks pass.
+- A single-bucket scenario covers a new dispatcher pin, full-capacity owner-only
+  waiting versus queued pool work, exclusions, correction/rule refusals and
+  receipts, feedback affinity, fresh-child reclaim, ended-child checkpointed
+  release, owner verdict application and clean replay.
+- The manual playbook's multi-agent harness waiting and rollover scenarios were
+  not executed; CLI-level behavior is covered by the automated suite.

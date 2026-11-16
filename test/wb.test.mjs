@@ -3988,3 +3988,60 @@ test("slow-sync simulator recovers when sync delay exceeds bucket settle and LWW
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("dispatcher lifecycle end-to-end: routing, receipts, rules and stopped-child recovery", () => {
+  const bucket = makeTempBucket();
+  try {
+    const task = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "E2E dispatcher",
+      "--message=- [ ] #1 First\n- [ ] #2 Second", "--assignee", "dispatcher"]);
+    const args = ["--bucket", bucket, "--task", task.id];
+    assert.ok(runWbJson(["watch", "--bucket", bucket, "--entity", "dispatcher"])
+      .tasks.some((item) => item.id === task.id));
+    const child1 = runWbJson(["claim", ...args, "--entity", "child-1", "--dispatcher", "dispatcher"]);
+    assert.equal(child1.status, "in-progress");
+    const queued = runWbJson(["create", "--bucket", bucket, "--entity", "owner", "--title", "Queued work"]);
+    const full = runWb(["watch", "--bucket", bucket, "--entity", "dispatcher", "--owner-only",
+      "--exclude-task", task.id, "--timeout", "0.05"]);
+    assert.equal(full.status, 124, full.stderr);
+    assert.ok(runWbJson(["watch", "--bucket", bucket, "--entity", "dispatcher", "--exclude-task", task.id])
+      .tasks.some((item) => item.id === queued.id));
+    runWbJson(["cancel", "--bucket", bucket, "--entity", "owner", "--task", queued.id]);
+    const amend = runWbJson(["amend", ...args, "--entity", "owner", "-m", "Owner correction"]);
+    assert.ok(amend.event);
+    const unreceipted = runWb(["question", ...args, "--entity", "child-1"]);
+    assert.equal(unreceipted.status, 1);
+    assert.match(unreceipted.stderr, /accept-amends/);
+    const receipt = runWbJson(["accept-amends", ...args, "--entity", "child-1"]);
+    assert.equal(receipt.last_amend_seen, amend.event);
+    fs.writeFileSync(path.join(bucket, "INSTRUCTIONS.md"), "E2E standing rule v2\n");
+    const staleRules = runWb(["review", ...args, "--entity", "child-1", "--ac", "1=pass,2=pass", "--proposed-outcome", "pass"]);
+    assert.equal(staleRules.status, 1);
+    assert.match(staleRules.stderr, /ack-instructions/);
+    runWbJson(["ack-instructions", ...args, "--entity", "child-1"]);
+    const review = runWbJson(["review", ...args, "--entity", "child-1", "--ac", "1=pass,2=pass", "--proposed-outcome", "pass"]);
+    assert.equal(review.status, "review");
+    const feedback = runWbJson(["feedback", ...args, "--entity", "owner", "-m", "Rework needed"]);
+    assert.equal(feedback.assignee, "dispatcher");
+    assert.equal(feedback.affinity, "child-1");
+    assert.ok(runWbJson(["watch", "--bucket", bucket, "--entity", "dispatcher"])
+      .tasks.some((item) => item.id === task.id && item.affinity === "child-1"));
+    const child2 = runWbJson(["claim", ...args, "--entity", "child-2", "--dispatcher", "dispatcher"]);
+    assert.equal(child2.claim_round, child1.claim_round + 1);
+    runWbJson(["checkpoint", ...args, "--entity", "child-2", "--files-touched", "a.txt", "--notes", "Child stopped; tree inspected"]);
+    runWbJson(["entity", "end", "--bucket", bucket, "--entity", "child-2"]);
+    const released = runWbJson(["release", ...args, "--entity", "dispatcher", "--files-touched", "a.txt",
+      "--notes", "No live resources; resume from tree"]);
+    assert.equal(released.status, "pending");
+    assert.equal(released.assignee, "dispatcher");
+    assert.equal(released.affinity, "child-2");
+    assert.equal(released.claimed_by, "");
+    const child3 = runWbJson(["claim", ...args, "--entity", "child-3", "--dispatcher", "dispatcher"]);
+    assert.equal(child3.claim_round, released.claim_round);
+    runWbJson(["ack-instructions", ...args, "--entity", "child-3"]);
+    runWbJson(["review", ...args, "--entity", "child-3", "--ac", "1=pass,2=pass", "--proposed-outcome", "pass"]);
+    const done = runWbJson(["complete", ...args, "--entity", "owner", "--accept-ac"]);
+    assert.equal(done.status, "complete");
+    assert.equal(done.outcome, "pass");
+    assert.equal(runWbJson(["fsck", "--bucket", bucket]).unresolved, 0);
+  } finally { fs.rmSync(bucket, { recursive: true, force: true }); }
+});
